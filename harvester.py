@@ -6,7 +6,6 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 import pandas as pd
-import pyotp
 import requests
 
 CONFIG = {
@@ -128,11 +127,14 @@ def run_nifty_daily_harvest():
       c = spot_res.json().get("data", {}).get("candles", [])
       if c:
         day_close = float(c[0][4])
-  except Exception:
-    pass
+        print(f"📍 NIFTY 50 Spot Level: {day_close:.2f}")
+  except Exception as e:
+    print(f"[-] स्पॉट एरर: {e}")
 
   atm_strike = round(day_close / 50.0) * 50
-  required_strikes = list(range(int(atm_strike - 250), int(atm_strike + 300), 50))
+  required_strikes = list(
+      range(int(atm_strike - 250), int(atm_strike + 300), 50)
+  )
 
   res = requests.get(
       "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz",
