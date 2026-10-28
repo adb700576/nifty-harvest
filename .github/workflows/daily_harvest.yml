@@ -1,0 +1,29 @@
+name: Daily Nifty Data Harvest
+on:
+  schedule:
+    # 15:35 IST = 10:05 UTC (सोमवार ते शुक्रवार)
+    - cron: '5 10 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python सेटअप
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: लायब्ररी इन्स्टॉल करणे
+        run: pip install pandas requests pyotp
+
+      - name: Harvester चालवणे
+        run: python harvester.py
+
+      - name: डेटाबेस सेव्ह करणे (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: nifty-vault-db
+          path: nifty_vault.db
