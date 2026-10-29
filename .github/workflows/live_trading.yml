@@ -1,0 +1,40 @@
+name: NIFTY Live Real-Time Intraday Engine
+
+on:
+  schedule:
+    # सोम-शुक्र भारतीय वेळेनुसार सकाळी ०९:१५ IST (03:45 UTC)
+    - cron: '45 3 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-live-strategy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 380
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install pandas requests
+
+      - name: Start Live Market Engine
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python live_engine.py
+
+      - name: Upload Realtime Vault DB
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-nifty-vault-db
+          path: nifty_vault.db
