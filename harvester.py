@@ -26,6 +26,34 @@ DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 
 
+def init_database():
+  conn = sqlite3.connect(DB_FILE)
+  conn.execute("""
+    CREATE TABLE IF NOT EXISTS nifty_options_1m (
+        date TEXT,
+        timestamp TEXT,
+        symbol TEXT,
+        strike REAL,
+        option_type TEXT,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume INTEGER,
+        oi INTEGER,
+        price_change REAL,
+        change_oi INTEGER,
+        buildup TEXT,
+        delta REAL,
+        gamma REAL,
+        theta REAL,
+        vega REAL
+    )
+    """)
+  conn.commit()
+  conn.close()
+
+
 # ==============================================================================
 # २. टेलिग्राम मेसेज हेल्पर
 # ==============================================================================
@@ -92,10 +120,16 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
 
 def harvest_nifty_data(target_date: str):
   print(f'🚀 डेटा डाऊनलोड सुरू झाला: {target_date}')
-  res_m = requests.get(
-      'https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz'
-  )
-  df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
+  try:
+    res_m = requests.get(
+        'https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz',
+        timeout=30,
+    )
+    df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
+  except Exception as e:
+    print(f'[-] मास्टर इन्स्ट्रुमेंट एरर: {e}')
+    return 0
+
   strike_col = 'strike_price' if 'strike_price' in df_m.columns else 'strike'
 
   opt = df_m[
@@ -160,6 +194,7 @@ def harvest_nifty_data(target_date: str):
     time.sleep(0.04)
 
   if not all_rows:
+    print('[-] आजच्या तारखेसाठी अद्याप कोणतीही कॅन्डल उपलब्ध नाही.')
     return 0
 
   df_all = (
@@ -381,13 +416,26 @@ def run_strategy(target_date: str):
 # ५. मुख्य नियंत्रक (Main Execution)
 # ==============================================================================
 if __name__ == '__main__':
+  init_database()
+
+  # आजची तारीख
   today = datetime.now().strftime('%Y-%m-%d')
 
   # १. डेटा संकलित करणे
   candles_count = harvest_nifty_data(today)
 
+  # चाचणीसाठी: आज सकाळी जर कॅन्डल्स नसतील, तर कालच्या (२८ ऑक्टोबर) डेटावर चाचणी घेईल
+  test_date = today
+  if candles_count == 0:
+    print(
+        'ℹ️ आजचा डेटा उपलब्ध नसल्याने कालच्या (2026-10-28) डेटावर टेस्ट करत'
+        ' आहे...'
+    )
+    test_date = '2026-10-28'
+    candles_count = harvest_nifty_data(test_date)
+
   # २. स्ट्रॅटेजी रन करणे
-  trades = run_strategy(today)
+  trades = run_strategy(test_date)
 
   # ३. टेलिग्रामवर निकाल पाठवणे
   if trades:
@@ -396,7 +444,7 @@ if __name__ == '__main__':
     losses = tot - wins
     tot_pnl = sum(t['net_pnl'] for t in trades)
 
-    msg = f'📊 *NIFTY ALGO निकाल ({today})*\n\n'
+    msg = f'📊 *NIFTY ALGO निकाल ({test_date})*\n\n'
     msg += f'🔹 *एकूण कॅन्डल्स:* `{candles_count:,}`\n'
     msg += f'🔹 *एकूण ट्रेड्स:* `{tot}` (जिंकले: `{wins}`, तोटा: `{losses}`)\n'
     msg += f'💰 *निव्वळ नफा (Net PnL):* `₹ {tot_pnl:+,.2f}`\n\n'
@@ -411,6 +459,6 @@ if __name__ == '__main__':
     send_telegram(msg)
   else:
     send_telegram(
-        f'ℹ️ *NIFTY निकाल ({today})*\nकॅन्डल्स:'
-        f' `{candles_count:,}`\nनिकषांनुसार आज एकही ट्रेड झाला नाही.'
+        f'ℹ️ *NIFTY निकाल ({test_date})*\nकॅन्डल्स:'
+        f' `{candles_count:,}`\nनिकषांनुसार कोणताही ट्रेड झाला नाही.'
     )
