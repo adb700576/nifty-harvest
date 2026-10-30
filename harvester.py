@@ -23,7 +23,7 @@ UPSTOX_HEADERS = {
     'Authorization': f'Bearer {UPSTOX_TOKEN}',
 }
 
-LOT_SIZE = 65
+# स्ट्रॅटेजी पॅरामीटर्स
 DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -107,32 +107,58 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
     }
 
 
+# ==============================================================================
+# २. डायनॅमिक स्पॉट व एक्सपायरी (No Hardcoding)
+# ==============================================================================
 def get_live_nifty_spot():
     try:
         url = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050'
         res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
         if res.status_code == 200:
             data = res.json().get('data', {})
-            val = next(iter(data.values()), {})
-            lp = val.get('last_price')
-            if lp:
-                return float(lp)
+            for _, val in data.items():
+                lp = val.get('last_price')
+                if lp and float(lp) > 0:
+                    return float(lp)
     except Exception as e:
         print(f"[-] Spot Fetch Error: {e}")
-    return 24200.0
+    return None
+
+
+def get_nearest_expiry_from_api(today_str):
+    try:
+        url = 'https://api.upstox.com/v2/expired-instruments/expiries?instrument_key=NSE_INDEX|Nifty%2050'
+        res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
+        if res.status_code == 200:
+            expiries = res.json().get('data', [])
+            valid = sorted([exp for exp in expiries if exp >= today_str])
+            if valid:
+                return valid[0]
+    except Exception as e:
+        print(f"[-] Expiry API Error: {e}")
+    return None
 
 
 # ==============================================================================
-# २. डेटा संकलन (Data Harvester - Dual Mode: Intraday V3 + Fallback)
+# ३. डेटा संकलन (Data Harvester)
 # ==============================================================================
 def harvest_nifty_data(target_date: str):
     print(f"🚀 डेटा डाऊनलोड सुरू झाला: {target_date}")
+    
+    spot_price = get_live_nifty_spot()
+    if spot_price is None:
+        print("❌ त्रुटी: लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. प्रोसेस थांबवत आहे.")
+        send_telegram("⚠️ लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. कृपया API टोकन किंवा मार्केट स्टेटस तपासा.")
+        return 0, 65
+
+    nearest_exp_str = get_nearest_expiry_from_api(target_date)
+
     try:
         res_m = session.get('https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz', timeout=30)
         df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
     except Exception as e:
-        print(f"[-] मास्टर इन्स्ट्रुमेंट एरर: {e}")
-        return 0
+        print(f"[-] मास्टर इन्स्ट्रुमेंट डाऊनलोड एरर: {e}")
+        return 0, 65
 
     strike_col = 'strike_price' if 'strike_price' in df_m.columns else 'strike'
     opt = df_m[
@@ -140,22 +166,30 @@ def harvest_nifty_data(target_date: str):
         (df_m['name'].str.upper() == 'NIFTY') &
         (df_m['instrument_type'] == 'OPTIDX')
     ].copy()
-    opt['expiry'] = pd.to_datetime(opt['expiry'])
+    opt['expiry_dt'] = pd.to_datetime(opt['expiry']).dt.strftime('%Y-%m-%d')
     opt['strike'] = opt[strike_col].astype(float)
 
-    upcoming = opt[opt['expiry'] >= pd.Timestamp(target_date)].sort_values('expiry')
-    current_expiry = upcoming['expiry'].iloc[0] if not upcoming.empty else opt['expiry'].max()
-    days_to_expiry = max(1, (current_expiry - pd.Timestamp(target_date)).days)
+    if not nearest_exp_str:
+        valid_expiries = sorted(opt[opt['expiry_dt'] >= target_date]['expiry_dt'].unique())
+        if not valid_expiries:
+            print("❌ कोणतीही वैध चालू किंवा आगामी एक्सपायरी सापडली नाही.")
+            return 0, 65
+        nearest_exp_str = valid_expiries[0]
 
-    spot_price = get_live_nifty_spot()
+    days_to_expiry = max(1, (pd.Timestamp(nearest_exp_str) - pd.Timestamp(target_date)).days)
     atm_strike = round(spot_price / 50.0) * 50.0
     dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
-    print(f"🎯 Dynamic Spot: {spot_price} | ATM: {atm_strike} | Strikes: {dynamic_strikes}")
-
+    
     selected = opt[
-        (opt['expiry'] == current_expiry) &
+        (opt['expiry_dt'] == nearest_exp_str) &
         (opt['strike'].isin(dynamic_strikes))
-    ]
+    ].copy()
+
+    # मास्टर फाइलमधून लॉट साईज वाचणे
+    dynamic_lot_size = int(selected['lot_size'].iloc[0]) if ('lot_size' in selected.columns and not selected.empty) else 65
+
+    print(f"🎯 Dynamic Spot: {spot_price} | ATM: {atm_strike} | Expiry: {nearest_exp_str} | Lot: {dynamic_lot_size}")
+    print(f"📌 Dynamic Strikes: {dynamic_strikes}")
 
     all_rows = []
     is_today = (target_date == datetime.now(IST).strftime('%Y-%m-%d'))
@@ -164,14 +198,12 @@ def harvest_nifty_data(target_date: str):
         key = quote(row['instrument_key'], safe='')
         candles = []
         try:
-            # जर आजचा दिवस असेल तर थेट Intraday V3 एंडपॉईंट कॉल करा
             if is_today:
                 url_v3 = f"https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/1"
                 r = session.get(url_v3, headers=UPSTOX_HEADERS, timeout=8)
                 if r.status_code == 200:
                     candles = r.json().get('data', {}).get('candles', [])
 
-            # जुनी तारीख असल्यास Historical API कॉल करा
             if not candles:
                 url_hist = f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{target_date}/{target_date}"
                 r = session.get(url_hist, headers=UPSTOX_HEADERS, timeout=8)
@@ -198,7 +230,7 @@ def harvest_nifty_data(target_date: str):
 
     if not all_rows:
         print(f"[-] {target_date} साठी कोणतीही कॅन्डल उपलब्ध नाही.")
-        return 0
+        return 0, dynamic_lot_size
 
     df_all = pd.DataFrame(all_rows).sort_values(by=['symbol', 'timestamp']).reset_index(drop=True)
     df_all['price_change'] = df_all.groupby('symbol')['close'].diff().fillna(0.0)
@@ -226,11 +258,12 @@ def harvest_nifty_data(target_date: str):
     conn.commit()
     conn.close()
 
-    return len(df_final)
+    print(f"✅ {len(df_final):,} कॅन्डल्स SQLite डेटाबेसमध्ये यशस्वीरीत्या जतन केल्या.")
+    return len(df_final), dynamic_lot_size
 
 
 # ==============================================================================
-# ३. ब्रोकरेज व स्ट्रॅटेजी
+# ४. ब्रोकरेज व बॅकटेस्ट स्ट्रॅटेजी
 # ==============================================================================
 def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
     url = 'https://api.upstox.com/v2/charges/brokerage'
@@ -251,7 +284,7 @@ def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, s
     return {'total_charges': 52.0}
 
 
-def run_strategy(target_date: str):
+def run_strategy(target_date: str, lot_size: int):
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query(
         f"SELECT * FROM nifty_options_1m WHERE timestamp LIKE '{target_date}%' ORDER BY timestamp ASC, symbol ASC",
@@ -309,8 +342,8 @@ def run_strategy(target_date: str):
                     exit_p, reason = float(bar['close']), 'FORCE_EOD ⏱️'
 
                 if exit_p:
-                    gross = round((exit_p - active['entry_price']) * LOT_SIZE, 2)
-                    ch = get_upstox_charges(active['symbol'], LOT_SIZE, active['entry_price'], exit_p)['total_charges']
+                    gross = round((exit_p - active['entry_price']) * lot_size, 2)
+                    ch = get_upstox_charges(active['symbol'], lot_size, active['entry_price'], exit_p)['total_charges']
                     net = round(gross - ch, 2)
                     trades.append({
                         'side': active['side'],
@@ -369,13 +402,13 @@ def run_strategy(target_date: str):
 
 
 # ==============================================================================
-# ४. मुख्य नियंत्रक (Main Execution)
+# ५. मुख्य नियंत्रक (Main Execution)
 # ==============================================================================
 if __name__ == '__main__':
     init_database()
 
     today = datetime.now(IST).strftime('%Y-%m-%d')
-    candles_count = harvest_nifty_data(today)
+    candles_count, dynamic_lot = harvest_nifty_data(today)
 
     if candles_count == 0:
         msg = f"⚠️ *NIFTY Harvester ({today})*\nआजचा डेटा अद्याप उपलब्ध नाही किंवा आज मार्केट सुट्टी असू शकते."
@@ -383,7 +416,7 @@ if __name__ == '__main__':
         send_telegram(msg)
         exit(0)
 
-    trades = run_strategy(today)
+    trades = run_strategy(today, dynamic_lot)
 
     if trades:
         tot = len(trades)
@@ -402,10 +435,13 @@ if __name__ == '__main__':
                 f"   ⏱️ {t['entry_time']} ➡️ {t['exit_time']} | पॉईंट्स: `{t['pts']:+}`\n"
                 f"   💵 निव्वळ PnL: `₹ {t['net_pnl']:+,.2f}` ({t['reason']})\n"
             )
+        print(msg)
         send_telegram(msg)
     else:
-        send_telegram(
+        no_trade_msg = (
             f"ℹ️ *NIFTY निकाल ({today})*\n"
             f"🔹 *कॅन्डल्स:* `{candles_count:,}`\n"
             f"निकषांनुसार कोणताही ट्रेड झाला नाही."
         )
+        print(no_trade_msg)
+        send_telegram(no_trade_msg)
