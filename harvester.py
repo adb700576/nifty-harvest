@@ -23,7 +23,6 @@ UPSTOX_HEADERS = {
     'Authorization': f'Bearer {UPSTOX_TOKEN}',
 }
 
-# स्ट्रॅटेजी पॅरामीटर्स
 DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -108,20 +107,24 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
 
 
 # ==============================================================================
-# २. डायनॅमिक स्पॉट व एक्सपायरी (No Hardcoding)
+# २. डायनॅमिक स्पॉट (LTP + Quotes Fallback) व एक्सपायरी
 # ==============================================================================
 def get_live_nifty_spot():
-    try:
-        url = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050'
-        res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
-        if res.status_code == 200:
-            data = res.json().get('data', {})
-            for _, val in data.items():
-                lp = val.get('last_price')
-                if lp and float(lp) > 0:
-                    return float(lp)
-    except Exception as e:
-        print(f"[-] Spot Fetch Error: {e}")
+    endpoints = [
+        "https://api.upstox.com/v2/market-quote/ltp?instrument_key=NSE_INDEX|Nifty%2050",
+        "https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050"
+    ]
+    for url in endpoints:
+        try:
+            res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
+            if res.status_code == 200:
+                data = res.json().get('data', {})
+                for _, val in data.items():
+                    lp = val.get('last_price')
+                    if lp and float(lp) > 10000:
+                        return float(lp)
+        except Exception as e:
+            print(f"[-] Spot Fetch Error ({url}): {e}")
     return None
 
 
@@ -185,7 +188,6 @@ def harvest_nifty_data(target_date: str):
         (opt['strike'].isin(dynamic_strikes))
     ].copy()
 
-    # मास्टर फाइलमधून लॉट साईज वाचणे
     dynamic_lot_size = int(selected['lot_size'].iloc[0]) if ('lot_size' in selected.columns and not selected.empty) else 65
 
     print(f"🎯 Dynamic Spot: {spot_price} | ATM: {atm_strike} | Expiry: {nearest_exp_str} | Lot: {dynamic_lot_size}")
