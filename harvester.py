@@ -7,6 +7,8 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ==============================================================================
 # १. कॉन्फिगरेशन व क्रेडेंशियल्स
@@ -25,6 +27,11 @@ LOT_SIZE = 65
 DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 IST = timezone(timedelta(hours=5, minutes=30))
+
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+session.mount('https://', HTTPAdapter(max_retries=retries))
+
 
 def init_database():
     conn = sqlite3.connect(DB_FILE)
@@ -53,16 +60,14 @@ def init_database():
     conn.commit()
     conn.close()
 
-# ==============================================================================
-# २. टेलिग्राम मेसेज हेल्पर
-# ==============================================================================
+
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[Telegram Log]:\n{text}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(
+        session.post(
             url,
             data={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'},
             timeout=10
@@ -70,14 +75,14 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"[-] Telegram Error: {e}")
 
-# ==============================================================================
-# ३. ग्रीक्स आणि डायनॅमिक स्पॉट हेल्पर
-# ==============================================================================
+
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
+
 def norm_pdf(x):
     return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
 
 def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
     if expiry_days <= 0 or volatility <= 0 or spot <= 0 or strike <= 0:
@@ -101,10 +106,11 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
         'vega': round(vega, 2)
     }
 
+
 def get_live_nifty_spot():
     try:
         url = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050'
-        res = requests.get(url, headers=UPSTOX_HEADERS, timeout=10)
+        res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
         if res.status_code == 200:
             data = res.json().get('data', {})
             val = next(iter(data.values()), {})
@@ -115,13 +121,14 @@ def get_live_nifty_spot():
         print(f"[-] Spot Fetch Error: {e}")
     return 24200.0
 
+
 # ==============================================================================
-# ४. डेटा संकलन (Data Harvester - Fully Dynamic)
+# २. डेटा संकलन (Data Harvester - Dual Mode: Intraday V3 + Fallback)
 # ==============================================================================
 def harvest_nifty_data(target_date: str):
     print(f"🚀 डेटा डाऊनलोड सुरू झाला: {target_date}")
     try:
-        res_m = requests.get('https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz', timeout=30)
+        res_m = session.get('https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz', timeout=30)
         df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
     except Exception as e:
         print(f"[-] मास्टर इन्स्ट्रुमेंट एरर: {e}")
@@ -140,7 +147,6 @@ def harvest_nifty_data(target_date: str):
     current_expiry = upcoming['expiry'].iloc[0] if not upcoming.empty else opt['expiry'].max()
     days_to_expiry = max(1, (current_expiry - pd.Timestamp(target_date)).days)
 
-    # डायनॅमिक ATM आणि Strikes
     spot_price = get_live_nifty_spot()
     atm_strike = round(spot_price / 50.0) * 50.0
     dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
@@ -152,29 +158,42 @@ def harvest_nifty_data(target_date: str):
     ]
 
     all_rows = []
+    is_today = (target_date == datetime.now(IST).strftime('%Y-%m-%d'))
+
     for _, row in selected.iterrows():
         key = quote(row['instrument_key'], safe='')
-        url = f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{target_date}/{target_date}"
-        r = requests.get(url, headers=UPSTOX_HEADERS)
-        if r.status_code != 200 or not r.json().get('data', {}).get('candles', []):
-            url = f"https://api.upstox.com/v3/historical-candle/{key}/1minute/{target_date}/{target_date}"
-            r = requests.get(url, headers=UPSTOX_HEADERS)
+        candles = []
+        try:
+            # जर आजचा दिवस असेल तर थेट Intraday V3 एंडपॉईंट कॉल करा
+            if is_today:
+                url_v3 = f"https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/1"
+                r = session.get(url_v3, headers=UPSTOX_HEADERS, timeout=8)
+                if r.status_code == 200:
+                    candles = r.json().get('data', {}).get('candles', [])
 
-        if r.status_code == 200:
-            for c in r.json().get('data', {}).get('candles', []):
-                all_rows.append({
-                    'date': target_date,
-                    'timestamp': c[0],
-                    'symbol': row['tradingsymbol'],
-                    'strike': row['strike'],
-                    'option_type': 'CE' if 'CE' in str(row['tradingsymbol']).upper() else 'PE',
-                    'open': float(c[1]),
-                    'high': float(c[2]),
-                    'low': float(c[3]),
-                    'close': float(c[4]),
-                    'volume': int(c[5]),
-                    'oi': int(c[6]) if len(c) > 6 and c[6] is not None else 0
-                })
+            # जुनी तारीख असल्यास Historical API कॉल करा
+            if not candles:
+                url_hist = f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{target_date}/{target_date}"
+                r = session.get(url_hist, headers=UPSTOX_HEADERS, timeout=8)
+                if r.status_code == 200:
+                    candles = r.json().get('data', {}).get('candles', [])
+        except Exception:
+            continue
+
+        for c in candles:
+            all_rows.append({
+                'date': target_date,
+                'timestamp': c[0],
+                'symbol': row['tradingsymbol'],
+                'strike': row['strike'],
+                'option_type': 'CE' if 'CE' in str(row['tradingsymbol']).upper() else 'PE',
+                'open': float(c[1]),
+                'high': float(c[2]),
+                'low': float(c[3]),
+                'close': float(c[4]),
+                'volume': int(c[5]),
+                'oi': int(c[6]) if len(c) > 6 and c[6] is not None else 0
+            })
         time.sleep(0.04)
 
     if not all_rows:
@@ -209,16 +228,17 @@ def harvest_nifty_data(target_date: str):
 
     return len(df_final)
 
+
 # ==============================================================================
-# ५. ब्रोकरेज व V3 बॅकटेस्ट इंजिन
+# ३. ब्रोकरेज व स्ट्रॅटेजी
 # ==============================================================================
 def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
     url = 'https://api.upstox.com/v2/charges/brokerage'
     buy_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'BUY', 'price': str(buy_price)}
     sell_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'SELL', 'price': str(sell_price)}
     try:
-        res_b = requests.get(url, headers=UPSTOX_HEADERS, params=buy_params, timeout=2)
-        res_s = requests.get(url, headers=UPSTOX_HEADERS, params=sell_params, timeout=2)
+        res_b = session.get(url, headers=UPSTOX_HEADERS, params=buy_params, timeout=2)
+        res_s = session.get(url, headers=UPSTOX_HEADERS, params=sell_params, timeout=2)
         if res_b.status_code == 200 and res_s.status_code == 200:
             db = res_b.json().get('data', {}).get('charges', {})
             ds = res_s.json().get('data', {}).get('charges', {})
@@ -229,6 +249,7 @@ def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, s
     except Exception:
         pass
     return {'total_charges': 52.0}
+
 
 def run_strategy(target_date: str):
     conn = sqlite3.connect(DB_FILE)
@@ -346,16 +367,14 @@ def run_strategy(target_date: str):
 
     return trades
 
+
 # ==============================================================================
-# ६. मुख्य नियंत्रक (Main Execution - १००% Dynamic)
+# ४. मुख्य नियंत्रक (Main Execution)
 # ==============================================================================
 if __name__ == '__main__':
     init_database()
 
-    # अचूक भारतीय वेळेनुसार (IST) आजची तारीख
     today = datetime.now(IST).strftime('%Y-%m-%d')
-
-    # १. डेटा संकलित करणे
     candles_count = harvest_nifty_data(today)
 
     if candles_count == 0:
@@ -364,10 +383,8 @@ if __name__ == '__main__':
         send_telegram(msg)
         exit(0)
 
-    # २. स्ट्रॅटेजी रन करणे
     trades = run_strategy(today)
 
-    # ३. टेलिग्रामवर अहवाल पाठवणे
     if trades:
         tot = len(trades)
         wins = len([t for t in trades if t['net_pnl'] > 0])
