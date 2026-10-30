@@ -34,6 +34,7 @@ session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def init_database():
     conn = sqlite3.connect(DB_FILE)
+    # १-मिनिट कॅन्डल्स डेटाबेस
     conn.execute('''
     CREATE TABLE IF NOT EXISTS nifty_options_1m (
         date TEXT,
@@ -54,6 +55,25 @@ def init_database():
         gamma REAL,
         theta REAL,
         vega REAL
+    )
+    ''')
+    # कायमस्वरूपी ट्रेड जर्नल (Day, Week, Month, YoY ट्रॅकिंगसाठी)
+    conn.execute('''
+    CREATE TABLE IF NOT EXISTS trade_journal (
+        date TEXT,
+        side TEXT,
+        symbol TEXT,
+        entry_time TEXT,
+        exit_time TEXT,
+        entry_px REAL,
+        opt_sl REAL,
+        opt_target REAL,
+        exit_px REAL,
+        pts REAL,
+        lot_size INTEGER,
+        net_pnl REAL,
+        reason TEXT,
+        PRIMARY KEY (date, symbol, entry_time)
     )
     ''')
     conn.commit()
@@ -107,7 +127,41 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
 
 
 # ==============================================================================
-# २. Upstox V3 द्वारे डायनॅमिक स्पॉट व एक्सपायरी (Zero Hardcoding)
+# २. Upstox अधिकृत ब्रोकरेज आणि चार्जेस API (F&O Intraday)
+# ==============================================================================
+def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
+    url = 'https://api.upstox.com/v2/charges/brokerage'
+    buy_params = {
+        'instrument_token': instrument_token,
+        'quantity': str(quantity),
+        'product': 'I',
+        'transaction_type': 'BUY',
+        'price': str(buy_price)
+    }
+    sell_params = {
+        'instrument_token': instrument_token,
+        'quantity': str(quantity),
+        'product': 'I',
+        'transaction_type': 'SELL',
+        'price': str(sell_price)
+    }
+    try:
+        res_b = session.get(url, headers=UPSTOX_HEADERS, params=buy_params, timeout=3)
+        res_s = session.get(url, headers=UPSTOX_HEADERS, params=sell_params, timeout=3)
+        if res_b.status_code == 200 and res_s.status_code == 200:
+            db = res_b.json().get('data', {}).get('charges', {})
+            ds = res_s.json().get('data', {}).get('charges', {})
+            b = float(db.get('brokerage', 20.0)) + float(ds.get('brokerage', 20.0))
+            s = float(db.get('stt', 0.0)) + float(ds.get('stt', 0.0))
+            o = float(db.get('gst', 0.0)) + float(ds.get('gst', 0.0)) + float(db.get('stamp_duty', 0.0)) + float(db.get('other_charges', 0.0)) + float(ds.get('other_charges', 0.0))
+            return {'total_charges': round(b + s + o, 2)}
+    except Exception:
+        pass
+    return {'total_charges': 52.0}
+
+
+# ==============================================================================
+# ३. डायनॅमिक स्पॉट व एक्सपायरी (No Hardcoding)
 # ==============================================================================
 def get_live_nifty_spot():
     inst_key = "NSE_INDEX|Nifty 50"
@@ -152,7 +206,6 @@ def get_live_nifty_spot():
     except Exception:
         pass
 
-    print("❌ त्रुटी: V3 API कडून चालू किंवा क्लोजिंग निफ्टी स्पॉट प्राप्त झाला नाही.")
     return None
 
 
@@ -171,7 +224,7 @@ def get_nearest_expiry_from_api(today_str):
 
 
 # ==============================================================================
-# ३. डेटा संकलन (Data Harvester)
+# ४. डेटा संकलन (Data Harvester)
 # ==============================================================================
 def harvest_nifty_data(target_date: str):
     print(f"🚀 डेटा डाऊनलोड सुरू झाला: {target_date}")
@@ -293,27 +346,8 @@ def harvest_nifty_data(target_date: str):
 
 
 # ==============================================================================
-# ४. ब्रोकरेज व बॅकटेस्ट स्ट्रॅटेजी
+# ५. स्ट्रॅटेजी रनर
 # ==============================================================================
-def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
-    url = 'https://api.upstox.com/v2/charges/brokerage'
-    buy_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'BUY', 'price': str(buy_price)}
-    sell_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'SELL', 'price': str(sell_price)}
-    try:
-        res_b = session.get(url, headers=UPSTOX_HEADERS, params=buy_params, timeout=2)
-        res_s = session.get(url, headers=UPSTOX_HEADERS, params=sell_params, timeout=2)
-        if res_b.status_code == 200 and res_s.status_code == 200:
-            db = res_b.json().get('data', {}).get('charges', {})
-            ds = res_s.json().get('data', {}).get('charges', {})
-            b = float(db.get('brokerage', 20.0)) + float(ds.get('brokerage', 20.0))
-            s = float(db.get('stt', 0.0)) + float(ds.get('stt', 0.0))
-            o = float(db.get('gst', 0.0)) + float(ds.get('gst', 0.0)) + float(db.get('stamp_duty', 0.0)) + float(db.get('other_charges', 0.0)) + float(ds.get('other_charges', 0.0))
-            return {'total_charges': round(b + s + o, 2)}
-    except Exception:
-        pass
-    return {'total_charges': 52.0}
-
-
 def run_strategy(target_date: str, lot_size: int):
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query(
@@ -372,17 +406,22 @@ def run_strategy(target_date: str, lot_size: int):
                     exit_p, reason = float(bar['close']), 'FORCE_EOD ⏱️'
 
                 if exit_p:
-                    gross = round((exit_p - active['entry_price']) * lot_size, 2)
+                    pts = round(exit_p - active['entry_price'], 2)
+                    gross = round(pts * lot_size, 2)
                     ch = get_upstox_charges(active['symbol'], lot_size, active['entry_price'], exit_p)['total_charges']
                     net = round(gross - ch, 2)
                     trades.append({
+                        'date': target_date,
                         'side': active['side'],
                         'symbol': active['symbol'],
                         'entry_time': active['entry_time'].strftime('%H:%M'),
                         'exit_time': ts.strftime('%H:%M'),
                         'entry_px': active['entry_price'],
+                        'opt_sl': active['opt_sl'],
+                        'opt_target': active['opt_target'],
                         'exit_px': round(exit_p, 2),
-                        'pts': round(exit_p - active['entry_price'], 2),
+                        'pts': pts,
+                        'lot_size': lot_size,
                         'net_pnl': net,
                         'reason': reason
                     })
@@ -432,7 +471,55 @@ def run_strategy(target_date: str, lot_size: int):
 
 
 # ==============================================================================
-# ५. मुख्य नियंत्रक (Main Execution)
+# ६. Cumulative PnL कॅल्क्युलेटर (Day, Week, Month, YoY)
+# ==============================================================================
+def save_and_get_cumulative_pnl(trades, current_date_str):
+    conn = sqlite3.connect(DB_FILE)
+    if trades:
+        for t in trades:
+            conn.execute('''
+            INSERT OR REPLACE INTO trade_journal 
+            (date, side, symbol, entry_time, exit_time, entry_px, opt_sl, opt_target, exit_px, pts, lot_size, net_pnl, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                t['date'], t['side'], t['symbol'], t['entry_time'], t['exit_time'],
+                t['entry_px'], t['opt_sl'], t['opt_target'], t['exit_px'],
+                t['pts'], t['lot_size'], t['net_pnl'], t['reason']
+            ))
+        conn.commit()
+
+    df_j = pd.read_sql_query("SELECT * FROM trade_journal", conn)
+    conn.close()
+
+    if df_j.empty:
+        return {'day': 0.0, 'week': 0.0, 'month': 0.0, 'yoy': 0.0}
+
+    df_j['dt'] = pd.to_datetime(df_j['date'])
+    curr_dt = pd.to_datetime(current_date_str)
+
+    # १. दिवस (Day)
+    day_pnl = df_j[df_j['dt'] == curr_dt]['net_pnl'].sum()
+
+    # २. चालू आठवडा (Week: सोमवार ते चालू दिवस)
+    start_of_week = curr_dt - pd.Timedelta(days=curr_dt.weekday())
+    week_pnl = df_j[(df_j['dt'] >= start_of_week) & (df_j['dt'] <= curr_dt)]['net_pnl'].sum()
+
+    # ३. चालू महिना (Month)
+    month_pnl = df_j[(df_j['dt'].dt.year == curr_dt.year) & (df_j['dt'].dt.month == curr_dt.month)]['net_pnl'].sum()
+
+    # ४. चालू वर्ष (Year on Year / YTD)
+    yoy_pnl = df_j[df_j['dt'].dt.year == curr_dt.year]['net_pnl'].sum()
+
+    return {
+        'day': round(day_pnl, 2),
+        'week': round(week_pnl, 2),
+        'month': round(month_pnl, 2),
+        'yoy': round(yoy_pnl, 2)
+    }
+
+
+# ==============================================================================
+# ७. मुख्य नियंत्रक
 # ==============================================================================
 if __name__ == '__main__':
     init_database()
@@ -447,31 +534,38 @@ if __name__ == '__main__':
         exit(0)
 
     trades = run_strategy(today, dynamic_lot)
+    pnl_summary = save_and_get_cumulative_pnl(trades, today)
+
+    tot = len(trades)
+    wins = len([t for t in trades if t['net_pnl'] > 0])
+    losses = tot - wins
+    tot_pnl = sum(t['net_pnl'] for t in trades)
+
+    msg = f"📊 *NIFTY ALGO निकाल — {today}*\n\n"
+    msg += f"🔹 *एकूण कॅन्डल्स:* `{candles_count:,}`\n"
+    msg += f"🔹 *ट्रेड्स:* `{tot}` (जिंकले: `{wins}`, तोटा: `{losses}`)\n"
+    msg += f"💵 *आजचा निव्वळ PnL:* `₹ {tot_pnl:+,.2f}`\n\n"
+
+    # Cumulative Performance
+    msg += "📈 *CUMULATIVE PERFORMANCE:*\n"
+    msg += f"▪️ *चालू दिवस (Day):* `₹ {pnl_summary['day']:+,.2f}`\n"
+    msg += f"▪️ *चालू आठवडा (Week):* `₹ {pnl_summary['week']:+,.2f}`\n"
+    msg += f"▪️ *चालू महिना (Month):* `₹ {pnl_summary['month']:+,.2f}`\n"
+    msg += f"▪️ *वार्षिक (YoY / YTD):* `₹ {pnl_summary['yoy']:+,.2f}`\n\n"
 
     if trades:
-        tot = len(trades)
-        wins = len([t for t in trades if t['net_pnl'] > 0])
-        losses = tot - wins
-        tot_pnl = sum(t['net_pnl'] for t in trades)
-
-        msg = f"📊 *NIFTY ALGO निकाल ({today})*\n\n"
-        msg += f"🔹 *एकूण कॅन्डल्स:* `{candles_count:,}`\n"
-        msg += f"🔹 *एकूण ट्रेड्स:* `{tot}` (जिंकले: `{wins}`, तोटा: `{losses}`)\n"
-        msg += f"💰 *निव्वळ नफा (Net PnL):* `₹ {tot_pnl:+,.2f}`\n\n"
-        msg += "📋 *ट्रेड तपशील:*\n"
+        msg += "📋 *ट्रेड तपशील (Complete Trade Details):*\n"
         for idx, t in enumerate(trades, 1):
             msg += (
-                f"{idx}. *{t['side']}* | `{t['symbol']}`\n"
-                f"   ⏱️ {t['entry_time']} ➡️ {t['exit_time']} | पॉईंट्स: `{t['pts']:+}`\n"
-                f"   💵 निव्वळ PnL: `₹ {t['net_pnl']:+,.2f}` ({t['reason']})\n"
+                f"*{idx}. {t['side']}* | `{t['symbol']}`\n"
+                f"   📅 तारीख: `{t['date']}` | वेळ: `{t['entry_time']}` ➡️ `{t['exit_time']}`\n"
+                f"   💵 एंट्री: `₹{t['entry_px']}` | एक्झिट: `₹{t['exit_px']}`\n"
+                f"   🛑 SL: `₹{t['opt_sl']}` | 🎯 Target: `₹{t['opt_target']}`\n"
+                f"   📊 पॉईंट्स: `{t['pts']:+}` | लॉट: `{t['lot_size']}`\n"
+                f"   💰 निव्वळ PnL: `₹ {t['net_pnl']:+,.2f}` ({t['reason']})\n\n"
             )
-        print(msg)
-        send_telegram(msg)
     else:
-        no_trade_msg = (
-            f"ℹ️ *NIFTY निकाल ({today})*\n"
-            f"🔹 *कॅन्डल्स:* `{candles_count:,}`\n"
-            f"निकषांनुसार कोणताही ट्रेड झाला नाही."
-        )
-        print(no_trade_msg)
-        send_telegram(no_trade_msg)
+        msg += "ℹ️ *निकषांनुसार कोणताही ट्रेड झाला नाही.*"
+
+    print(msg)
+    send_telegram(msg)
