@@ -23,12 +23,12 @@ UPSTOX_HEADERS = {
     'Authorization': f'Bearer {UPSTOX_TOKEN}',
 }
 
-LOT_SIZE = 65
+# स्ट्रॅटेजी पॅरामीटर्स (नियम)
 DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# नेटवर्क एरर / Connection Reset टाळण्यासाठी Session आणि Auto-Retry
+# नेटवर्क सुरक्षिततेसाठी Session + Auto-Retry[cite: 1]
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
@@ -79,7 +79,7 @@ def send_telegram(text: str):
 
 
 # ==============================================================================
-# २. ग्रीक्स आणि डायनॅमिक स्पॉट हेल्पर
+# २. ग्रीक्स कॅल्क्युलेशन
 # ==============================================================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -112,69 +112,103 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
     }
 
 
+# ==============================================================================
+# ३. डायनॅमिक स्पॉट, एक्सपायरी व लॉट साईज (Zero Hardcoding)
+# ==============================================================================
 def get_live_nifty_spot():
     try:
         url = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050'
         res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
         if res.status_code == 200:
             data = res.json().get('data', {})
-            val = next(iter(data.values()), {})
-            lp = val.get('last_price')
-            if lp:
-                return float(lp)
+            for _, val in data.items():
+                lp = val.get('last_price')
+                if lp and float(lp) > 0:
+                    return float(lp)
     except Exception as e:
         print(f"[-] Spot Fetch Error: {e}")
-    return 24200.0
+    return None
 
 
-# ==============================================================================
-# ३. डायनॅमिक इन्स्ट्रुमेंट्स लोड करणे (Auto ATM +/- 5 Strikes)
-# ==============================================================================
+def get_nearest_expiry_from_api(today_str):
+    try:
+        url = 'https://api.upstox.com/v2/expired-instruments/expiries?instrument_key=NSE_INDEX|Nifty%2050'
+        res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
+        if res.status_code == 200:
+            expiries = res.json().get('data', [])
+            valid = sorted([exp for exp in expiries if exp >= today_str])
+            if valid:
+                return valid[0]
+    except Exception as e:
+        print(f"[-] Expiry API Error: {e}")
+    return None
+
+
 def get_active_instruments(target_date: str):
+    spot = get_live_nifty_spot()
+    if spot is None:
+        print("❌ त्रुटी: लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही.")
+        send_telegram("⚠️ लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. कृपया API टोकन किंवा मार्केट स्टेटस तपासा.")
+        return pd.DataFrame(), 1, 0.0, 65
+
+    nearest_exp_str = get_nearest_expiry_from_api(target_date)
+
     try:
         res_m = session.get('https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz', timeout=30)
         df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
-        strike_col = 'strike_price' if 'strike_price' in df_m.columns else 'strike'
-        opt = df_m[
-            (df_m['exchange'] == 'NSE_FO') &
-            (df_m['name'].str.upper() == 'NIFTY') &
-            (df_m['instrument_type'] == 'OPTIDX')
-        ].copy()
-        opt['expiry'] = pd.to_datetime(opt['expiry'])
-        opt['strike'] = opt[strike_col].astype(float)
-
-        upcoming = opt[opt['expiry'] >= pd.Timestamp(target_date)].sort_values('expiry')
-        current_expiry = upcoming['expiry'].iloc[0] if not upcoming.empty else opt['expiry'].max()
-        days_to_expiry = max(1, (current_expiry - pd.Timestamp(target_date)).days)
-
-        spot = get_live_nifty_spot()
-        atm_strike = round(spot / 50.0) * 50.0
-        dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
-        print(f"🎯 Live Spot: {spot} | ATM: {atm_strike} | Active Strikes: {dynamic_strikes}")
-
-        selected = opt[(opt['expiry'] == current_expiry) & (opt['strike'].isin(dynamic_strikes))]
-        return selected, days_to_expiry, spot
     except Exception as e:
-        print(f"[-] Instrument load error: {e}")
-        return pd.DataFrame(), 1, 24200.0
+        print(f"[-] मास्टर इन्स्ट्रुमेंट डाऊनलोड एरर: {e}")
+        return pd.DataFrame(), 1, 0.0, 65
+
+    strike_col = 'strike_price' if 'strike_price' in df_m.columns else 'strike'
+    opt = df_m[
+        (df_m['exchange'] == 'NSE_FO') &
+        (df_m['name'].str.upper() == 'NIFTY') &
+        (df_m['instrument_type'] == 'OPTIDX')
+    ].copy()
+    opt['expiry_dt'] = pd.to_datetime(opt['expiry']).dt.strftime('%Y-%m-%d')
+    opt['strike'] = opt[strike_col].astype(float)
+
+    if not nearest_exp_str:
+        valid_expiries = sorted(opt[opt['expiry_dt'] >= target_date]['expiry_dt'].unique())
+        if not valid_expiries:
+            print("❌ कोणतीही वैध आगामी एक्सपायरी सापडली नाही.")
+            return pd.DataFrame(), 1, 0.0, 65
+        nearest_exp_str = valid_expiries[0]
+
+    days_to_expiry = max(1, (pd.Timestamp(nearest_exp_str) - pd.Timestamp(target_date)).days)
+    atm_strike = round(spot / 50.0) * 50.0
+    dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
+
+    selected = opt[
+        (opt['expiry_dt'] == nearest_exp_str) &
+        (opt['strike'].isin(dynamic_strikes))
+    ].copy()
+
+    # लॉट साईज थेट Upstox मास्टर फाइलमधून घेणे
+    dynamic_lot_size = int(selected['lot_size'].iloc[0]) if ('lot_size' in selected.columns and not selected.empty) else 65
+
+    print(f"🎯 Live Spot: {spot} | ATM: {atm_strike} | Nearest Expiry: {nearest_exp_str} | Lot: {dynamic_lot_size}")
+    print(f"📌 Active Strikes: {dynamic_strikes}")
+
+    return selected, days_to_expiry, spot, dynamic_lot_size
 
 
 # ==============================================================================
-# ४. १-मिनिट पोलिंग (Upstox Intraday V3 API - Safe & Resilient)
+# ४. १-मिनिट डेटा संकलन (Upstox Intraday V3 API)[cite: 1]
 # ==============================================================================
 def fetch_and_store_latest(selected, today_str, days_to_expiry, spot):
     all_rows = []
     for _, row in selected.iterrows():
         try:
             key = quote(row['instrument_key'], safe='')
-            # V3 Intraday Candle Endpoint (चालू दिवसाच्या १-मिनिट डेटासाठी अधिकृत URL)
             url = f"https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/1"
             r = session.get(url, headers=UPSTOX_HEADERS, timeout=7)
 
             if r.status_code == 200:
                 candles = r.json().get('data', {}).get('candles', [])
                 if candles:
-                    c = candles[0]  # सर्वात ताजी कॅन्डल
+                    c = candles[0]
                     all_rows.append({
                         'date': today_str,
                         'timestamp': c[0],
@@ -189,7 +223,6 @@ def fetch_and_store_latest(selected, today_str, days_to_expiry, spot):
                         'oi': int(c[6]) if len(c) > 6 and c[6] is not None else 0
                     })
         except Exception:
-            # अपस्टॉक्स नेटवर्क ड्रॉप झाले तरी कोड अखंड चालू राहील
             continue
         time.sleep(0.04)
 
@@ -223,12 +256,16 @@ def live_monitor():
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime('%Y-%m-%d')
 
-    send_telegram(f"🟢 *NIFTY Live Strategy Engine सुरू झाला!*\n📅 तारीख: `{today_str}`\n⏱️ वेळ: `{now_ist.strftime('%H:%M:%S')}`")
-
-    selected_inst, dte, live_spot = get_active_instruments(today_str)
+    selected_inst, dte, live_spot, lot_size = get_active_instruments(today_str)
     if selected_inst.empty:
-        send_telegram("❌ इन्स्ट्रुमेंट्स लोड करता आले नाहीत. कृपया API टोकन तपासा.")
+        send_telegram("❌ इन्स्ट्रुमेंट्स लोड करता आले नाहीत. कृपया क्रेडेंशियल्स किंवा मार्केट स्टेटस तपासा.")
         return
+
+    send_telegram(
+        f"🟢 *NIFTY Live Strategy Engine सुरू झाला!*\n"
+        f"📅 तारीख: `{today_str}` | वेळ: `{now_ist.strftime('%H:%M:%S')}`\n"
+        f"🎯 स्पॉट: `{live_spot}` | लॉट साईज: `{lot_size}`"
+    )
 
     active_trade = None
     morning_trades = 0
@@ -254,21 +291,25 @@ def live_monitor():
         if not df_all.empty:
             df_all['timestamp'] = pd.to_datetime(df_all['timestamp'])
 
-            # १. चालू ट्रेड SL/Target तपासणी
             if active_trade:
                 curr_sym_data = df_all[df_all['symbol'] == active_trade['symbol']].sort_values('timestamp')
                 if not curr_sym_data.empty:
                     latest_bar = curr_sym_data.iloc[-1]
                     if latest_bar['low'] <= active_trade['opt_sl']:
-                        send_telegram(f"🛑 *STOP LOSS HIT!*\n`{active_trade['symbol']}`\nएक्झिट भाव: `₹{active_trade['opt_sl']}` | तोटा: `₹{(active_trade['opt_sl'] - active_trade['entry_price']) * LOT_SIZE:,.2f}`")
+                        send_telegram(
+                            f"🛑 *STOP LOSS HIT!*\n`{active_trade['symbol']}`\n"
+                            f"एक्झिट भाव: `₹{active_trade['opt_sl']}` | तोटा: `₹{(active_trade['opt_sl'] - active_trade['entry_price']) * lot_size:,.2f}`"
+                        )
                         active_trade = None
                         cooldown_until = curr_time + timedelta(minutes=15)
                     elif latest_bar['high'] >= active_trade['opt_target']:
-                        send_telegram(f"🎯 *TARGET HIT!*\n`{active_trade['symbol']}`\nएक्झिट भाव: `₹{active_trade['opt_target']}` | नफा: `₹{(active_trade['opt_target'] - active_trade['entry_price']) * LOT_SIZE:,.2f}`")
+                        send_telegram(
+                            f"🎯 *TARGET HIT!*\n`{active_trade['symbol']}`\n"
+                            f"एक्झिट भाव: `₹{active_trade['opt_target']}` | नफा: `₹{(active_trade['opt_target'] - active_trade['entry_price']) * lot_size:,.2f}`"
+                        )
                         active_trade = None
                         cooldown_until = curr_time + timedelta(minutes=15)
 
-            # २. नवीन सिग्नल तपासणी
             is_morning = ('09:40' <= hhmm <= '11:30') and (morning_trades < 1)
             is_afternoon = ('12:30' <= hhmm <= '14:30') and (afternoon_trades < 2)
 
