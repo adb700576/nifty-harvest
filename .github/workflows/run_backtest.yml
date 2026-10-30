@@ -1,0 +1,36 @@
+name: Run October Backtest
+
+on:
+  workflow_dispatch: # Actions टॅबमधून मॅन्युअली १-क्लिकवर रन करण्यासाठी
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install requests pandas pytz urllib3
+
+      - name: Run October Backtest Engine
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python october_backtest.py
+
+      - name: Upload Backtest DB Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: october-vault-db
+          path: nifty_vault.db
