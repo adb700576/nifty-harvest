@@ -65,7 +65,7 @@ def send_telegram(text: str):
         print(f"[-] Telegram Error: {e}")
 
 # ==============================================================================
-# ग्रीक्स आणि बिल्डअप
+# ग्रीक्स आणि डायनॅमिक स्पॉट हेल्पर
 # ==============================================================================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
@@ -90,8 +90,22 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
         theta = (-(spot * norm_pdf(d1) * volatility) / (2.0 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm_cdf(-d2)) / 365.0
     return {'delta': round(delta, 4), 'gamma': round(gamma, 6), 'theta': round(theta, 2), 'vega': round(vega, 2)}
 
+def get_live_nifty_spot():
+    try:
+        url = 'https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050'
+        res = requests.get(url, headers=UPSTOX_HEADERS, timeout=10)
+        if res.status_code == 200:
+            data = res.json().get('data', {})
+            val = next(iter(data.values()), {})
+            lp = val.get('last_price')
+            if lp:
+                return float(lp)
+    except Exception as e:
+        print(f"[-] Spot Fetch Error: {e}")
+    return 24200.0
+
 # ==============================================================================
-# इन्स्ट्रुमेंट्स लोड करणे
+# डायनॅमिक इन्स्ट्रुमेंट्स लोड करणे (Auto ATM +/- 5 Strikes)
 # ==============================================================================
 def get_active_instruments(target_date: str):
     try:
@@ -106,18 +120,22 @@ def get_active_instruments(target_date: str):
         current_expiry = upcoming['expiry'].iloc[0] if not upcoming.empty else opt['expiry'].max()
         days_to_expiry = max(1, (current_expiry - pd.Timestamp(target_date)).days)
         
-        # मुख्य ATM स्ट्राइक रेंज
-        strikes = [24000, 24050, 24100, 24150, 24200, 24250, 24300, 24350, 24400, 24450, 24500]
-        selected = opt[(opt['expiry'] == current_expiry) & (opt['strike'].isin(strikes))]
-        return selected, days_to_expiry
+        # स्पॉट वाचून डायनॅमिक ११ स्ट्राइक्स निवडणे
+        spot = get_live_nifty_spot()
+        atm_strike = round(spot / 50.0) * 50.0
+        dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
+        print(f"🎯 Live Spot: {spot} | ATM: {atm_strike} | Active Strikes: {dynamic_strikes}")
+
+        selected = opt[(opt['expiry'] == current_expiry) & (opt['strike'].isin(dynamic_strikes))]
+        return selected, days_to_expiry, spot
     except Exception as e:
         print(f"[-] Instrument load error: {e}")
-        return pd.DataFrame(), 1
+        return pd.DataFrame(), 1, 24200.0
 
 # ==============================================================================
-# १-मिनिट लाईव्ह पोलिंग व सेव्ह
+# १-मिनिट पोलिंग व डेटा सेव्ह
 # ==============================================================================
-def fetch_and_store_latest(selected, today_str, days_to_expiry):
+def fetch_and_store_latest(selected, today_str, days_to_expiry, spot):
     all_rows = []
     for _, row in selected.iterrows():
         key = quote(row['instrument_key'], safe='')
@@ -130,7 +148,7 @@ def fetch_and_store_latest(selected, today_str, days_to_expiry):
         if r.status_code == 200:
             candles = r.json().get('data', {}).get('candles', [])
             if candles:
-                c = candles[0] # सर्वात नवीन कॅन्डल
+                c = candles[0]
                 all_rows.append({
                     'date': today_str,
                     'timestamp': c[0],
@@ -154,7 +172,7 @@ def fetch_and_store_latest(selected, today_str, days_to_expiry):
     df_new['change_oi'] = 0
     df_new['buildup'] = 'Neutral'
     
-    greeks = [calculate_greeks(24200.0, r['strike'], days_to_expiry, 0.14, r['option_type']) for _, r in df_new.iterrows()]
+    greeks = [calculate_greeks(spot, r['strike'], days_to_expiry, 0.14, r['option_type']) for _, r in df_new.iterrows()]
     df_final = pd.concat([df_new, pd.DataFrame(greeks)], axis=1)
 
     conn = sqlite3.connect(DB_FILE)
@@ -164,7 +182,7 @@ def fetch_and_store_latest(selected, today_str, days_to_expiry):
     return len(df_final)
 
 # ==============================================================================
-# मुख्य लाईव्ह लूप (०९:१५ ते १५:३०)
+# मुख्य लाईव्ह मॉनिटरिंग लूप
 # ==============================================================================
 def live_monitor():
     init_database()
@@ -173,9 +191,9 @@ def live_monitor():
     
     send_telegram(f"🟢 *NIFTY Live Strategy Engine सुरू झाला!*\n📅 तारीख: `{today_str}`\n⏱️ वेळ: `{now_ist.strftime('%H:%M:%S')}`")
     
-    selected_inst, dte = get_active_instruments(today_str)
+    selected_inst, dte, live_spot = get_active_instruments(today_str)
     if selected_inst.empty:
-        send_telegram("❌ इन्स्ट्रुमेंट्स लोड करता आले नाहीत. कृपया क्रेडेंशियल्स तपासा.")
+        send_telegram("❌ इन्स्ट्रुमेंट्स लोड करता आले नाहीत. कृपया API टोकन तपासा.")
         return
 
     active_trade = None
@@ -187,17 +205,15 @@ def live_monitor():
         curr_time = datetime.now(IST)
         hhmm = curr_time.strftime('%H:%M')
 
-        # ३:३० ला बाजार संपताच लूप बंद होईल
+        # दुपारी ३:३० ला लूप बंद होईल
         if hhmm >= '15:30':
             if active_trade:
                 send_telegram(f"⏱️ *EOD Force Exit:* `{active_trade['symbol']}` बाजार बंद झाला.")
             send_telegram("🏁 *आजचा लाईव्ह ट्रेडिंग दिवस पूर्ण झाला.* EOD रिपोर्ट सेव्ह झाला.")
             break
 
-        # डेटा फेच करा
-        fetch_and_store_latest(selected_inst, today_str, dte)
+        fetch_and_store_latest(selected_inst, today_str, dte, live_spot)
 
-        # डेटाबेसमधून डेटा तपासा
         conn = sqlite3.connect(DB_FILE)
         df_all = pd.read_sql_query(f"SELECT * FROM nifty_options_1m WHERE timestamp LIKE '{today_str}%'", conn)
         conn.close()
@@ -205,7 +221,7 @@ def live_monitor():
         if not df_all.empty:
             df_all['timestamp'] = pd.to_datetime(df_all['timestamp'])
             
-            # १. चालू ट्रेड असेल तर SL/Target तपासा
+            # १. चालू ट्रेड SL/Target मॉनिटर करणे
             if active_trade:
                 curr_sym_data = df_all[df_all['symbol'] == active_trade['symbol']].sort_values('timestamp')
                 if not curr_sym_data.empty:
@@ -219,13 +235,12 @@ def live_monitor():
                         active_trade = None
                         cooldown_until = curr_time + timedelta(minutes=15)
 
-            # २. नवीन सिग्नल तपासणे
+            # २. नवीन सिग्नल शोधणे
             is_morning = ('09:40' <= hhmm <= '11:30') and (morning_trades < 1)
             is_afternoon = ('12:30' <= hhmm <= '14:30') and (afternoon_trades < 2)
 
             if not active_trade and (is_morning or is_afternoon):
                 if not cooldown_until or curr_time >= cooldown_until:
-                    # नवीनतम बार तपासा
                     latest_ts = df_all['timestamp'].max()
                     snap = df_all[df_all['timestamp'] == latest_ts]
                     
@@ -259,7 +274,6 @@ def live_monitor():
                                 )
                                 break
 
-        # दर ६० सेकंदांनी पुन्हा तपासा
         time.sleep(60)
 
 if __name__ == '__main__':
