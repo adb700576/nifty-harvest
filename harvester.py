@@ -107,44 +107,52 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
 
 
 # ==============================================================================
-# २. डायनॅमिक स्पॉट (Live Quote -> Day Candle Fallback) व एक्सपायरी
+# २. Upstox V3 द्वारे डायनॅमिक स्पॉट व एक्सपायरी (Zero Hardcoding)
 # ==============================================================================
 def get_live_nifty_spot():
-    key = quote("NSE_INDEX|Nifty 50", safe="")
-    
-    # १. चालू मार्केटमध्ये थेट Live LTP / Quotes API
-    live_urls = [
-        f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={key}",
-        f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={key}"
-    ]
-    for url in live_urls:
-        try:
-            res = session.get(url, headers=UPSTOX_HEADERS, timeout=6)
-            if res.status_code == 200:
-                data = res.json().get('data', {})
-                for _, val in data.items():
-                    lp = val.get('last_price')
-                    if lp and float(lp) > 10000:
-                        return float(lp)
-        except Exception:
-            pass
+    inst_key = "NSE_INDEX|Nifty 50"
+    enc_key = quote(inst_key, safe="")
 
-    # २. बाजार बंद असल्यास आजच्या डेली कॅन्डलचा क्लोजिंग भाव (Zero Hardcode)
     try:
-        today_str = datetime.now(IST).strftime('%Y-%m-%d')
-        hist_url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{today_str}/{today_str}"
-        res = session.get(hist_url, headers=UPSTOX_HEADERS, timeout=6)
+        url_ltp = f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={enc_key}"
+        res = session.get(url_ltp, headers=UPSTOX_HEADERS, timeout=6)
+        if res.status_code == 200:
+            data = res.json().get('data', {})
+            for _, val in data.items():
+                lp = val.get('last_price')
+                if lp and float(lp) > 10000:
+                    return float(lp)
+    except Exception:
+        pass
+
+    try:
+        url_ohlc = f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={enc_key}&interval=1d"
+        res = session.get(url_ohlc, headers=UPSTOX_HEADERS, timeout=6)
+        if res.status_code == 200:
+            data = res.json().get('data', {})
+            for _, val in data.items():
+                close_px = val.get('close') or (val.get('ohlc', {}).get('close') if isinstance(val.get('ohlc'), dict) else None)
+                if close_px and float(close_px) > 10000:
+                    return float(close_px)
+                lp = val.get('last_price')
+                if lp and float(lp) > 10000:
+                    return float(lp)
+    except Exception:
+        pass
+
+    try:
+        url_day = f"https://api.upstox.com/v3/historical-candle/intraday/{enc_key}/days/1"
+        res = session.get(url_day, headers=UPSTOX_HEADERS, timeout=6)
         if res.status_code == 200:
             candles = res.json().get('data', {}).get('candles', [])
             if candles:
-                close_spot = float(candles[0][4])
-                if close_spot > 10000:
-                    print(f"📌 बाजार बंद असल्याने आजचा क्लोजिंग स्पॉट निवडला: {close_spot}")
-                    return close_spot
-    except Exception as e:
-        print(f"[-] Spot Day Candle Fetch Error: {e}")
+                day_close = float(candles[0][4])
+                if day_close > 10000:
+                    return day_close
+    except Exception:
+        pass
 
-    print("❌ त्रुटी: लाईव्ह किंवा क्लोजिंग निफ्टी स्पॉट प्राप्त झाला नाही.")
+    print("❌ त्रुटी: V3 API कडून चालू किंवा क्लोजिंग निफ्टी स्पॉट प्राप्त झाला नाही.")
     return None
 
 
@@ -170,7 +178,7 @@ def harvest_nifty_data(target_date: str):
     
     spot_price = get_live_nifty_spot()
     if spot_price is None:
-        print("❌ त्रुटी: लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. प्रोसेस थांबवत आहे.")
+        print("❌ त्रुटी: निफ्टी स्पॉट प्राप्त झाला नाही. प्रोसेस थांबवत आहे.")
         send_telegram("⚠️ लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. कृपया API टोकन किंवा मार्केट स्टेटस तपासा.")
         return 0, 65
 
