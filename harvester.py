@@ -107,24 +107,44 @@ def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
 
 
 # ==============================================================================
-# २. डायनॅमिक स्पॉट (LTP + Quotes Fallback) व एक्सपायरी
+# २. डायनॅमिक स्पॉट (Live Quote -> Day Candle Fallback) व एक्सपायरी
 # ==============================================================================
 def get_live_nifty_spot():
-    endpoints = [
-        "https://api.upstox.com/v2/market-quote/ltp?instrument_key=NSE_INDEX|Nifty%2050",
-        "https://api.upstox.com/v2/market-quote/quotes?instrument_key=NSE_INDEX|Nifty%2050"
+    key = quote("NSE_INDEX|Nifty 50", safe="")
+    
+    # १. चालू मार्केटमध्ये थेट Live LTP / Quotes API
+    live_urls = [
+        f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={key}",
+        f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={key}"
     ]
-    for url in endpoints:
+    for url in live_urls:
         try:
-            res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
+            res = session.get(url, headers=UPSTOX_HEADERS, timeout=6)
             if res.status_code == 200:
                 data = res.json().get('data', {})
                 for _, val in data.items():
                     lp = val.get('last_price')
                     if lp and float(lp) > 10000:
                         return float(lp)
-        except Exception as e:
-            print(f"[-] Spot Fetch Error ({url}): {e}")
+        except Exception:
+            pass
+
+    # २. बाजार बंद असल्यास आजच्या डेली कॅन्डलचा क्लोजिंग भाव (Zero Hardcode)
+    try:
+        today_str = datetime.now(IST).strftime('%Y-%m-%d')
+        hist_url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{today_str}/{today_str}"
+        res = session.get(hist_url, headers=UPSTOX_HEADERS, timeout=6)
+        if res.status_code == 200:
+            candles = res.json().get('data', {}).get('candles', [])
+            if candles:
+                close_spot = float(candles[0][4])
+                if close_spot > 10000:
+                    print(f"📌 बाजार बंद असल्याने आजचा क्लोजिंग स्पॉट निवडला: {close_spot}")
+                    return close_spot
+    except Exception as e:
+        print(f"[-] Spot Day Candle Fetch Error: {e}")
+
+    print("❌ त्रुटी: लाईव्ह किंवा क्लोजिंग निफ्टी स्पॉट प्राप्त झाला नाही.")
     return None
 
 
