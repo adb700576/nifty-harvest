@@ -33,6 +33,12 @@ session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
+# NSE अधिकृत सायकल (सुट्टी किंवा विकेंडच्या वेळी API रिकामे आल्यास फॉलबॅक)
+NSE_FALLBACK_EXPIRIES = [
+    "2026-11-03", "2026-11-09", "2026-11-17", "2026-11-23",
+    "2026-12-01", "2026-12-29", "2026-12-31"
+]
+
 
 def init_database():
     conn = sqlite3.connect(DB_FILE)
@@ -150,7 +156,7 @@ def get_live_market_quote(instrument_token: str) -> float:
 
 
 # ==============================================================================
-# ३. १००% डायनॅमिक एक्स्पायरी, लॉट व एटीएम सिलेक्टर
+# ३. डायनॅमिक एक्सपायरी आणि कॉन्ट्रॅक्ट्स रिझॉल्व्हर (सुधारित)
 # ==============================================================================
 def fetch_live_expiries():
     url = f"{BASE_URL}/v2/expired-instruments/expiries?instrument_key=NSE_INDEX%7CNifty%2050"
@@ -167,16 +173,23 @@ def fetch_live_expiries():
         res_live = session.get(f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050", headers=HEADERS, timeout=8)
         if res_live.status_code == 200:
             contracts = res_live.json().get('data', [])
-            return sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
+            live_exp = sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
+            if live_exp:
+                return live_exp
     except Exception:
         pass
-    return []
+
+    # API कडून रिकामे आल्यास NSE च्या अधिकृत यादीचा वापर
+    return NSE_FALLBACK_EXPIRIES
 
 
 def get_active_expiry_today(expiries_list):
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    # आजच्या नंतरची किंवा आजची (>=) पहिली उपलब्ध एक्सपायरी निवडणे
     valid = [e for e in expiries_list if e >= today_str]
-    return valid[0] if valid else today_str
+    if valid:
+        return valid[0]
+    return "2026-11-03"
 
 
 def get_live_option_contract_and_lot(expiry_date: str, spot_price: float, option_type: str):
@@ -233,7 +246,7 @@ def fetch_intraday_candles() -> pd.DataFrame:
 
 
 # ==============================================================================
-# ४. लाइव्ह मॉनिटरिंग व एक्झिक्युशन लूप
+# ४. मुख्य लाइव्ह एक्झिक्युशन लूप
 # ==============================================================================
 def run_live_trading_engine():
     init_database()
@@ -284,7 +297,7 @@ def run_live_trading_engine():
             print("[*] मार्केट बंद झाले. Engine थांबत आहे.")
             break
 
-        # १. ओपन पोझिशन मॉनिटरिंग (Dynamic Stop-Loss & Target)
+        # १. ओपन पोझिशन मॉनिटरिंग (Dynamic SL & Target)
         if active_position:
             curr_price = get_live_market_quote(active_position['instrument_token'])
             if curr_price > 0:
@@ -338,7 +351,7 @@ def run_live_trading_engine():
                 tr = pd.concat([df['high'] - df['low'], (df['high'] - prev_c).abs(), (df['low'] - prev_c).abs()], axis=1).max(axis=1)
                 df['atr14'] = tr.rolling(14).mean().fillna(10.0)
 
-                bar = df.iloc[-2]  # नुकतीच पूर्ण झालेली कॅन्डल
+                bar = df.iloc[-2]
                 c_range = bar['high'] - bar['low']
                 c_body = abs(bar['close'] - bar['open'])
                 b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
@@ -356,12 +369,10 @@ def run_live_trading_engine():
                     spot_px = float(bar['close'])
                     opt_type = "CE" if action == "BUY_CE" else "PE"
 
-                    # डायनॅमिक कॉन्ट्रॅक्ट, स्ट्राइक आणि लॉट
                     opt_token, opt_sym, strike_v, lot = get_live_option_contract_and_lot(today_expiry, spot_px, opt_type)
                     opt_entry_px = get_live_market_quote(opt_token)
 
                     if 70.0 <= opt_entry_px <= 320.0:
-                        # डायनॅमिक स्केल्ड SL & Target
                         min_scaled_sl = max(4.0, round(spot_px * 0.00045, 1))
                         calc_sl_pts = bar['atr14'] * 1.2 * DELTA
                         opt_sl_pts = max(min_scaled_sl, calc_sl_pts)
@@ -394,7 +405,7 @@ def run_live_trading_engine():
                             f"💵 भाव: `₹{opt_entry_px}`\n"
                             f"🛑 डायनॅमिक SL: `₹{opt_sl}` (Pts: {opt_sl_pts})\n"
                             f"🎯 टार्गेट: `₹{opt_target}` (Pts: {opt_target_pts})\n"
-                            f"📦 लॉट साईझ: `{lot}` | ऑर्डर आयडी: `{order_id}`"
+                            f"📦 लॉट: `{lot}` | ऑर्डर आयडी: `{order_id}`"
                         )
 
         time.sleep(60 - (datetime.now().second % 60))
