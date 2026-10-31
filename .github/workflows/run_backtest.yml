@@ -1,12 +1,11 @@
 name: Run October Backtest
 
 on:
-  workflow_dispatch: # Actions टॅबमधून मॅन्युअली १-क्लिकवर रन करण्यासाठी
+  workflow_dispatch:
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -18,7 +17,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests pandas pytz urllib3
+          pip install requests pandas numpy pytz urllib3
 
       - name: Run October Backtest Engine
         env:
@@ -28,9 +27,9 @@ jobs:
         run: |
           python -u october_backtest.py
 
-      - name: Upload Backtest DB Artifact
+      - name: Upload Vault DB Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: october-vault-db
+          name: nifty-vault-db
           path: nifty_vault.db
