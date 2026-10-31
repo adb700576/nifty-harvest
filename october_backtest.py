@@ -108,34 +108,64 @@ def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, s
 
 
 # ==============================================================================
-# ३. NSE अधिकृत एक्सपायरी लिस्ट (NSE Official Expiry Cycle 2026)
+# ३. १००% डायनॅमिक एक्सपायरी आणि ऑप्शन कॉन्ट्रॅक्ट इंजिन (No Hardcoding)
 # ==============================================================================
-NSE_OFFICIAL_EXPIRIES = [
-    "2026-10-06",
-    "2026-10-13",
-    "2026-10-19",
-    "2026-10-27",
-    "2026-11-03",
-    "2026-11-09",
-    "2026-11-17",
-    "2026-11-23"
-]
+def fetch_all_dynamic_expiries():
+    """
+    Upstox Get Expiries API (/v2/expired-instruments/expiries) वरून
+    सर्व अधिकृत एक्सपायरी तारखा (मंगळवार असो वा सुट्टीमुळे बदललेली तारीख) थेट मिळवणे.
+    """
+    url = f"{BASE_URL}/v2/expired-instruments/expiries?instrument_key=NSE_INDEX%7CNifty%2050"
+    expiries = []
+    try:
+        res = session.get(url, headers=HEADERS, timeout=10)
+        if res.status_code == 200:
+            expiries = res.json().get('data', [])
+            if expiries:
+                print(f"[+] Upstox API Expiries: {len(expiries)} अधिकृत तारखा डायनॅमिकली मिळाल्या.", flush=True)
+                return sorted(list(set(expiries)))
+    except Exception as e:
+        print(f"[-] Expired Expiries API Exception: {e}", flush=True)
 
-def get_exact_nse_expiry_for_date(trade_date: pd.Timestamp) -> str:
+    # चालू (Active) कॉन्ट्रॅक्ट्समधून एक्सपायरी लिस्ट बॅकअप
+    try:
+        res_live = session.get(f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050", headers=HEADERS, timeout=8)
+        if res_live.status_code == 200:
+            contracts = res_live.json().get('data', [])
+            live_exp = [c['expiry'] for c in contracts if 'expiry' in c]
+            if live_exp:
+                expiries.extend(live_exp)
+    except Exception:
+        pass
+
+    return sorted(list(set(expiries)))
+
+
+def get_dynamic_expiry_for_date(expiries_list: list, trade_date: pd.Timestamp) -> str:
+    """
+    ट्रेडच्या तारखेवरून त्या आठवड्याची सर्वात जवळची उपलब्ध एक्सपायरी डायनॅमिकली शोधणे.
+    """
     t_str = trade_date.strftime("%Y-%m-%d")
-    for exp in NSE_OFFICIAL_EXPIRIES:
-        if exp >= t_str:
-            return exp
-    return "2026-11-03"
+    valid_dates = [e for e in expiries_list if e >= t_str]
+    if valid_dates:
+        return valid_dates[0]
+    
+    # अत्यंत दुर्मिळ अपवादात (जर API डाउन असेल) शेवटची उपलब्ध एक्सपायरी
+    return expiries_list[-1] if expiries_list else t_str
 
 
 CONTRACTS_CACHE = {}
 
-def get_option_contract_details(expiry_date: str, strike: int, option_type: str, master_df):
+def get_dynamic_option_contract(expiry_date: str, strike: int, option_type: str, master_df):
+    """
+    Get Expired Option Contracts API (/v2/expired-instruments/option/contract)
+    वरून त्या एक्सपायरीच्या ATM पर्यायाचा खरा instrument_key आणि सिम्बॉल मिळवणे.
+    """
     cache_key = f"{expiry_date}_{strike}_{option_type}"
     if cache_key in CONTRACTS_CACHE:
         return CONTRACTS_CACHE[cache_key]
 
+    # १. Upstox Expired Option Contracts API कॉल
     url = f"{BASE_URL}/v2/expired-instruments/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={expiry_date}"
     try:
         res = session.get(url, headers=HEADERS, timeout=8)
@@ -149,6 +179,7 @@ def get_option_contract_details(expiry_date: str, strike: int, option_type: str,
     except Exception:
         pass
 
+    # २. Master फाईलमधील शोध (Active Contracts साठी)
     if master_df is not None:
         strike_col = 'strike_price' if 'strike_price' in master_df.columns else 'strike'
         match = master_df[
@@ -165,6 +196,7 @@ def get_option_contract_details(expiry_date: str, strike: int, option_type: str,
             CONTRACTS_CACHE[cache_key] = res_tuple
             return res_tuple
 
+    # ३. Upstox Standard Key रचना (Fallback)
     exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
     dd_mm_yyyy = exp_dt.strftime("%d-%m-%Y")
     month_name = exp_dt.strftime("%b").upper()
@@ -218,7 +250,7 @@ def download_master():
     return None
 
 
-def fetch_index_futures_candles(from_date="2026-10-01", to_date="2026-10-30"):
+def fetch_index_candles(from_date="2026-10-01", to_date="2026-10-30"):
     index_key = quote("NSE_INDEX|Nifty 50", safe="")
     url = f"{BASE_URL}/v2/historical-candle/{index_key}/1minute/{to_date}/{from_date}"
     try:
@@ -239,18 +271,24 @@ def get_atm_strike(spot_price: float, step: int = 50) -> int:
 
 
 # ==============================================================================
-# ४. मुख्य बॅकटेस्ट इंजिन
+# ४. मुख्य बॅकटेस्ट इंजिन (100% Dynamic Engine)
 # ==============================================================================
 def run_october_authentic_backtest():
     init_database()
     print("==========================================================", flush=True)
-    print("  UPSTOX NIFTY NSE-OFFICIAL WEEKLY EXPIRIES (01-30 OCT 2026)", flush=True)
+    print("  UPSTOX NIFTY 100% DYNAMIC WEEKLY EXPIRIES (01-30 OCT 2026)", flush=True)
     print("==========================================================", flush=True)
 
     df_master = download_master()
+    expiries_list = fetch_all_dynamic_expiries()
 
+    if not expiries_list:
+        print("[-] एक्सपायरी यादी डाऊनलोड होऊ शकली नाही. क्रेडेंशियल्स तपासा.", flush=True)
+        return
+
+    print(f"[*] एकूण {len(expiries_list)} एक्सपायरी तारखांवर डायनॅमिक मॅपिंग सुरू आहे...", flush=True)
     print("[*] Fetching Full Month 1-Min Spot/Index Candles (01-30 Oct)...", flush=True)
-    df_fut_1m = fetch_index_futures_candles(from_date="2026-10-01", to_date="2026-10-30")
+    df_fut_1m = fetch_index_candles(from_date="2026-10-01", to_date="2026-10-30")
 
     if df_fut_1m.empty:
         print("[-] 1-Min Data फेच होऊ शकला नाही. Token तपासा.", flush=True)
@@ -274,7 +312,7 @@ def run_october_authentic_backtest():
     daily_trade_count = {}
     opt_candles_cache = {}
 
-    print("[*] Processing Strategy with NSE Official Expiry Calendar...\n", flush=True)
+    print("[*] Processing Dynamic Weekly Options Strategy...\n", flush=True)
 
     while i < len(df_fut_1m):
         current_bar = df_fut_1m.iloc[i]
@@ -323,8 +361,9 @@ def run_october_authentic_backtest():
                         atm_strike = get_atm_strike(fut_entry_price, step=50)
                         option_type = "CE" if action == "BUY_CE" else "PE"
 
-                        exact_expiry = get_exact_nse_expiry_for_date(retest_time)
-                        opt_key, opt_symbol, opt_lot = get_option_contract_details(exact_expiry, atm_strike, option_type, df_master)
+                        # संपूर्ण डायनॅमिक एक्सपायरी रिझॉल्व्हर
+                        exact_expiry = get_dynamic_expiry_for_date(expiries_list, retest_time)
+                        opt_key, opt_symbol, opt_lot = get_dynamic_option_contract(exact_expiry, atm_strike, option_type, df_master)
 
                         if opt_key:
                             cache_k = f"{opt_key}_{date_str}"
@@ -436,9 +475,9 @@ def run_october_authentic_backtest():
 
     df_res = pd.DataFrame(trade_logs)
     if not df_res.empty:
-        print("\n======================================= 1 OCT TO 30 OCT 2026 AUTHENTIC NSE TRADE REPORT =======================================")
+        print("\n======================================= 1 OCT TO 30 OCT 2026 DYNAMIC TRADE REPORT =======================================")
         print(df_res[['date', 'side', 'option_symbol', 'expiry', 'fut_entry_time', 'opt_entry', 'opt_exit', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-        print("================================================================================================================================")
+        print("=========================================================================================================================")
 
         tot_trades = len(df_res)
         wins = df_res[df_res['net_pnl'] > 0]
@@ -477,7 +516,7 @@ def run_october_authentic_backtest():
         yoy_pnl = df_res[df_res['dt'].dt.year == last_dt.year]['net_pnl'].sum()
 
         telegram_msg = (
-            f"🏆 *NIFTY OFFICIAL NSE EXPIRIES REPORT (01-30 OCT)*\n\n"
+            f"🏆 *NIFTY 100% DYNAMIC EXPIRIES REPORT (01-30 OCT)*\n\n"
             f"🔹 *एकूण ट्रेड्स:* `{tot_trades}` (जिंकले: `{len(wins)}`, तोटा: `{len(losses)}`)\n"
             f"🎯 *Win Rate:* `{win_rate:.1f}%` | *Profit Factor:* `{profit_factor:.2f}`\n"
             f"💵 *ग्रॉस नफा:* `₹ {gross_total:+,.2f}`\n"
@@ -488,7 +527,7 @@ def run_october_authentic_backtest():
             f"▪️ *चालू आठवडा (Week):* `₹ {week_pnl:+,.2f}`\n"
             f"▪️ *चालू महिना (Oct):* `₹ {month_pnl:+,.2f}`\n"
             f"▪️ *वार्षिक (YoY / YTD):* `₹ {yoy_pnl:+,.2f}`\n\n"
-            f"📊 *NSE च्या अधिकृत वीकली तारखांवर (06, 13, 19, 27 Oct आणि 03 Nov) आधारित बॅकटेस्ट पूर्ण झाला आहे.*"
+            f"📊 *Upstox API कडून सर्व एक्सपायरी तारखा डायनॅमिकली रिझॉल्व्ह झाल्या आहेत.*"
         )
         send_telegram(telegram_msg)
 
