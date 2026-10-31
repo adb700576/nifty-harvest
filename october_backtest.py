@@ -27,7 +27,6 @@ HEADERS = {
 }
 
 DELTA = 0.52
-MIN_OPT_SL_PTS = 10.0
 IST = timezone(timedelta(hours=5, minutes=30))
 
 session = requests.Session()
@@ -110,10 +109,9 @@ def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, s
 
 
 # ==============================================================================
-# ३. १००% डायनॅमिक एक्सपायरी, लॉट साईझ व एटीएम सर्च इंजिन
+# ३. डायनॅमिक एक्सपायरी, लॉट साईझ आणि एटीएम स्ट्राईक इंजिन
 # ==============================================================================
 def fetch_all_dynamic_expiries():
-    """ Get Expiries API वरून सर्व अधिकृत एक्सपायरी तारखा आणणे """
     url = f"{BASE_URL}/v2/expired-instruments/expiries?instrument_key=NSE_INDEX%7CNifty%2050"
     try:
         res = session.get(url, headers=HEADERS, timeout=10)
@@ -128,7 +126,6 @@ def fetch_all_dynamic_expiries():
 
 
 def get_dynamic_expiry_for_date(expiries_list: list, trade_date: pd.Timestamp) -> str:
-    """ ट्रेडच्या दिवसाची सर्वात जवळची वैध एक्सपायरी शोधणे """
     t_str = trade_date.strftime("%Y-%m-%d")
     valid_dates = [e for e in expiries_list if e >= t_str]
     if valid_dates:
@@ -139,14 +136,11 @@ def get_dynamic_expiry_for_date(expiries_list: list, trade_date: pd.Timestamp) -
 CONTRACTS_CACHE = {}
 
 def get_dynamic_option_contract_and_lot(expiry_date: str, spot_price: float, option_type: str, master_df):
-    """
-    अपस्टॉक्स API कडून ATM पर्याय, अचूक सिम्बॉल आणि अधिकृत lot_size डायनॅमिकली मिळवणे
-    """
     cache_key = f"{expiry_date}_{round(spot_price)}_{option_type}"
     if cache_key in CONTRACTS_CACHE:
         return CONTRACTS_CACHE[cache_key]
 
-    # १. Upstox Expired Option Contracts API कॉल
+    # १. Expired Option Contracts API
     url = f"{BASE_URL}/v2/expired-instruments/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={expiry_date}"
     try:
         res = session.get(url, headers=HEADERS, timeout=8)
@@ -154,20 +148,19 @@ def get_dynamic_option_contract_and_lot(expiry_date: str, spot_price: float, opt
             contracts = res.json().get('data', [])
             filtered = [c for c in contracts if c.get('instrument_type', '').upper() == option_type.upper()]
             if filtered:
-                # स्पॉट भावाच्या सर्वात जवळचा ATM स्ट्राइक निवडणे
                 best_contract = min(filtered, key=lambda x: abs(float(x.get('strike_price', 0)) - spot_price))
                 res_tuple = (
                     best_contract.get('instrument_key'),
                     best_contract.get('trading_symbol'),
                     float(best_contract.get('strike_price')),
-                    int(best_contract.get('lot_size'))  # थेट API कडून अधिकृत लॉट साईझ
+                    int(best_contract.get('lot_size'))
                 )
                 CONTRACTS_CACHE[cache_key] = res_tuple
                 return res_tuple
     except Exception:
         pass
 
-    # २. Upstox Master फाईलमधून शोध (Active Contracts साठी)
+    # २. Master फाईलमधून मॅचिंग
     if master_df is not None:
         strike_col = 'strike_price' if 'strike_price' in master_df.columns else 'strike'
         match = master_df[
@@ -183,12 +176,12 @@ def get_dynamic_option_contract_and_lot(expiry_date: str, spot_price: float, opt
                 target['instrument_key'],
                 target['tradingsymbol'],
                 float(target[strike_col]),
-                int(target['lot_size'])  # मास्टर फाईलमधील अधिकृत लॉट साईझ
+                int(target['lot_size'])
             )
             CONTRACTS_CACHE[cache_key] = res_tuple
             return res_tuple
 
-    # ३. Upstox Search API (atm_offset=0) द्वारे फॉलबॅक शोध
+    # ३. Upstox Search API (atm_offset=0) फॉलबॅक
     try:
         search_url = f"{BASE_URL}/v2/instruments/search"
         params = {
@@ -216,7 +209,6 @@ def get_dynamic_option_contract_and_lot(expiry_date: str, spot_price: float, opt
     except Exception:
         pass
 
-    # शेवटचा सेफ फॉलबॅक
     exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
     strike_round = round(spot_price / 50.0) * 50.0
     sim_sym = f"NIFTY26{exp_dt.strftime('%d%b').upper()}{int(strike_round)}{option_type}"
@@ -289,14 +281,13 @@ def fetch_index_candles(from_date="2026-10-01", to_date="2026-10-30"):
 def run_october_authentic_backtest():
     init_database()
     print("==========================================================", flush=True)
-    print("  UPSTOX NIFTY FULL DYNAMIC ENGINE (LOT SIZE & STRIKE)     ", flush=True)
+    print("  UPSTOX NIFTY FULL DYNAMIC ENGINE (LOT, EXPIRY & SCALED SL)", flush=True)
     print("==========================================================", flush=True)
 
     df_master = download_master()
     expiries_list = fetch_all_dynamic_expiries()
 
     if not expiries_list:
-        # सुरक्षित डायनॅमिक फॉलबॅक
         expiries_list = sorted(list(df_master[df_master['name'] == 'NIFTY']['expiry'].unique())) if df_master is not None else []
 
     print("[*] Fetching Full Month 1-Min Spot/Index Candles (01-30 Oct)...", flush=True)
@@ -324,7 +315,7 @@ def run_october_authentic_backtest():
     daily_trade_count = {}
     opt_candles_cache = {}
 
-    print("[*] Processing Dynamic Weekly Options Strategy...\n", flush=True)
+    print("[*] Processing Dynamic Scaled Options Strategy...\n", flush=True)
 
     while i < len(df_fut_1m):
         current_bar = df_fut_1m.iloc[i]
@@ -372,10 +363,10 @@ def run_october_authentic_backtest():
                         fut_entry_price = float(f_bar['close'])
                         option_type = "CE" if action == "BUY_CE" else "PE"
 
-                        # १. डायनॅमिक एक्सपायरी
+                        # डायनॅमिक एक्सपायरी
                         exact_expiry = get_dynamic_expiry_for_date(expiries_list, retest_time)
 
-                        # २. डायनॅमिक ATM स्ट्राइक आणि डायनॅमिक Lot Size
+                        # डायनॅमिक एटीएम स्ट्राइक आणि लॉट साईझ
                         opt_key, opt_symbol, strike_val, opt_lot = get_dynamic_option_contract_and_lot(
                             exact_expiry, fut_entry_price, option_type, df_master
                         )
@@ -397,9 +388,14 @@ def run_october_authentic_backtest():
                             if entry_opt_price <= 0:
                                 entry_opt_price = round(max(80.0, 180.0 - abs(fut_entry_price - strike_val) * 0.4), 2)
 
+                            # ==============================================================================
+                            # डायनॅमिक स्टॉप लॉस व टार्गेट स्केलिंग (इंडेक्स लेव्हलनुसार ॲडजस्ट होणारे)
+                            # ==============================================================================
+                            # स्पॉट भावाच्या ०.०४५% इतका किमान फ्लोअर (उदा. १०,००० वर ~४.५ पॉईंट्स, २३,००० वर ~१० पॉईंट्स, ५०,००० वर ~२२.५ पॉईंट्स)
+                            min_scaled_sl = max(4.0, round(fut_entry_price * 0.00045, 1))
                             calc_sl_pts = atr * 1.2 * DELTA
-                            opt_sl_pts = max(MIN_OPT_SL_PTS, calc_sl_pts)
-                            opt_target_pts = opt_sl_pts * 1.5
+                            opt_sl_pts = max(min_scaled_sl, calc_sl_pts)
+                            opt_target_pts = round(opt_sl_pts * 1.5, 2)
 
                             opt_sl = max(0.05, round(entry_opt_price - opt_sl_pts, 2))
                             opt_target = round(entry_opt_price + opt_target_pts, 2)
@@ -518,7 +514,7 @@ def run_october_authentic_backtest():
         print(f" [-] Total Upstox Charges (Taxes)   : ₹{charges_total:,.2f} (Avg ₹{charges_total/tot_trades:.2f} per trade)")
         print(f" [*] NET REALIZED P&L               : ₹{net_total:+,.2f}")
         print(f" -----------------------------------------------------------------------------------------------------------------------------------")
-        print(f" [+] Planned Risk-to-Reward Ratio   : 1 : 1.50 (Dynamic Minimum 10 Pts SL)")
+        print(f" [+] Planned Risk-to-Reward Ratio   : 1 : 1.50 (Dynamic Scaled SL & Target)")
         print(f" [+] Realized Average Win           : ₹{avg_win:+,.2f}")
         print(f" [-] Realized Average Loss          : ₹-{avg_loss:,.2f}")
         print(f" [*] Strategy Profit Factor         : {profit_factor:.2f}")
@@ -533,7 +529,7 @@ def run_october_authentic_backtest():
         yoy_pnl = df_res[df_res['dt'].dt.year == last_dt.year]['net_pnl'].sum()
 
         telegram_msg = (
-            f"🏆 *NIFTY FULL DYNAMIC EXPIRIES & LOT REPORT (01-30 OCT)*\n\n"
+            f"🏆 *NIFTY FULL DYNAMIC SCALED ENGINE REPORT (01-30 OCT)*\n\n"
             f"🔹 *एकूण ट्रेड्स:* `{tot_trades}` (जिंकले: `{len(wins)}`, तोटा: `{len(losses)}`)\n"
             f"🎯 *Win Rate:* `{win_rate:.1f}%` | *Profit Factor:* `{profit_factor:.2f}`\n"
             f"💵 *ग्रॉस नफा:* `₹ {gross_total:+,.2f}`\n"
@@ -544,7 +540,7 @@ def run_october_authentic_backtest():
             f"▪️ *चालू आठवडा (Week):* `₹ {week_pnl:+,.2f}`\n"
             f"▪️ *चालू महिना (Oct):* `₹ {month_pnl:+,.2f}`\n"
             f"▪️ *वार्षिक (YoY / YTD):* `₹ {yoy_pnl:+,.2f}`\n\n"
-            f"📊 *Upstox API कडून सर्व एक्सपायरी, ATM स्ट्राइक आणि Lot Size १००% डायनॅमिकली रिझॉल्व्ह झाले आहेत.*"
+            f"📊 *Upstox API कडून सर्व एक्सपायरी, ATM स्ट्राइक, Lot Size आणि स्केल्ड SL डायनॅमिकली रिझॉल्व्ह झाले आहेत.*"
         )
         send_telegram(telegram_msg)
 
