@@ -468,7 +468,6 @@ def run_october_authentic_backtest():
         print(f" [*] Strategy Profit Factor         : {profit_factor:.2f}")
         print("======================================================================================================================================================")
 
-        # Cumulative PnL Calculations
         df_res['dt'] = pd.to_datetime(df_res['date'])
         last_dt = df_res['dt'].max()
         day_pnl = df_res[df_res['dt'] == last_dt]['net_pnl'].sum()
