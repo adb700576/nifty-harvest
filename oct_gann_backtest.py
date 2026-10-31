@@ -21,8 +21,6 @@ DELTA = 0.52
 LOT_SIZE = 65
 BUFFER_PCT = 0.001          # ०.१% बफर
 MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे वाट पाहणे
-MAX_HOLD_BARS = 20          # थीटा डिके गार्ड: २० मिनिटांपेक्षा जास्त फ्लॅट राहिल्यास एक्झिट
-MOMENTUM_CHECK_BAR = 10     # पहिल्या १० मिनिटांत ५ पॉईंट्सही हालचाल न झाल्यास एक्झिट
 
 # ==============================================================================
 # २. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
@@ -68,11 +66,11 @@ def fetch_october_index_candles():
     return pd.DataFrame()
 
 # ==============================================================================
-# ४. गॅन बॅकटेस्ट इंजिन
+# ४. गॅन बॅकटेस्ट इंजिन (नो थीटा डिके - ओन्ली SL / TARGET / EOD)
 # ==============================================================================
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 + 15-MIN RETEST + THETA DECAY (OCT 2026)  ")
+    print("   NIFTY GANN SQUARE OF 9 + 15-MIN RETEST (NO THETA EXIT - OCT 2026) ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
@@ -147,27 +145,19 @@ def run_gann_october_backtest():
                             opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
 
                             exit_time, exit_opt_px, exit_reason = None, 0.0, None
-                            max_reached = est_entry_opt
 
-                            for f_idx in range(i + 1, min(c_len, i + 60)):
+                            # फॉरवर्ड लूप - फक्त SL, Target किंवा 15:20 EOD
+                            for f_idx in range(i + 1, c_len):
                                 f_bar = df_curr.iloc[f_idx]
-                                bars_in = f_idx - i
                                 f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
                                 cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
-                                max_reached = max(max_reached, cur_opt)
 
                                 if cur_opt >= opt_tgt:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT"
                                     break
                                 elif cur_opt <= opt_sl:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_sl, "SL_HIT"
-                                    break
-                                elif bars_in == MOMENTUM_CHECK_BAR and max_reached < (est_entry_opt + 5.0):
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "THETA_MOMENTUM_FAIL"
-                                    break
-                                elif bars_in >= MAX_HOLD_BARS:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "THETA_TIME_EXIT"
                                     break
                                 elif f_hhmm >= "15:20":
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD"
@@ -213,27 +203,19 @@ def run_gann_october_backtest():
                             opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
 
                             exit_time, exit_opt_px, exit_reason = None, 0.0, None
-                            max_reached = est_entry_opt
 
-                            for f_idx in range(i + 1, min(c_len, i + 60)):
+                            # फॉरवर्ड लूप - फक्त SL, Target किंवा 15:20 EOD
+                            for f_idx in range(i + 1, c_len):
                                 f_bar = df_curr.iloc[f_idx]
-                                bars_in = f_idx - i
                                 f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
                                 cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
-                                max_reached = max(max_reached, cur_opt)
 
                                 if cur_opt >= opt_tgt:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT"
                                     break
                                 elif cur_opt <= opt_sl:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_sl, "SL_HIT"
-                                    break
-                                elif bars_in == MOMENTUM_CHECK_BAR and max_reached < (est_entry_opt + 5.0):
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "THETA_MOMENTUM_FAIL"
-                                    break
-                                elif bars_in >= MAX_HOLD_BARS:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "THETA_TIME_EXIT"
                                     break
                                 elif f_hhmm >= "15:20":
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD"
