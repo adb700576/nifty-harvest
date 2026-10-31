@@ -1,17 +1,16 @@
-name: Daily Nifty Data Harvest & Auto PnL Engine
+name: Daily Harvest Vault
 
 on:
   schedule:
-    # दररोज दुपारी ०३:३६ वाजता (10:06 AM UTC)
-    - cron: '6 10 * * 1-5'
-  workflow_dispatch: # मॅन्युअली चाचणी घेण्यासाठी
+    # दररोज दुपारी 3:35 IST (UTC 10:05 AM) मार्केट बंद झाल्यानंतर डेटा साठवण्यासाठी
+    - cron: '5 10 * * 1-5'
+  workflow_dispatch:
 
 jobs:
-  harvest-and-analyze:
+  harvest:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -21,18 +20,17 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install pandas requests
+          pip install requests pandas numpy pytz urllib3
 
-      - name: Run Harvester & Strategy Engine
+      - name: Run Harvester
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python harvester.py
+          python -u harvester.py
 
-      - name: Upload Vault DB Artifact
+      - name: Upload Harvested DB Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: nifty-vault-db
+          name: harvested-nifty-vault
           path: nifty_vault.db
