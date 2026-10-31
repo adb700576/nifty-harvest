@@ -3,8 +3,9 @@ import math
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
+import numpy as np
 import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,17 +15,18 @@ from urllib3.util.retry import Retry
 # १. कॉन्फिगरेशन व क्रेडेंशियल्स
 # ==============================================================================
 DB_FILE = 'nifty_vault.db'
-UPSTOX_TOKEN = os.getenv('UPSTOX_TOKEN', 'a429fb9b-6faf-4c3c-b070-78cae68237c4')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-UPSTOX_HEADERS = {
-    'Accept': 'application/json',
-    'Authorization': f'Bearer {UPSTOX_TOKEN}',
+BASE_URL = "https://api.upstox.com"
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {ACCESS_TOKEN}"
 }
 
-DELTA_TARGET = 0.52
-MIN_OPT_SL_PTS = 10.0
+DELTA = 0.52
 IST = timezone(timedelta(hours=5, minutes=30))
 
 session = requests.Session()
@@ -35,33 +37,14 @@ session.mount('https://', HTTPAdapter(max_retries=retries))
 def init_database():
     conn = sqlite3.connect(DB_FILE)
     conn.execute('''
-    CREATE TABLE IF NOT EXISTS nifty_options_1m (
-        date TEXT,
-        timestamp TEXT,
-        symbol TEXT,
-        strike REAL,
-        option_type TEXT,
-        open REAL,
-        high REAL,
-        low REAL,
-        close REAL,
-        volume INTEGER,
-        oi INTEGER,
-        price_change REAL,
-        change_oi INTEGER,
-        buildup TEXT,
-        delta REAL,
-        gamma REAL,
-        theta REAL,
-        vega REAL,
-        PRIMARY KEY (symbol, timestamp)
-    )
-    ''')
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS trade_journal (
+    CREATE TABLE IF NOT EXISTS live_trade_journal (
+        trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
         date TEXT,
         side TEXT,
-        symbol TEXT,
+        option_symbol TEXT,
+        instrument_token TEXT,
+        expiry TEXT,
+        strike REAL,
         entry_time TEXT,
         exit_time TEXT,
         entry_px REAL,
@@ -70,439 +53,352 @@ def init_database():
         exit_px REAL,
         pts REAL,
         lot_size INTEGER,
+        order_id_entry TEXT,
+        order_id_exit TEXT,
+        charges REAL,
         net_pnl REAL,
-        reason TEXT,
-        PRIMARY KEY (date, symbol, entry_time)
-    )
-    ''')
+        exit_reason TEXT
+    )''')
     conn.commit()
     conn.close()
 
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[Telegram Log]:\n{text}")
+        print(f"\n[Telegram Alert]:\n{text}\n")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        session.post(
-            url,
-            data={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'},
-            timeout=10
-        )
+        session.post(url, json={'chat_id': TELEGRAM_CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}, timeout=6)
     except Exception as e:
         print(f"[-] Telegram Error: {e}")
 
 
-def norm_cdf(x):
-    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
-
-
-def norm_pdf(x):
-    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
-def calculate_greeks(spot, strike, expiry_days, volatility, opt_type, r=0.07):
-    if expiry_days <= 0 or volatility <= 0 or spot <= 0 or strike <= 0:
-        return {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
-    t = max(expiry_days, 0.5) / 365.0
-    v_sqrt_t = volatility * math.sqrt(t)
-    d1 = (math.log(spot / strike) + (r + 0.5 * volatility * volatility) * t) / v_sqrt_t
-    d2 = d1 - v_sqrt_t
-    gamma = norm_pdf(d1) / (spot * v_sqrt_t)
-    vega = (spot * norm_pdf(d1) * math.sqrt(t)) / 100.0
-    if opt_type.upper() in ['CE', 'CALL']:
-        delta = norm_cdf(d1)
-        theta = (-(spot * norm_pdf(d1) * volatility) / (2.0 * math.sqrt(t)) - r * strike * math.exp(-r * t) * norm_cdf(d2)) / 365.0
-    else:
-        delta = norm_cdf(d1) - 1.0
-        theta = (-(spot * norm_pdf(d1) * volatility) / (2.0 * math.sqrt(t)) + r * strike * math.exp(-r * t) * norm_cdf(-d2)) / 365.0
-    return {
-        'delta': round(delta, 4),
-        'gamma': round(gamma, 6),
-        'theta': round(theta, 2),
-        'vega': round(vega, 2)
-    }
-
-
+# ==============================================================================
+# २. UPSTOX LIVE API & ORDER EXECUTION
+# ==============================================================================
 def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
-    url = 'https://api.upstox.com/v2/charges/brokerage'
-    buy_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'BUY', 'price': str(buy_price)}
-    sell_params = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'SELL', 'price': str(sell_price)}
+    url = f"{BASE_URL}/v2/charges/brokerage"
+    total_brokerage = 0.0
+    total_stt = 0.0
+    total_other = 0.0
+
+    bp = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'BUY', 'price': str(buy_price)}
+    sp = {'instrument_token': instrument_token, 'quantity': str(quantity), 'product': 'I', 'transaction_type': 'SELL', 'price': str(sell_price)}
+
     try:
-        res_b = session.get(url, headers=UPSTOX_HEADERS, params=buy_params, timeout=2)
-        res_s = session.get(url, headers=UPSTOX_HEADERS, params=sell_params, timeout=2)
-        if res_b.status_code == 200 and res_s.status_code == 200:
-            db = res_b.json().get('data', {}).get('charges', {})
-            ds = res_s.json().get('data', {}).get('charges', {})
-            b = float(db.get('brokerage', 20.0)) + float(ds.get('brokerage', 20.0))
-            s = float(db.get('stt', 0.0)) + float(ds.get('stt', 0.0))
-            o = float(db.get('gst', 0.0)) + float(ds.get('gst', 0.0)) + float(db.get('stamp_duty', 0.0)) + float(db.get('other_charges', 0.0)) + float(ds.get('other_charges', 0.0))
-            return {'total_charges': round(b + s + o, 2)}
+        rb = session.get(url, headers=HEADERS, params=bp, timeout=3)
+        if rb.status_code == 200:
+            db = rb.json().get("data", {}).get("charges", {})
+            total_brokerage += float(db.get("brokerage", 20.0))
+            total_stt += float(db.get("stt", 0.0))
+            total_other += float(db.get("gst", 0.0)) + float(db.get("stamp_duty", 0.0)) + float(db.get("other_charges", 0.0))
+
+        rs = session.get(url, headers=HEADERS, params=sp, timeout=3)
+        if rs.status_code == 200:
+            ds = rs.json().get("data", {}).get("charges", {})
+            total_brokerage += float(ds.get("brokerage", 20.0))
+            total_stt += float(ds.get("stt", 0.0))
+            total_other += float(ds.get("gst", 0.0)) + float(ds.get("other_charges", 0.0))
+
+        total_taxes = round(total_brokerage + total_stt + total_other, 2)
+        if total_taxes > 0:
+            return {"total_charges": total_taxes}
     except Exception:
         pass
-    return {'total_charges': 52.0}
+    return {"total_charges": 52.0}
+
+
+def place_upstox_order(instrument_token: str, quantity: int, transaction_type: str = "BUY") -> str:
+    url = f"{BASE_URL}/v2/order/place"
+    payload = {
+        "quantity": quantity,
+        "product": "I",
+        "validity": "DAY",
+        "price": 0,
+        "tag": "ALGO_HARVEST",
+        "instrument_token": instrument_token,
+        "order_type": "MARKET",
+        "transaction_type": transaction_type,
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False
+    }
+    try:
+        res = session.post(url, headers=HEADERS, json=payload, timeout=5)
+        if res.status_code == 200:
+            return res.json().get("data", {}).get("order_id", "ORDER_SUCCESS")
+        else:
+            print(f"[-] Live Order Reject: {res.status_code} - {res.text}")
+    except Exception as e:
+        print(f"[-] Live Order Error: {e}")
+    return f"SIM_{int(time.time())}"
+
+
+def get_live_market_quote(instrument_token: str) -> float:
+    enc_key = quote(instrument_token, safe='')
+    url = f"{BASE_URL}/v2/market-quote/ltp?instrument_key={enc_key}"
+    try:
+        res = session.get(url, headers=HEADERS, timeout=4)
+        if res.status_code == 200:
+            data = res.json().get("data", {})
+            first_val = next(iter(data.values()), {})
+            return float(first_val.get("last_price", 0.0))
+    except Exception:
+        pass
+    return 0.0
 
 
 # ==============================================================================
-# २. Upstox V3 डायनॅमिक स्पॉट व एक्सपायरी
+# ३. १००% डायनॅमिक एक्स्पायरी, लॉट व एटीएम सिलेक्टर
 # ==============================================================================
-def get_live_nifty_spot():
-    inst_key = "NSE_INDEX|Nifty 50"
-    enc_key = quote(inst_key, safe="")
-
+def fetch_live_expiries():
+    url = f"{BASE_URL}/v2/expired-instruments/expiries?instrument_key=NSE_INDEX%7CNifty%2050"
     try:
-        url_ltp = f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={enc_key}"
-        res = session.get(url_ltp, headers=UPSTOX_HEADERS, timeout=6)
-        if res.status_code == 200:
-            data = res.json().get('data', {})
-            for _, val in data.items():
-                lp = val.get('last_price')
-                if lp and float(lp) > 10000:
-                    return float(lp)
-    except Exception:
-        pass
-
-    try:
-        url_ohlc = f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={enc_key}&interval=1d"
-        res = session.get(url_ohlc, headers=UPSTOX_HEADERS, timeout=6)
-        if res.status_code == 200:
-            data = res.json().get('data', {})
-            for _, val in data.items():
-                close_px = val.get('close') or (val.get('ohlc', {}).get('close') if isinstance(val.get('ohlc'), dict) else None)
-                if close_px and float(close_px) > 10000:
-                    return float(close_px)
-                lp = val.get('last_price')
-                if lp and float(lp) > 10000:
-                    return float(lp)
-    except Exception:
-        pass
-
-    try:
-        url_day = f"https://api.upstox.com/v3/historical-candle/intraday/{enc_key}/days/1"
-        res = session.get(url_day, headers=UPSTOX_HEADERS, timeout=6)
-        if res.status_code == 200:
-            candles = res.json().get('data', {}).get('candles', [])
-            if candles:
-                day_close = float(candles[0][4])
-                if day_close > 10000:
-                    return day_close
-    except Exception:
-        pass
-
-    return None
-
-
-def get_nearest_expiry_from_api(today_str):
-    try:
-        url = 'https://api.upstox.com/v2/expired-instruments/expiries?instrument_key=NSE_INDEX|Nifty%2050'
-        res = session.get(url, headers=UPSTOX_HEADERS, timeout=10)
+        res = session.get(url, headers=HEADERS, timeout=8)
         if res.status_code == 200:
             expiries = res.json().get('data', [])
-            valid = sorted([exp for exp in expiries if exp >= today_str])
-            if valid:
-                return valid[0]
-    except Exception as e:
-        print(f"[-] Expiry API Error: {e}")
-    return None
-
-
-def get_active_instruments(target_date: str):
-    spot = get_live_nifty_spot()
-    if spot is None:
-        print("❌ त्रुटी: निफ्टी स्पॉट प्राप्त झाला नाही. प्रोसेस थांबवत आहे.")
-        send_telegram("⚠️ लाईव्ह निफ्टी स्पॉट प्राप्त झाला नाही. कृपया API टोकन तपासा.")
-        return pd.DataFrame(), 1, 0.0, 65
-
-    nearest_exp_str = get_nearest_expiry_from_api(target_date)
+            if expiries:
+                return sorted(list(set(expiries)))
+    except Exception:
+        pass
 
     try:
-        res_m = session.get('https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz', timeout=30)
-        df_m = pd.read_csv(io.BytesIO(res_m.content), compression='gzip')
-    except Exception as e:
-        print(f"[-] मास्टर इन्स्ट्रुमेंट डाऊनलोड एरर: {e}")
-        return pd.DataFrame(), 1, 0.0, 65
-
-    strike_col = 'strike_price' if 'strike_price' in df_m.columns else 'strike'
-    opt = df_m[
-        (df_m['exchange'] == 'NSE_FO') &
-        (df_m['name'].str.upper() == 'NIFTY') &
-        (df_m['instrument_type'] == 'OPTIDX')
-    ].copy()
-    opt['expiry_dt'] = pd.to_datetime(opt['expiry']).dt.strftime('%Y-%m-%d')
-    opt['strike'] = opt[strike_col].astype(float)
-
-    if not nearest_exp_str:
-        valid_expiries = sorted(opt[opt['expiry_dt'] >= target_date]['expiry_dt'].unique())
-        if not valid_expiries:
-            print("❌ कोणतीही वैध चालू किंवा आगामी एक्सपायरी सापडली नाही.")
-            return pd.DataFrame(), 1, 0.0, 65
-        nearest_exp_str = valid_expiries[0]
-
-    days_to_expiry = max(1, (pd.Timestamp(nearest_exp_str) - pd.Timestamp(target_date)).days)
-    atm_strike = round(spot / 50.0) * 50.0
-    dynamic_strikes = [atm_strike + (i * 50.0) for i in range(-5, 6)]
-
-    selected = opt[
-        (opt['expiry_dt'] == nearest_exp_str) &
-        (opt['strike'].isin(dynamic_strikes))
-    ].copy()
-
-    dynamic_lot_size = int(selected['lot_size'].iloc[0]) if ('lot_size' in selected.columns and not selected.empty) else 65
-
-    print(f"🎯 V3 Spot: {spot} | ATM: {atm_strike} | Nearest Expiry: {nearest_exp_str} | Lot: {dynamic_lot_size}")
-    print(f"📌 Active Strikes: {dynamic_strikes}")
-
-    return selected, days_to_expiry, spot, dynamic_lot_size
+        res_live = session.get(f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050", headers=HEADERS, timeout=8)
+        if res_live.status_code == 200:
+            contracts = res_live.json().get('data', [])
+            return sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
+    except Exception:
+        pass
+    return []
 
 
-# ==============================================================================
-# ३. १-मिनिट डेटा संकलन (Upstox Intraday V3 API)
-# ==============================================================================
-def fetch_and_store_latest(selected, today_str, days_to_expiry, spot):
-    all_rows = []
-    for _, row in selected.iterrows():
-        try:
-            key = quote(row['instrument_key'], safe='')
-            url = f"https://api.upstox.com/v3/historical-candle/intraday/{key}/minutes/1"
-            r = session.get(url, headers=UPSTOX_HEADERS, timeout=7)
+def get_active_expiry_today(expiries_list):
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    valid = [e for e in expiries_list if e >= today_str]
+    return valid[0] if valid else today_str
 
-            if r.status_code == 200:
-                candles = r.json().get('data', {}).get('candles', [])
-                if candles:
-                    c = candles[0]
-                    all_rows.append({
-                        'date': today_str,
-                        'timestamp': c[0],
-                        'symbol': row['tradingsymbol'],
-                        'strike': row['strike'],
-                        'option_type': 'CE' if 'CE' in str(row['tradingsymbol']).upper() else 'PE',
-                        'open': float(c[1]),
-                        'high': float(c[2]),
-                        'low': float(c[3]),
-                        'close': float(c[4]),
-                        'volume': int(c[5]),
-                        'oi': int(c[6]) if len(c) > 6 and c[6] is not None else 0
-                    })
-        except Exception:
-            continue
-        time.sleep(0.04)
 
-    if not all_rows:
-        return 0
-
+def get_live_option_contract_and_lot(expiry_date: str, spot_price: float, option_type: str):
+    url = f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={expiry_date}"
     try:
-        df_new = pd.DataFrame(all_rows)
-        df_new['price_change'] = 0.0
-        df_new['change_oi'] = 0
-        df_new['buildup'] = 'Neutral'
+        res = session.get(url, headers=HEADERS, timeout=6)
+        if res.status_code == 200:
+            contracts = res.json().get('data', [])
+            filtered = [c for c in contracts if c.get('instrument_type', '').upper() == option_type.upper()]
+            if filtered:
+                best = min(filtered, key=lambda x: abs(float(x.get('strike_price', 0)) - spot_price))
+                return (
+                    best.get('instrument_key'),
+                    best.get('trading_symbol'),
+                    float(best.get('strike_price')),
+                    int(best.get('lot_size'))
+                )
+    except Exception:
+        pass
 
-        greeks = [calculate_greeks(spot, r['strike'], days_to_expiry, 0.14, r['option_type']) for _, r in df_new.iterrows()]
-        df_final = pd.concat([df_new, pd.DataFrame(greeks)], axis=1)
+    # Upstox Search API (atm_offset=0) फॉलबॅक
+    try:
+        s_url = f"{BASE_URL}/v2/instruments/search"
+        p = {'query': 'NIFTY', 'exchanges': 'NSE', 'segments': 'FO', 'instrument_types': option_type, 'expiry': expiry_date, 'atm_offset': 0, 'records': 5}
+        r = session.get(s_url, headers=HEADERS, params=p, timeout=5)
+        if r.status_code == 200:
+            items = r.json().get('data', [])
+            if items:
+                it = items[0]
+                return (it.get('instrument_key'), it.get('trading_symbol'), float(it.get('strike_price', spot_price)), int(it.get('lot_size', 65)))
+    except Exception:
+        pass
 
-        conn = sqlite3.connect(DB_FILE)
-        df_final.to_sql('nifty_options_1m', conn, if_exists='append', index=False)
-        conn.commit()
-        conn.close()
-        return len(df_final)
+    strike_round = round(spot_price / 50.0) * 50.0
+    exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d")
+    sym = f"NIFTY26{exp_dt.strftime('%d%b').upper()}{int(strike_round)}{option_type}"
+    return f"NSE_FO|{sym}", sym, strike_round, 65
+
+
+def fetch_intraday_candles() -> pd.DataFrame:
+    index_key = quote("NSE_INDEX|Nifty 50", safe="")
+    url = f"{BASE_URL}/v2/historical-candle/intraday/{index_key}/1minute"
+    try:
+        res = session.get(url, headers=HEADERS, timeout=6)
+        if res.status_code == 200:
+            candles = res.json().get("data", {}).get("candles", [])
+            if candles:
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
-        print(f"[-] DB Save Error: {e}")
-        return 0
+        print(f"[-] Intraday Candle Error: {e}")
+    return pd.DataFrame()
 
 
 # ==============================================================================
-# ४. Cumulative PnL कॅल्क्युलेटर
+# ४. लाइव्ह मॉनिटरिंग व एक्झिक्युशन लूप
 # ==============================================================================
-def get_cumulative_metrics(current_date_str):
-    conn = sqlite3.connect(DB_FILE)
-    df_j = pd.read_sql_query("SELECT * FROM trade_journal", conn)
-    conn.close()
-
-    if df_j.empty:
-        return {'day': 0.0, 'week': 0.0, 'month': 0.0, 'yoy': 0.0}
-
-    df_j['dt'] = pd.to_datetime(df_j['date'])
-    curr_dt = pd.to_datetime(current_date_str)
-
-    day_pnl = df_j[df_j['dt'] == curr_dt]['net_pnl'].sum()
-    start_of_week = curr_dt - pd.Timedelta(days=curr_dt.weekday())
-    week_pnl = df_j[(df_j['dt'] >= start_of_week) & (df_j['dt'] <= curr_dt)]['net_pnl'].sum()
-    month_pnl = df_j[(df_j['dt'].dt.year == curr_dt.year) & (df_j['dt'].dt.month == curr_dt.month)]['net_pnl'].sum()
-    yoy_pnl = df_j[df_j['dt'].dt.year == curr_dt.year]['net_pnl'].sum()
-
-    return {
-        'day': round(day_pnl, 2),
-        'week': round(week_pnl, 2),
-        'month': round(month_pnl, 2),
-        'yoy': round(yoy_pnl, 2)
-    }
-
-
-def record_live_trade(t):
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute('''
-    INSERT OR REPLACE INTO trade_journal 
-    (date, side, symbol, entry_time, exit_time, entry_px, opt_sl, opt_target, exit_px, pts, lot_size, net_pnl, reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        t['date'], t['side'], t['symbol'], t['entry_time'], t['exit_time'],
-        t['entry_px'], t['opt_sl'], t['opt_target'], t['exit_px'],
-        t['pts'], t['lot_size'], t['net_pnl'], t['reason']
-    ))
-    conn.commit()
-    conn.close()
-
-
-# ==============================================================================
-# ५. मुख्य मॉनिटरिंग लूप
-# ==============================================================================
-def live_monitor():
+def run_live_trading_engine():
     init_database()
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime('%Y-%m-%d')
+    print("==========================================================", flush=True)
+    print("  NIFTY 50 LIVE TRADING ENGINE - FULL DYNAMIC SCALING     ", flush=True)
+    print("==========================================================", flush=True)
 
-    selected_inst, dte, live_spot, lot_size = get_active_instruments(today_str)
-    if selected_inst.empty:
-        send_telegram("❌ इन्स्ट्रुमेंट्स लोड करता आले नाहीत. कृपया क्रेडेंशियल्स किंवा मार्केट स्टेटस तपासा.")
-        return
+    expiries = fetch_live_expiries()
+    today_expiry = get_active_expiry_today(expiries)
+    send_telegram(f"🚀 *Nifty Live Trading Bot सुरू झाला आहे!*\n📅 सक्रिय वीकली एक्सपायरी: `{today_expiry}`")
 
-    send_telegram(
-        f"🟢 *NIFTY Live Strategy Engine सुरू झाला!*\n"
-        f"📅 तारीख: `{today_str}` | वेळ: `{now_ist.strftime('%H:%M:%S')}`\n"
-        f"🎯 स्पॉट: `{live_spot}` | ATM: `{round(live_spot/50.0)*50.0}` | लॉट: `{lot_size}`"
-    )
-
-    active_trade = None
-    morning_trades = 0
-    afternoon_trades = 0
-    cooldown_until = None
+    daily_trade_count = 0
+    active_position = None
 
     while True:
-        curr_time = datetime.now(IST)
-        hhmm = curr_time.strftime('%H:%M')
+        now_ist = datetime.now(IST)
+        hhmm = now_ist.strftime("%H:%M")
 
-        if hhmm >= '15:30':
-            if active_trade:
-                send_telegram(f"⏱️ *EOD Force Exit:* `{active_trade['symbol']}` बाजार बंद झाला.")
-            
-            pnl_data = get_cumulative_metrics(today_str)
-            eod_msg = (
-                f"🏁 *आजचा लाईव्ह ट्रेडिंग दिवस पूर्ण झाला.*\n"
-                f"📅 तारीख: `{today_str}`\n\n"
-                f"📈 *CUMULATIVE PERFORMANCE:*\n"
-                f"▪️ *आजचा PnL (Day):* `₹ {pnl_data['day']:+,.2f}`\n"
-                f"▪️ *चालू आठवडा (Week):* `₹ {pnl_data['week']:+,.2f}`\n"
-                f"▪️ *चालू महिना (Month):* `₹ {pnl_data['month']:+,.2f}`\n"
-                f"▪️ *वार्षिक (YoY / YTD):* `₹ {pnl_data['yoy']:+,.2f}`"
-            )
-            send_telegram(eod_msg)
+        if hhmm < "09:15":
+            time.sleep(30)
+            continue
+        if hhmm >= "15:25":
+            if active_position:
+                exit_price = get_live_market_quote(active_position['instrument_token']) or active_position['entry_px']
+                order_id_exit = place_upstox_order(active_position['instrument_token'], active_position['lot_size'], "SELL")
+                pts = round(exit_price - active_position['entry_px'], 2)
+                gross = round(pts * active_position['lot_size'], 2)
+                charges_dict = get_upstox_charges(active_position['instrument_token'], active_position['lot_size'], active_position['entry_px'], exit_price)
+                net = round(gross - charges_dict["total_charges"], 2)
+
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute('''
+                INSERT INTO live_trade_journal 
+                (date, side, option_symbol, instrument_token, expiry, strike, entry_time, exit_time, entry_px, opt_sl, opt_target, exit_px, pts, lot_size, order_id_entry, order_id_exit, charges, net_pnl, exit_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    now_ist.strftime("%Y-%m-%d"), active_position['side'], active_position['symbol'],
+                    active_position['instrument_token'], today_expiry, active_position['strike'],
+                    active_position['entry_time'], hhmm, active_position['entry_px'],
+                    active_position['opt_sl'], active_position['opt_target'], exit_price,
+                    pts, active_position['lot_size'], active_position['order_id'], order_id_exit,
+                    charges_dict["total_charges"], net, "FORCE_EOD ⏱️"
+                ))
+                conn.commit()
+                conn.close()
+
+                send_telegram(f"⏱️ *EOD Force Exit Triggered!*\nLTP: `₹{exit_price}` | Net PnL: `₹ {net:+,.2f}`")
+            print("[*] मार्केट बंद झाले. Engine थांबत आहे.")
             break
 
-        fetch_and_store_latest(selected_inst, today_str, dte, live_spot)
+        # १. ओपन पोझिशन मॉनिटरिंग (Dynamic Stop-Loss & Target)
+        if active_position:
+            curr_price = get_live_market_quote(active_position['instrument_token'])
+            if curr_price > 0:
+                is_sl = curr_price <= active_position['opt_sl']
+                is_tgt = curr_price >= active_position['opt_target']
 
-        conn = sqlite3.connect(DB_FILE)
-        df_all = pd.read_sql_query(f"SELECT * FROM nifty_options_1m WHERE timestamp LIKE '{today_str}%'", conn)
-        conn.close()
-
-        if not df_all.empty:
-            df_all['timestamp'] = pd.to_datetime(df_all['timestamp'])
-
-            # १. चालू ट्रेड SL/Target तपासणी
-            if active_trade:
-                curr_sym_data = df_all[df_all['symbol'] == active_trade['symbol']].sort_values('timestamp')
-                if not curr_sym_data.empty:
-                    latest_bar = curr_sym_data.iloc[-1]
-                    exit_px, reason = None, ''
+                if is_sl or is_tgt:
+                    exit_reason = "SL_HIT ❌" if is_sl else "TARGET_HIT ✅"
+                    order_id_exit = place_upstox_order(active_position['instrument_token'], active_position['lot_size'], "SELL")
                     
-                    if latest_bar['low'] <= active_trade['opt_sl']:
-                        exit_px, reason = active_trade['opt_sl'], 'SL_HIT ❌'
-                    elif latest_bar['high'] >= active_trade['opt_target']:
-                        exit_px, reason = active_trade['opt_target'], 'TARGET_HIT ✅'
-                    
-                    if exit_px:
-                        pts = round(exit_px - active_trade['entry_price'], 2)
-                        gross = round(pts * lot_size, 2)
-                        ch = get_upstox_charges(active_trade['symbol'], lot_size, active_trade['entry_price'], exit_px)['total_charges']
-                        net = round(gross - ch, 2)
+                    pts = round(curr_price - active_position['entry_px'], 2)
+                    gross = round(pts * active_position['lot_size'], 2)
+                    charges_dict = get_upstox_charges(active_position['instrument_token'], active_position['lot_size'], active_position['entry_px'], curr_price)
+                    net = round(gross - charges_dict["total_charges"], 2)
 
-                        trade_record = {
-                            'date': today_str,
-                            'side': active_trade['side'],
-                            'symbol': active_trade['symbol'],
-                            'entry_time': active_trade['entry_time'],
-                            'exit_time': hhmm,
-                            'entry_px': active_trade['entry_price'],
-                            'opt_sl': active_trade['opt_sl'],
-                            'opt_target': active_trade['opt_target'],
-                            'exit_px': exit_px,
-                            'pts': pts,
-                            'lot_size': lot_size,
-                            'net_pnl': net,
-                            'reason': reason
+                    conn = sqlite3.connect(DB_FILE)
+                    conn.execute('''
+                    INSERT INTO live_trade_journal 
+                    (date, side, option_symbol, instrument_token, expiry, strike, entry_time, exit_time, entry_px, opt_sl, opt_target, exit_px, pts, lot_size, order_id_entry, order_id_exit, charges, net_pnl, exit_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        now_ist.strftime("%Y-%m-%d"), active_position['side'], active_position['symbol'],
+                        active_position['instrument_token'], today_expiry, active_position['strike'],
+                        active_position['entry_time'], hhmm, active_position['entry_px'],
+                        active_position['opt_sl'], active_position['opt_target'], curr_price,
+                        pts, active_position['lot_size'], active_position['order_id'], order_id_exit,
+                        charges_dict["total_charges"], net, exit_reason
+                    ))
+                    conn.commit()
+                    conn.close()
+
+                    send_telegram(
+                        f"🔔 *LIVE TRADE EXIT: {exit_reason}*\n\n"
+                        f"🔹 सिम्बॉल: `{active_position['symbol']}`\n"
+                        f"💵 एंट्री: `₹{active_position['entry_px']}` ➡️ एक्झिट: `₹{curr_price}`\n"
+                        f"🎯 पॉइंट्स: `{pts:+.2f}` | 💰 Net PnL: `₹ {net:+,.2f}`"
+                    )
+                    active_position = None
+                    time.sleep(60)
+                    continue
+
+        # २. नवीन ब्रेकआउट व रिटेस्ट शोधणे
+        is_trading_window = ("09:20" <= hhmm <= "12:00") or ("13:30" <= hhmm <= "14:45")
+
+        if active_position is None and is_trading_window and daily_trade_count < 3:
+            df = fetch_intraday_candles()
+            if len(df) >= 25:
+                df['vol_sma20'] = df['volume'].rolling(20).mean().replace(0, 1.0)
+                df['vol_ratio'] = df['volume'] / df['vol_sma20']
+                prev_c = df['close'].shift(1)
+                tr = pd.concat([df['high'] - df['low'], (df['high'] - prev_c).abs(), (df['low'] - prev_c).abs()], axis=1).max(axis=1)
+                df['atr14'] = tr.rolling(14).mean().fillna(10.0)
+
+                bar = df.iloc[-2]  # नुकतीच पूर्ण झालेली कॅन्डल
+                c_range = bar['high'] - bar['low']
+                c_body = abs(bar['close'] - bar['open'])
+                b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
+
+                has_vol = bar['vol_ratio'] >= 1.20
+                is_expansion = c_range >= (1.20 * bar['atr14'])
+                is_solid = b_ratio >= 0.45
+
+                action = "NO_TRADE"
+                if (has_vol or is_expansion) and is_solid:
+                    if bar['close'] > bar['open']: action = "BUY_CE"
+                    elif bar['close'] < bar['open']: action = "BUY_PE"
+
+                if action in ["BUY_CE", "BUY_PE"]:
+                    spot_px = float(bar['close'])
+                    opt_type = "CE" if action == "BUY_CE" else "PE"
+
+                    # डायनॅमिक कॉन्ट्रॅक्ट, स्ट्राइक आणि लॉट
+                    opt_token, opt_sym, strike_v, lot = get_live_option_contract_and_lot(today_expiry, spot_px, opt_type)
+                    opt_entry_px = get_live_market_quote(opt_token)
+
+                    if 70.0 <= opt_entry_px <= 320.0:
+                        # डायनॅमिक स्केल्ड SL & Target
+                        min_scaled_sl = max(4.0, round(spot_px * 0.00045, 1))
+                        calc_sl_pts = bar['atr14'] * 1.2 * DELTA
+                        opt_sl_pts = max(min_scaled_sl, calc_sl_pts)
+                        opt_target_pts = round(opt_sl_pts * 1.5, 2)
+
+                        opt_sl = max(0.05, round(opt_entry_px - opt_sl_pts, 2))
+                        opt_target = round(opt_entry_px + opt_target_pts, 2)
+
+                        order_id = place_upstox_order(opt_token, lot, "BUY")
+                        daily_trade_count += 1
+
+                        active_position = {
+                            "symbol": opt_sym,
+                            "instrument_token": opt_token,
+                            "side": action,
+                            "strike": strike_v,
+                            "entry_time": now_ist.strftime("%H:%M"),
+                            "entry_px": opt_entry_px,
+                            "opt_sl": opt_sl,
+                            "opt_target": opt_target,
+                            "lot_size": lot,
+                            "order_id": order_id
                         }
-                        record_live_trade(trade_record)
-                        pnl_data = get_cumulative_metrics(today_str)
 
-                        alert_title = "🛑 *STOP LOSS HIT!*" if "SL" in reason else "🎯 *TARGET HIT!*"
                         send_telegram(
-                            f"{alert_title}\n\n"
-                            f"📌 *इन्स्ट्रुमेंट:* `{active_trade['symbol']}` ({active_trade['side']})\n"
-                            f"📅 *तारीख:* `{today_str}` | वेळ: `{active_trade['entry_time']}` ➡️ `{hhmm}`\n"
-                            f"💵 *एंट्री भाव:* `₹{active_trade['entry_price']}` | *एक्झिट:* `₹{exit_px}`\n"
-                            f"🛑 *SL:* `₹{active_trade['opt_sl']}` | 🎯 *Target:* `₹{active_trade['opt_target']}`\n"
-                            f"📊 *पॉईंट्स:* `{pts:+}` | लॉट: `{lot_size}`\n"
-                            f"💰 *ट्रेड निव्वळ PnL:* `₹ {net:+,.2f}`\n\n"
-                            f"📈 *Cumulative PnL Update:*\n"
-                            f"▪️ Day: `₹ {pnl_data['day']:+,.2f}` | Week: `₹ {pnl_data['week']:+,.2f}`\n"
-                            f"▪️ Month: `₹ {pnl_data['month']:+,.2f}` | YoY: `₹ {pnl_data['yoy']:+,.2f}`"
+                            f"⚡ *LIVE TRADE ENTRY EXECUTED!*\n\n"
+                            f"🔹 बाजू: *{action}*\n"
+                            f"🔹 सिम्बॉल: `{opt_sym}`\n"
+                            f"📅 एक्सपायरी: `{today_expiry}`\n"
+                            f"💵 भाव: `₹{opt_entry_px}`\n"
+                            f"🛑 डायनॅमिक SL: `₹{opt_sl}` (Pts: {opt_sl_pts})\n"
+                            f"🎯 टार्गेट: `₹{opt_target}` (Pts: {opt_target_pts})\n"
+                            f"📦 लॉट साईझ: `{lot}` | ऑर्डर आयडी: `{order_id}`"
                         )
-                        active_trade = None
-                        cooldown_until = curr_time + timedelta(minutes=15)
 
-            # २. नवीन सिग्नल शोधणे
-            is_morning = ('09:40' <= hhmm <= '11:30') and (morning_trades < 1)
-            is_afternoon = ('12:30' <= hhmm <= '14:30') and (afternoon_trades < 2)
-
-            if not active_trade and (is_morning or is_afternoon):
-                if not cooldown_until or curr_time >= cooldown_until:
-                    latest_ts = df_all['timestamp'].max()
-                    snap = df_all[df_all['timestamp'] == latest_ts]
-
-                    for _, row in snap.iterrows():
-                        sub = df_all[df_all['symbol'] == row['symbol']].sort_values('timestamp')
-                        if len(sub) >= 20:
-                            sma_vol = sub['volume'].rolling(20).mean().iloc[-1]
-                            if (row['volume'] >= 1.30 * sma_vol) and (70.0 <= row['close'] <= 320.0) and (row['close'] > row['open']):
-                                ep = float(row['close'])
-                                sl_pts = max(MIN_OPT_SL_PTS, 12.0)
-                                target_pts = sl_pts * 1.5
-
-                                active_trade = {
-                                    'symbol': row['symbol'],
-                                    'side': f"BUY_{row['option_type']}",
-                                    'entry_time': hhmm,
-                                    'entry_price': ep,
-                                    'opt_sl': round(ep - sl_pts, 2),
-                                    'opt_target': round(ep + target_pts, 2)
-                                }
-                                if is_morning:
-                                    morning_trades += 1
-                                else:
-                                    afternoon_trades += 1
-
-                                send_telegram(
-                                    f"🚨 *LIVE ENTRY TRIGGER!*\n\n"
-                                    f"📌 *इन्स्ट्रुमेंट:* `{row['symbol']}` ({active_trade['side']})\n"
-                                    f"📅 *तारीख:* `{today_str}` | वेळ: `{hhmm}`\n"
-                                    f"💵 *एंट्री भाव:* `₹{ep}`\n"
-                                    f"🛑 *स्टॉप लॉस:* `₹{active_trade['opt_sl']}`\n"
-                                    f"🎯 *टार्गेट:* `₹{active_trade['opt_target']}`\n"
-                                    f"📦 *लॉट साईज:* `{lot_size}`"
-                                )
-                                break
-
-        time.sleep(60)
+        time.sleep(60 - (datetime.now().second % 60))
 
 
-if __name__ == '__main__':
-    live_monitor()
+if __name__ == "__main__":
+    run_live_trading_engine()
