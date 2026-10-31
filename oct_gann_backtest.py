@@ -21,6 +21,7 @@ DELTA = 0.52
 LOT_SIZE = 65
 BUFFER_PCT = 0.001          # ०.१% बफर
 MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे वाट पाहणे
+MAX_OPT_SL_PTS = 32.0       # कमाल स्टॉप-लॉस मर्यादा (Max SL Cap - भांडवल रक्षण)
 
 # ==============================================================================
 # २. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
@@ -66,11 +67,11 @@ def fetch_october_index_candles():
     return pd.DataFrame()
 
 # ==============================================================================
-# ४. गॅन बॅकटेस्ट इंजिन (नो थीटा डिके - ओन्ली SL / TARGET / EOD)
+# ४. ऑप्टिमाइझ गॅन बॅकटेस्ट इंजिन (ट्रेलिंग SL + SL CAP)
 # ==============================================================================
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 + 15-MIN RETEST (NO THETA EXIT - OCT 2026) ")
+    print("   NIFTY GANN SQUARE OF 9 (OPTIMIZED: TRAILING SL & MAX SL CAP)    ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
@@ -98,6 +99,7 @@ def run_gann_october_backtest():
         gann_levels = calculate_gann_levels(prev_close)
 
         daily_trades = 0
+        used_levels_today = set()
         active_trackers = {lvl: {"state": "IDLE", "break_idx": None, "type": None} for lvl in gann_levels}
 
         c_len = len(df_curr)
@@ -128,8 +130,8 @@ def run_gann_october_backtest():
                 elif tracker["state"] == "AWAY":
                     bars_away = i - tracker["break_idx"]
 
-                    if bars_away >= MIN_AWAY_BARS:
-                        # बुलिश रिटेस्ट एंट्री
+                    if bars_away >= MIN_AWAY_BARS and lvl not in used_levels_today:
+                        # बुलिश रिटेस्ट एंट्री (BUY CE)
                         if tracker["type"] == "BULL" and (zone_low <= bar['low'] <= zone_high) and bar['close'] > bar['open']:
                             entry_spot = float(bar['close'])
                             entry_time = bar['timestamp']
@@ -139,25 +141,33 @@ def run_gann_october_backtest():
                             index_target = get_next_gann_target(lvl, gann_levels, "BUY_CE")
 
                             est_entry_opt = 160.0
-                            opt_sl_pts = max(10.0, round((entry_spot - index_sl) * DELTA, 2))
+                            # नियम १: मॅक्स SL मर्यादा लागू करणे
+                            raw_sl_pts = (entry_spot - index_sl) * DELTA
+                            opt_sl_pts = min(MAX_OPT_SL_PTS, max(10.0, round(raw_sl_pts, 2)))
+                            
                             opt_tgt_pts = round((index_target - entry_spot) * DELTA, 2)
-                            opt_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
+                            active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
                             opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
 
                             exit_time, exit_opt_px, exit_reason = None, 0.0, None
 
-                            # फॉरवर्ड लूप - फक्त SL, Target किंवा 15:20 EOD
                             for f_idx in range(i + 1, c_len):
                                 f_bar = df_curr.iloc[f_idx]
                                 f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
                                 cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
 
+                                # नियम २: ट्रेलिंग स्टॉप-लॉस
+                                if cur_opt >= est_entry_opt + 50.0:
+                                    active_sl = max(active_sl, est_entry_opt + 25.0)  # +२५ पॉईंट्स नफा लॉक
+                                elif cur_opt >= est_entry_opt + 25.0:
+                                    active_sl = max(active_sl, est_entry_opt + 2.0)   # ब्रेक-इव्हन (नो लॉस)
+
                                 if cur_opt >= opt_tgt:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT"
                                     break
-                                elif cur_opt <= opt_sl:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_sl, "SL_HIT"
+                                elif cur_opt <= active_sl:
+                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], active_sl, "SL_OR_TRAIL_HIT"
                                     break
                                 elif f_hhmm >= "15:20":
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD"
@@ -183,11 +193,12 @@ def run_gann_october_backtest():
                                     "exit_reason": exit_reason
                                 })
                                 daily_trades += 1
+                                used_levels_today.add(lvl)
                                 active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
                                 i = f_idx
                                 break
 
-                        # बेअरिश रिटेस्ट एंट्री
+                        # बेअरिश रिटेस्ट एंट्री (BUY PE)
                         elif tracker["type"] == "BEAR" and (zone_low <= bar['high'] <= zone_high) and bar['close'] < bar['open']:
                             entry_spot = float(bar['close'])
                             entry_time = bar['timestamp']
@@ -197,25 +208,32 @@ def run_gann_october_backtest():
                             index_target = get_next_gann_target(lvl, gann_levels, "BUY_PE")
 
                             est_entry_opt = 160.0
-                            opt_sl_pts = max(10.0, round((index_sl - entry_spot) * DELTA, 2))
+                            raw_sl_pts = (index_sl - entry_spot) * DELTA
+                            opt_sl_pts = min(MAX_OPT_SL_PTS, max(10.0, round(raw_sl_pts, 2)))
+
                             opt_tgt_pts = round((entry_spot - index_target) * DELTA, 2)
-                            opt_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
+                            active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
                             opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
 
                             exit_time, exit_opt_px, exit_reason = None, 0.0, None
 
-                            # फॉरवर्ड लूप - फक्त SL, Target किंवा 15:20 EOD
                             for f_idx in range(i + 1, c_len):
                                 f_bar = df_curr.iloc[f_idx]
                                 f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
                                 cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
 
+                                # नियम २: ट्रेलिंग स्टॉप-लॉस
+                                if cur_opt >= est_entry_opt + 50.0:
+                                    active_sl = max(active_sl, est_entry_opt + 25.0)  # +२५ पॉईंट्स लॉक
+                                elif cur_opt >= est_entry_opt + 25.0:
+                                    active_sl = max(active_sl, est_entry_opt + 2.0)   # ब्रेक-इव्हन
+
                                 if cur_opt >= opt_tgt:
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT"
                                     break
-                                elif cur_opt <= opt_sl:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_sl, "SL_HIT"
+                                elif cur_opt <= active_sl:
+                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], active_sl, "SL_OR_TRAIL_HIT"
                                     break
                                 elif f_hhmm >= "15:20":
                                     exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD"
@@ -241,6 +259,7 @@ def run_gann_october_backtest():
                                     "exit_reason": exit_reason
                                 })
                                 daily_trades += 1
+                                used_levels_today.add(lvl)
                                 active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
                                 i = f_idx
                                 break
@@ -251,9 +270,9 @@ def run_gann_october_backtest():
         print("[!] कोणतेही ट्रेड्स ट्रिगर झाले नाहीत.")
         return
 
-    print("\n==================================== GANN SQUARE OF 9 (01-30 OCT 2026) REPORT ====================================")
+    print("\n==================================== GANN SQUARE OF 9 (OPTIMIZED REPORT) ====================================")
     print(df_res[['date', 'side', 'level', 'entry_time', 'exit_time', 'entry_px', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-    print("==================================================================================================================")
+    print("==============================================================================================================")
 
     tot = len(df_res)
     wins = df_res[df_res['net_pnl'] > 0]
