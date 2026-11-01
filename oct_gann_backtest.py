@@ -19,12 +19,12 @@ HEADERS = {
 
 DELTA = 0.52
 LOT_SIZE = 65
-BUFFER_PCT = 0.001          # ०.१% बफर
-MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे वाट पाहणे
+BUFFER_PCT = 0.001          # ०.१% बफर झोन
+MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे लेव्हलपासून लांब राहणे
 MAX_OPT_SL_PTS = 32.0       # कमाल स्टॉप-लॉस मर्यादा (Max SL Cap)
 
 # ==============================================================================
-# २. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
+# २. गॅन स्क्वेअर ऑफ ९ लेव्हल्स जनरेटर
 # ==============================================================================
 def calculate_gann_levels(prev_close: float, count: int = 4):
     base_n = int(math.isqrt(int(prev_close)))
@@ -55,11 +55,60 @@ def fetch_october_index_candles():
     return pd.DataFrame()
 
 # ==============================================================================
-# ४. गॅन बॅकटेस्ट इंजिन (TARGET = SL * 2)
+# ४. रिव्हर्सल फेनोमेना (Rejection Wick / Engulfing Confirmation)
+# ==============================================================================
+def is_valid_bullish_phenomenon(df_window):
+    """
+    सॉलिड बुलिश पॅटर्न:
+    १. Hammer / Pin-bar रिजेक्शन (खालची विक एकूण रेंजच्या ३५%+ असणे)
+    २. किंवा मागील कॅन्डलचा हाय तोडणारी बुलिश एन्गल्फिंग
+    """
+    bar = df_window.iloc[-1]
+    prev = df_window.iloc[-2]
+    
+    c_range = bar['high'] - bar['low']
+    if c_range <= 2.0:
+        return False
+        
+    lower_wick = min(bar['open'], bar['close']) - bar['low']
+    
+    # अट १: पिनबार / हॅमर रिजेक्शन
+    has_rejection_wick = (lower_wick / c_range) >= 0.35 and bar['close'] >= bar['open']
+    
+    # अट २: बुलिश ब्रेक / एन्गल्फिंग
+    is_engulfing = (bar['close'] > prev['high']) and (bar['close'] > bar['open'])
+    
+    return has_rejection_wick or is_engulfing
+
+def is_valid_bearish_phenomenon(df_window):
+    """
+    सॉलिड बेअरिश पॅटर्न:
+    १. Shooting Star रिजेक्शन (वरची विक एकूण रेंजच्या ३५%+ असणे)
+    २. किंवा मागील कॅन्डलचा लो तोडणारी बेअरिश एन्गल्फिंग
+    """
+    bar = df_window.iloc[-1]
+    prev = df_window.iloc[-2]
+    
+    c_range = bar['high'] - bar['low']
+    if c_range <= 2.0:
+        return False
+        
+    upper_wick = bar['high'] - max(bar['open'], bar['close'])
+    
+    # अट १: शूटिंग स्टार रिजेक्शन
+    has_rejection_wick = (upper_wick / c_range) >= 0.35 and bar['close'] <= bar['open']
+    
+    # अट २: बेअरिश ब्रेक / एन्गल्फिंग
+    is_engulfing = (bar['close'] < prev['low']) and (bar['close'] < bar['open'])
+    
+    return has_rejection_wick or is_engulfing
+
+# ==============================================================================
+# ५. गॅन बॅकटेस्ट इंजिन (BREAKOUT + 15M AWAY + RE-TEST + TARGET = SL * 2)
 # ==============================================================================
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 (OPTIMIZED: TARGET = SL * 2 & TRAIL)      ")
+    print("   NIFTY GANN SQUARE OF 9 (RE-TEST + PHENOMENON + TARGET = SL * 2)   ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
@@ -91,7 +140,7 @@ def run_gann_october_backtest():
         active_trackers = {lvl: {"state": "IDLE", "break_idx": None, "type": None} for lvl in gann_levels}
 
         c_len = len(df_curr)
-        i = 0
+        i = 5
         while i < c_len - 1:
             if daily_trades >= 3:
                 break
@@ -99,7 +148,7 @@ def run_gann_october_backtest():
             bar = df_curr.iloc[i]
             hhmm = bar['timestamp'].strftime("%H:%M")
 
-            if not (("09:20" <= hhmm <= "12:00") or ("13:30" <= hhmm <= "14:45")):
+            if not (("09:25" <= hhmm <= "12:00") or ("13:30" <= hhmm <= "14:45")):
                 i += 1
                 continue
 
@@ -109,149 +158,155 @@ def run_gann_october_backtest():
                 zone_high = lvl + buf
                 tracker = active_trackers[lvl]
 
+                # पायरी १: ब्रेकआउट शोधणे
                 if tracker["state"] == "IDLE":
                     if bar['close'] > zone_high:
                         active_trackers[lvl] = {"state": "AWAY", "break_idx": i, "type": "BULL"}
                     elif bar['close'] < zone_low:
                         active_trackers[lvl] = {"state": "AWAY", "break_idx": i, "type": "BEAR"}
 
+                # पायरी २ आणि ३: किमान १५ मिनिटे लांब राहणे आणि नंतर RE-TEST झोनमध्ये येणे
                 elif tracker["state"] == "AWAY":
                     bars_away = i - tracker["break_idx"]
 
                     if bars_away >= MIN_AWAY_BARS and lvl not in used_levels_today:
-                        # बुलिश रिटेस्ट एंट्री (BUY CE)
-                        if tracker["type"] == "BULL" and (zone_low <= bar['low'] <= zone_high) and bar['close'] > bar['open']:
-                            entry_spot = float(bar['close'])
-                            entry_time = bar['timestamp']
+                        window_5m = df_curr.iloc[i-4 : i+1]
 
-                            swing_low = df_curr.iloc[tracker["break_idx"]:i+1]['low'].min()
-                            index_sl = swing_low - buf
+                        # --- बुलिश RE-TEST (BUY CE) ---
+                        if tracker["type"] == "BULL" and (zone_low <= bar['low'] <= zone_high):
+                            if is_valid_bullish_phenomenon(window_5m):
+                                entry_spot = float(bar['close'])
+                                entry_time = bar['timestamp']
 
-                            est_entry_opt = 160.0
-                            raw_sl_pts = (entry_spot - index_sl) * DELTA
-                            opt_sl_pts = min(MAX_OPT_SL_PTS, max(10.0, round(raw_sl_pts, 2)))
+                                swing_low = df_curr.iloc[tracker["break_idx"]:i+1]['low'].min()
+                                index_sl = swing_low - buf
 
-                            # नियम: टार्गेट = SL * २
-                            opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                            active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
-                            opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
+                                est_entry_opt = 160.0
+                                raw_sl_pts = (entry_spot - index_sl) * DELTA
+                                opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
 
-                            exit_time, exit_opt_px, exit_reason = None, 0.0, None
+                                # टार्गेट = SL * 2
+                                opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
+                                active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
+                                opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
 
-                            for f_idx in range(i + 1, c_len):
-                                f_bar = df_curr.iloc[f_idx]
-                                f_hhmm = f_bar['timestamp'].strftime("%H:%M")
+                                exit_time, exit_opt_px, exit_reason = None, 0.0, None
 
-                                cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
+                                for f_idx in range(i + 1, c_len):
+                                    f_bar = df_curr.iloc[f_idx]
+                                    f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
-                                # 1R (SL एवढा नफा) झाल्यावर ब्रेक-इव्हन ट्रेल
-                                if cur_opt >= est_entry_opt + opt_sl_pts:
-                                    active_sl = max(active_sl, est_entry_opt + 2.0)
+                                    cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
 
-                                if cur_opt >= opt_tgt:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
-                                    break
-                                elif cur_opt <= active_sl:
-                                    exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
-                                    exit_time, exit_opt_px = f_bar['timestamp'], active_sl
-                                    break
-                                elif f_hhmm >= "15:20":
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD ⏱️"
-                                    break
+                                    # 1R हालचालीनंतर ब्रेक-इव्हन ट्रेलिंग
+                                    if cur_opt >= est_entry_opt + opt_sl_pts:
+                                        active_sl = max(active_sl, est_entry_opt + 2.0)
 
-                            if exit_reason:
-                                pts = round(exit_opt_px - est_entry_opt, 2)
-                                gross = round(pts * LOT_SIZE, 2)
-                                net = round(gross - 52.0, 2)
+                                    if cur_opt >= opt_tgt:
+                                        exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
+                                        break
+                                    elif cur_opt <= active_sl:
+                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
+                                        exit_time, exit_opt_px = f_bar['timestamp'], active_sl
+                                        break
+                                    elif f_hhmm >= "15:20":
+                                        exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD ⏱️"
+                                        break
 
-                                trade_logs.append({
-                                    "date": curr_date,
-                                    "side": "BUY_CE",
-                                    "level": lvl,
-                                    "entry_time": entry_time.strftime("%H:%M"),
-                                    "exit_time": exit_time.strftime("%H:%M"),
-                                    "entry_px": est_entry_opt,
-                                    "sl_pts": opt_sl_pts,
-                                    "tgt_pts": opt_tgt_pts,
-                                    "exit_px": exit_opt_px,
-                                    "pts": pts,
-                                    "gross_pnl": gross,
-                                    "charges": 52.0,
-                                    "net_pnl": net,
-                                    "exit_reason": exit_reason
-                                })
-                                daily_trades += 1
-                                used_levels_today.add(lvl)
-                                active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
-                                i = f_idx
-                                break
+                                if exit_reason:
+                                    pts = round(exit_opt_px - est_entry_opt, 2)
+                                    gross = round(pts * LOT_SIZE, 2)
+                                    net = round(gross - 52.0, 2)
 
-                        # बेअरिश रिटेस्ट एंट्री (BUY PE)
-                        elif tracker["type"] == "BEAR" and (zone_low <= bar['high'] <= zone_high) and bar['close'] < bar['open']:
-                            entry_spot = float(bar['close'])
-                            entry_time = bar['timestamp']
-
-                            swing_high = df_curr.iloc[tracker["break_idx"]:i+1]['high'].max()
-                            index_sl = swing_high + buf
-
-                            est_entry_opt = 160.0
-                            raw_sl_pts = (index_sl - entry_spot) * DELTA
-                            opt_sl_pts = min(MAX_OPT_SL_PTS, max(10.0, round(raw_sl_pts, 2)))
-
-                            # नियम: टार्गेट = SL * २
-                            opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                            active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
-                            opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
-
-                            exit_time, exit_opt_px, exit_reason = None, 0.0, None
-
-                            for f_idx in range(i + 1, c_len):
-                                f_bar = df_curr.iloc[f_idx]
-                                f_hhmm = f_bar['timestamp'].strftime("%H:%M")
-
-                                cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
-
-                                # 1R (SL एवढा नफा) झाल्यावर ब्रेक-इव्हन ट्रेल
-                                if cur_opt >= est_entry_opt + opt_sl_pts:
-                                    active_sl = max(active_sl, est_entry_opt + 2.0)
-
-                                if cur_opt >= opt_tgt:
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
-                                    break
-                                elif cur_opt <= active_sl:
-                                    exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
-                                    exit_time, exit_opt_px = f_bar['timestamp'], active_sl
-                                    break
-                                elif f_hhmm >= "15:20":
-                                    exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD ⏱️"
+                                    trade_logs.append({
+                                        "date": curr_date,
+                                        "side": "BUY_CE",
+                                        "level": lvl,
+                                        "entry_time": entry_time.strftime("%H:%M"),
+                                        "exit_time": exit_time.strftime("%H:%M"),
+                                        "entry_px": est_entry_opt,
+                                        "sl_pts": opt_sl_pts,
+                                        "tgt_pts": opt_tgt_pts,
+                                        "exit_px": exit_opt_px,
+                                        "pts": pts,
+                                        "gross_pnl": gross,
+                                        "charges": 52.0,
+                                        "net_pnl": net,
+                                        "exit_reason": exit_reason
+                                    })
+                                    daily_trades += 1
+                                    used_levels_today.add(lvl)
+                                    active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
+                                    i = f_idx
                                     break
 
-                            if exit_reason:
-                                pts = round(exit_opt_px - est_entry_opt, 2)
-                                gross = round(pts * LOT_SIZE, 2)
-                                net = round(gross - 52.0, 2)
+                        # --- बेअरिश RE-TEST (BUY PE) ---
+                        elif tracker["type"] == "BEAR" and (zone_low <= bar['high'] <= zone_high):
+                            if is_valid_bearish_phenomenon(window_5m):
+                                entry_spot = float(bar['close'])
+                                entry_time = bar['timestamp']
 
-                                trade_logs.append({
-                                    "date": curr_date,
-                                    "side": "BUY_PE",
-                                    "level": lvl,
-                                    "entry_time": entry_time.strftime("%H:%M"),
-                                    "exit_time": exit_time.strftime("%H:%M"),
-                                    "entry_px": est_entry_opt,
-                                    "sl_pts": opt_sl_pts,
-                                    "tgt_pts": opt_tgt_pts,
-                                    "exit_px": exit_opt_px,
-                                    "pts": pts,
-                                    "gross_pnl": gross,
-                                    "charges": 52.0,
-                                    "net_pnl": net,
-                                    "exit_reason": exit_reason
-                                })
-                                daily_trades += 1
-                                used_levels_today.add(lvl)
-                                active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
-                                i = f_idx
-                                break
+                                swing_high = df_curr.iloc[tracker["break_idx"]:i+1]['high'].max()
+                                index_sl = swing_high + buf
+
+                                est_entry_opt = 160.0
+                                raw_sl_pts = (index_sl - entry_spot) * DELTA
+                                opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
+
+                                # टार्गेट = SL * 2
+                                opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
+                                active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
+                                opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
+
+                                exit_time, exit_opt_px, exit_reason = None, 0.0, None
+
+                                for f_idx in range(i + 1, c_len):
+                                    f_bar = df_curr.iloc[f_idx]
+                                    f_hhmm = f_bar['timestamp'].strftime("%H:%M")
+
+                                    cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
+
+                                    # 1R हालचालीनंतर ब्रेक-इव्हन ट्रेलिंग
+                                    if cur_opt >= est_entry_opt + opt_sl_pts:
+                                        active_sl = max(active_sl, est_entry_opt + 2.0)
+
+                                    if cur_opt >= opt_tgt:
+                                        exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
+                                        break
+                                    elif cur_opt <= active_sl:
+                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
+                                        exit_time, exit_opt_px = f_bar['timestamp'], active_sl
+                                        break
+                                    elif f_hhmm >= "15:20":
+                                        exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], cur_opt, "FORCE_EOD ⏱️"
+                                        break
+
+                                if exit_reason:
+                                    pts = round(exit_opt_px - est_entry_opt, 2)
+                                    gross = round(pts * LOT_SIZE, 2)
+                                    net = round(gross - 52.0, 2)
+
+                                    trade_logs.append({
+                                        "date": curr_date,
+                                        "side": "BUY_PE",
+                                        "level": lvl,
+                                        "entry_time": entry_time.strftime("%H:%M"),
+                                        "exit_time": exit_time.strftime("%H:%M"),
+                                        "entry_px": est_entry_opt,
+                                        "sl_pts": opt_sl_pts,
+                                        "tgt_pts": opt_tgt_pts,
+                                        "exit_px": exit_opt_px,
+                                        "pts": pts,
+                                        "gross_pnl": gross,
+                                        "charges": 52.0,
+                                        "net_pnl": net,
+                                        "exit_reason": exit_reason
+                                    })
+                                    daily_trades += 1
+                                    used_levels_today.add(lvl)
+                                    active_trackers[lvl] = {"state": "IDLE", "break_idx": None, "type": None}
+                                    i = f_idx
+                                    break
             i += 1
 
     df_res = pd.DataFrame(trade_logs)
@@ -259,9 +314,9 @@ def run_gann_october_backtest():
         print("[!] कोणतेही ट्रेड्स ट्रिगर झाले नाहीत.")
         return
 
-    print("\n==================================== GANN SQUARE OF 9 (TARGET = SL * 2 REPORT) ====================================")
+    print("\n==================================== GANN SQUARE OF 9 (RE-TEST REPORT) ====================================")
     print(df_res[['date', 'side', 'level', 'entry_time', 'exit_time', 'entry_px', 'sl_pts', 'tgt_pts', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-    print("=====================================================================================================================")
+    print("============================================================================================================")
 
     tot = len(df_res)
     wins = df_res[df_res['net_pnl'] > 0]
