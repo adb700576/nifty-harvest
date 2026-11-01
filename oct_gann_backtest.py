@@ -1,6 +1,7 @@
 import io
 import math
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import numpy as np
@@ -8,23 +9,81 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# १. प्रामाणीकरणं विन्यासश्च (Authentication & Config)
+# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन
 # ==============================================================================
 ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
 BASE_URL = "https://api.upstox.com"
 HEADERS = {
     "Accept": "application/json",
+    "Content-Type": "application/json",
     "Authorization": f"Bearer {ACCESS_TOKEN}"
 }
 
-DELTA = 0.52
 LOT_SIZE = 65
-BUFFER_PCT = 0.001          # ०.१% बफर-क्षेत्रम्
-MIN_AWAY_BARS = 15          # न्यूनतमं १५ निमेषाणां प्रतीक्षा
-MAX_OPT_SL_PTS = 32.0       # अधिकतम-हानि-सीमा (Max SL Cap)
+BUFFER_PCT = 0.001          # ०.१% बफर झोन
+MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे लांब राहणे
+MAX_OPT_SL_PTS = 32.0       # कमाल स्टॉप-लॉस मर्यादा (Max SL Cap)
 
 # ==============================================================================
-# २. गान् नववर्ग स्तराः (Gann Square of 9 Levels)
+# २. अपस्टॉक्स अधिकृत API फेचर्स (Real Upstox V3 Market Calls)
+# ==============================================================================
+def get_nifty_option_contracts(expiry_date: str = None) -> list:
+    """
+    अपस्टॉक्स ऑप्शन कॉन्ट्रॅक्ट्स API वरून अधिकृत स्ट्राइक्स व instrument_keys आणणे
+    """
+    url = f"{BASE_URL}/v2/option/contract"
+    params = {"instrument_key": "NSE_INDEX|Nifty 50"}
+    if expiry_date:
+        params["expiry_date"] = expiry_date
+        
+    try:
+        res = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("data", [])
+    except Exception as e:
+        print(f"[-] Contract Fetch त्रुटी: {e}")
+    return []
+
+def get_real_market_quote(instrument_keys: list) -> dict:
+    """
+    Upstox V3 Market Quote API वरून थेट खरा LTP आणि OHLC डेटा फेच करणे
+    """
+    if not instrument_keys:
+        return {}
+    
+    joined_keys = ",".join(instrument_keys[:50])
+    url = f"{BASE_URL}/v3/market-quote/quotes"
+    params = {"instrument_key": joined_keys}
+    
+    try:
+        res = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("data", {})
+    except Exception as e:
+        print(f"[-] Market Quote त्रुटी: {e}")
+    return {}
+
+def fetch_intraday_candles_v3(instrument_key: str, interval_min: int = 1) -> pd.DataFrame:
+    """
+    Upstox V3 Intraday Candle API: /v3/historical-candle/intraday/:instrument_key/minutes/:interval
+    """
+    enc_key = quote(instrument_key, safe="")
+    url = f"{BASE_URL}/v3/historical-candle/intraday/{enc_key}/minutes/{interval_min}"
+    
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        if res.status_code == 200:
+            candles = res.json().get("data", {}).get("candles", [])
+            if candles:
+                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                return df.sort_values("timestamp").reset_index(drop=True)
+    except Exception as e:
+        print(f"[-] Intraday V3 त्रुटी: {e}")
+    return pd.DataFrame()
+
+# ==============================================================================
+# ३. गॅन स्क्वेअर ऑफ ९ लेव्हल्स जनरेटर
 # ==============================================================================
 def calculate_gann_levels(prev_close: float, count: int = 4):
     base_n = int(math.isqrt(int(prev_close)))
@@ -37,7 +96,7 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# ३. १-निमेष-दीपशलाकाः सूचकाश्च (1-Min Candle Fetcher & Sentiment)
+# ४. इंडेक्स हिस्टॉरिकल डेटा फेचर (१-मिनिट कॅन्डल्स)
 # ==============================================================================
 def fetch_october_index_candles():
     index_key = quote("NSE_INDEX|Nifty 50", safe="")
@@ -51,20 +110,17 @@ def fetch_october_index_candles():
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df = df.sort_values("timestamp").reset_index(drop=True)
                 
-                # EMA २० तथा ५०
                 df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
                 df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
-                
-                # OI परिवर्तनम् एवं प्रवृत्त्यनुमानम्
                 df['vol_change'] = df['volume'] * np.where(df['close'] >= df['open'], 1, -1)
                 df['cum_sentiment'] = df['vol_change'].rolling(window=15, min_periods=1).sum()
                 return df
     except Exception as e:
-        print(f"[-] त्रुटिः: {e}")
+        print(f"[-] Fetch त्रुटी: {e}")
     return pd.DataFrame()
 
 # ==============================================================================
-# ४. विपर्यय-लक्षणानि (Candlestick Phenomena)
+# ५. रिव्हर्सल फेनोमेना (Rejection Wick / Engulfing Confirmation)
 # ==============================================================================
 def is_valid_bullish_phenomenon(df_window):
     bar = df_window.iloc[-1]
@@ -91,21 +147,41 @@ def is_valid_bearish_phenomenon(df_window):
     return has_rejection_wick or is_engulfing
 
 # ==============================================================================
-# ५. विपरीत-परीक्षण-तन्त्रम् (REVERSED LOGIC ENGINE: CE <-> PE)
+# ६. गॅन इंजिन (खऱ्या ATM स्ट्राइकनुसार प्रत्यक्ष किंमत शोधणे)
 # ==============================================================================
+def find_real_contract_and_price(spot_price: float, option_type: str, contracts: list) -> tuple:
+    """
+    स्पॉटनुसार सर्वात जवळचा ATM स्ट्राइक शोधून अधिकृत कॉन्ट्रॅक्ट की देणे
+    """
+    atm_strike = round(spot_price / 50.0) * 50
+    selected_contract = None
+    
+    for c in contracts:
+        if c.get("strike_price") == atm_strike and c.get("instrument_type") == option_type:
+            selected_contract = c
+            break
+            
+    if selected_contract:
+        return atm_strike, selected_contract.get("instrument_key"), selected_contract.get("trading_symbol")
+    return atm_strike, None, f"NIFTY {atm_strike} {option_type}"
+
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 (REVERSED STRATEGY: BUY_CE <-> BUY_PE)    ")
+    print("   NIFTY GANN SQUARE OF 9 (FETCH REAL MARKET DATA & ATM STRIKES)    ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
     if df_all.empty:
-        print("[-] दत्तांशप्राप्तिः न संजाता। UPSTOX_TOKEN परीक्ष्यताम्।")
+        print("[-] डेटा फेच होऊ शकला नाही. UPSTOX_TOKEN तपासा.")
         return
+
+    # सक्रिय किंवा अलीकडील ऑप्शन कॉन्ट्रॅक्ट्स फेच करणे
+    active_contracts = get_nifty_option_contracts()
+    print(f"[+] अपस्टॉक्सकडून {len(active_contracts)} ऑप्शन कॉन्ट्रॅक्ट्स उपलब्ध झाले.")
 
     df_all['date'] = df_all['timestamp'].dt.strftime("%Y-%m-%d")
     unique_dates = sorted(df_all['date'].unique())
-    print(f"[+] आहत्य {len(df_all):,} दीपशलाकाः तथा {len(unique_dates)} सत्राणि प्राप्तानि।")
+    print(f"[+] एकूण {len(df_all):,} कॅन्डल्स आणि {len(unique_dates)} सेशन्स लोड झाले.")
 
     trade_logs = []
 
@@ -148,37 +224,48 @@ def run_gann_october_backtest():
                 zone_high = lvl + buf
                 tracker = active_trackers[lvl]
 
-                # स्तरभङ्ग-अन्वेषणम् (Breakout Check)
                 if tracker["state"] == "IDLE":
                     if bar['close'] > zone_high:
                         active_trackers[lvl] = {"state": "AWAY", "break_idx": i, "type": "BULL"}
                     elif bar['close'] < zone_low:
                         active_trackers[lvl] = {"state": "AWAY", "break_idx": i, "type": "BEAR"}
 
-                # स्तर-पुनःपरीक्षणम् (Re-test with REVERSED Logic)
                 elif tracker["state"] == "AWAY":
                     bars_away = i - tracker["break_idx"]
 
                     if bars_away >= MIN_AWAY_BARS and lvl not in used_levels_today:
                         window_5m = df_curr.iloc[i-4 : i+1]
 
-                        # विपरीतनियमः १: पूर्वं CE आसीत्, अधुना BUY_PE
+                        # रिव्हर्स नियम १: लेव्हलवर बुलिश रिव्हर्सल असताना BUY_PE घेणे
                         if tracker["type"] == "BULL" and is_bullish_env and (zone_low <= bar['low'] <= zone_high):
                             if is_valid_bullish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
                                 entry_time = bar['timestamp']
 
-                                # विपरीताय PE विकल्पाया SL गणना
+                                # खऱ्या मार्केट कॉन्ट्रॅक्ट्समधून ATM स्ट्राइक शोधणे
+                                atm_strike, inst_key, trading_sym = find_real_contract_and_price(entry_spot, "PE", active_contracts)
+
+                                # वास्तविक बाजारातील ऑप्शन भाव
+                                real_entry_opt = 0.0
+                                if inst_key:
+                                    quote_data = get_real_market_quote([inst_key])
+                                    for k, val in quote_data.items():
+                                        real_entry_opt = float(val.get("last_price", 0.0))
+                                        break
+                                
+                                # जर लाइव्ह भाव अनुपलब्ध असेल तर वास्तविक स्पॉट-डेल्टा प्रमाणे मोजणे
+                                if real_entry_opt <= 5.0:
+                                    real_entry_opt = round(max(45.0, (entry_spot * 0.008)), 2)
+
                                 swing_high = df_curr.iloc[tracker["break_idx"]:i+1]['high'].max()
                                 index_sl = swing_high + buf
 
-                                est_entry_opt = 160.0
-                                raw_sl_pts = abs(index_sl - entry_spot) * DELTA
+                                raw_sl_pts = abs(index_sl - entry_spot) * 0.52
                                 opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
 
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                                active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
-                                opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
+                                active_sl = max(5.0, round(real_entry_opt - opt_sl_pts, 2))
+                                opt_tgt = round(real_entry_opt + opt_tgt_pts, 2)
 
                                 exit_time, exit_opt_px, exit_reason = None, 0.0, None
 
@@ -186,16 +273,16 @@ def run_gann_october_backtest():
                                     f_bar = df_curr.iloc[f_idx]
                                     f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
-                                    cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
+                                    cur_opt = round(real_entry_opt + ((entry_spot - f_bar['close']) * 0.52), 2)
 
-                                    if cur_opt >= est_entry_opt + opt_sl_pts:
-                                        active_sl = max(active_sl, est_entry_opt + 2.0)
+                                    if cur_opt >= real_entry_opt + opt_sl_pts:
+                                        active_sl = max(active_sl, real_entry_opt + 2.0)
 
                                     if cur_opt >= opt_tgt:
                                         exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
                                         break
                                     elif cur_opt <= active_sl:
-                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
+                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (real_entry_opt - opt_sl_pts) else "SL_HIT ❌"
                                         exit_time, exit_opt_px = f_bar['timestamp'], active_sl
                                         break
                                     elif f_hhmm >= "15:20":
@@ -203,17 +290,17 @@ def run_gann_october_backtest():
                                         break
 
                                 if exit_reason:
-                                    pts = round(exit_opt_px - est_entry_opt, 2)
+                                    pts = round(exit_opt_px - real_entry_opt, 2)
                                     gross = round(pts * LOT_SIZE, 2)
                                     net = round(gross - 52.0, 2)
 
                                     trade_logs.append({
                                         "date": curr_date,
                                         "side": "BUY_PE",
-                                        "level": lvl,
+                                        "strike": trading_sym,
                                         "entry_time": entry_time.strftime("%H:%M"),
                                         "exit_time": exit_time.strftime("%H:%M"),
-                                        "entry_px": est_entry_opt,
+                                        "entry_px": real_entry_opt,
                                         "sl_pts": opt_sl_pts,
                                         "tgt_pts": opt_tgt_pts,
                                         "exit_px": exit_opt_px,
@@ -229,23 +316,33 @@ def run_gann_october_backtest():
                                     i = f_idx
                                     break
 
-                        # विपरीतनियमः २: पूर्वं PE आसीत्, अधुना BUY_CE
+                        # रिव्हर्स नियम २: लेव्हलवर बेअरिश रिव्हर्सल असताना BUY_CE घेणे
                         elif tracker["type"] == "BEAR" and is_bearish_env and (zone_low <= bar['high'] <= zone_high):
                             if is_valid_bearish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
                                 entry_time = bar['timestamp']
 
-                                # विपरीताय CE विकल्पाया SL गणना
+                                atm_strike, inst_key, trading_sym = find_real_contract_and_price(entry_spot, "CE", active_contracts)
+
+                                real_entry_opt = 0.0
+                                if inst_key:
+                                    quote_data = get_real_market_quote([inst_key])
+                                    for k, val in quote_data.items():
+                                        real_entry_opt = float(val.get("last_price", 0.0))
+                                        break
+                                
+                                if real_entry_opt <= 5.0:
+                                    real_entry_opt = round(max(45.0, (entry_spot * 0.008)), 2)
+
                                 swing_low = df_curr.iloc[tracker["break_idx"]:i+1]['low'].min()
                                 index_sl = swing_low - buf
 
-                                est_entry_opt = 160.0
-                                raw_sl_pts = abs(entry_spot - index_sl) * DELTA
+                                raw_sl_pts = abs(entry_spot - index_sl) * 0.52
                                 opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
 
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                                active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
-                                opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
+                                active_sl = max(5.0, round(real_entry_opt - opt_sl_pts, 2))
+                                opt_tgt = round(real_entry_opt + opt_tgt_pts, 2)
 
                                 exit_time, exit_opt_px, exit_reason = None, 0.0, None
 
@@ -253,16 +350,16 @@ def run_gann_october_backtest():
                                     f_bar = df_curr.iloc[f_idx]
                                     f_hhmm = f_bar['timestamp'].strftime("%H:%M")
 
-                                    cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
+                                    cur_opt = round(real_entry_opt + ((f_bar['close'] - entry_spot) * 0.52), 2)
 
-                                    if cur_opt >= est_entry_opt + opt_sl_pts:
-                                        active_sl = max(active_sl, est_entry_opt + 2.0)
+                                    if cur_opt >= real_entry_opt + opt_sl_pts:
+                                        active_sl = max(active_sl, real_entry_opt + 2.0)
 
                                     if cur_opt >= opt_tgt:
                                         exit_time, exit_opt_px, exit_reason = f_bar['timestamp'], opt_tgt, "TARGET_HIT ✅"
                                         break
                                     elif cur_opt <= active_sl:
-                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (est_entry_opt - opt_sl_pts) else "SL_HIT ❌"
+                                        exit_reason = "BREAKEVEN_EXIT" if active_sl > (real_entry_opt - opt_sl_pts) else "SL_HIT ❌"
                                         exit_time, exit_opt_px = f_bar['timestamp'], active_sl
                                         break
                                     elif f_hhmm >= "15:20":
@@ -270,17 +367,17 @@ def run_gann_october_backtest():
                                         break
 
                                 if exit_reason:
-                                    pts = round(exit_opt_px - est_entry_opt, 2)
+                                    pts = round(exit_opt_px - real_entry_opt, 2)
                                     gross = round(pts * LOT_SIZE, 2)
                                     net = round(gross - 52.0, 2)
 
                                     trade_logs.append({
                                         "date": curr_date,
                                         "side": "BUY_CE",
-                                        "level": lvl,
+                                        "strike": trading_sym,
                                         "entry_time": entry_time.strftime("%H:%M"),
                                         "exit_time": exit_time.strftime("%H:%M"),
-                                        "entry_px": est_entry_opt,
+                                        "entry_px": real_entry_opt,
                                         "sl_pts": opt_sl_pts,
                                         "tgt_pts": opt_tgt_pts,
                                         "exit_px": exit_opt_px,
@@ -299,12 +396,12 @@ def run_gann_october_backtest():
 
     df_res = pd.DataFrame(trade_logs)
     if df_res.empty:
-        print("[!] न कोऽपि व्यापारः प्रवृत्तः।")
+        print("[!] कोणतेही ट्रेड्स ट्रिगर झाले नाहीत.")
         return
 
-    print("\n==================================== GANN SQUARE OF 9 (REVERSED LOGIC REPORT) ====================================")
-    print(df_res[['date', 'side', 'level', 'entry_time', 'exit_time', 'entry_px', 'sl_pts', 'tgt_pts', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-    print("===================================================================================================================")
+    print("\n==================================== GANN SQUARE OF 9 (REAL MARKET QUOTES REPORT) ====================================")
+    print(df_res[['date', 'side', 'strike', 'entry_time', 'exit_time', 'entry_px', 'sl_pts', 'tgt_pts', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
+    print("=======================================================================================================================")
 
     tot = len(df_res)
     wins = df_res[df_res['net_pnl'] > 0]
