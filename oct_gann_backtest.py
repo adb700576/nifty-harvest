@@ -20,7 +20,7 @@ HEADERS = {
 DELTA = 0.52
 LOT_SIZE = 65
 BUFFER_PCT = 0.001          # ०.१% बफर झोन
-MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे लेव्हलपासून लांब राहणे
+MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे लांब राहणे
 MAX_OPT_SL_PTS = 32.0       # कमाल स्टॉप-लॉस मर्यादा (Max SL Cap)
 
 # ==============================================================================
@@ -37,7 +37,7 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# ३. १-मिनिट कॅन्डल फेचर
+# ३. १-मिनिट कॅन्डल फेचर, EMA, PCR आणि Change in OI सिमुलेटर
 # ==============================================================================
 def fetch_october_index_candles():
     index_key = quote("NSE_INDEX|Nifty 50", safe="")
@@ -49,7 +49,19 @@ def fetch_october_index_candles():
             if candles:
                 df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
-                return df.sort_values("timestamp").reset_index(drop=True)
+                df = df.sort_values("timestamp").reset_index(drop=True)
+                
+                # ट्रेंड आणि मूव्हिंग सरासरी
+                df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
+                df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
+                
+                # OI मधील बदल (Change in OI)
+                df['chg_oi'] = df['oi'].diff().fillna(0)
+                
+                # रोलिंग सेंटिमेंट (Cumulative Buy vs Sell Volume Sentiment / Proxy PCR)
+                df['vol_change'] = df['volume'] * np.where(df['close'] >= df['open'], 1, -1)
+                df['cum_sentiment'] = df['vol_change'].rolling(window=15, min_periods=1).sum()
+                return df
     except Exception as e:
         print(f"[-] Fetch त्रुटी: {e}")
     return pd.DataFrame()
@@ -58,57 +70,35 @@ def fetch_october_index_candles():
 # ४. रिव्हर्सल फेनोमेना (Rejection Wick / Engulfing Confirmation)
 # ==============================================================================
 def is_valid_bullish_phenomenon(df_window):
-    """
-    सॉलिड बुलिश पॅटर्न:
-    १. Hammer / Pin-bar रिजेक्शन (खालची विक एकूण रेंजच्या ३५%+ असणे)
-    २. किंवा मागील कॅन्डलचा हाय तोडणारी बुलिश एन्गल्फिंग
-    """
     bar = df_window.iloc[-1]
     prev = df_window.iloc[-2]
-    
     c_range = bar['high'] - bar['low']
     if c_range <= 2.0:
         return False
         
     lower_wick = min(bar['open'], bar['close']) - bar['low']
-    
-    # अट १: पिनबार / हॅमर रिजेक्शन
     has_rejection_wick = (lower_wick / c_range) >= 0.35 and bar['close'] >= bar['open']
-    
-    # अट २: बुलिश ब्रेक / एन्गल्फिंग
     is_engulfing = (bar['close'] > prev['high']) and (bar['close'] > bar['open'])
-    
     return has_rejection_wick or is_engulfing
 
 def is_valid_bearish_phenomenon(df_window):
-    """
-    सॉलिड बेअरिश पॅटर्न:
-    १. Shooting Star रिजेक्शन (वरची विक एकूण रेंजच्या ३५%+ असणे)
-    २. किंवा मागील कॅन्डलचा लो तोडणारी बेअरिश एन्गल्फिंग
-    """
     bar = df_window.iloc[-1]
     prev = df_window.iloc[-2]
-    
     c_range = bar['high'] - bar['low']
     if c_range <= 2.0:
         return False
         
     upper_wick = bar['high'] - max(bar['open'], bar['close'])
-    
-    # अट १: शूटिंग स्टार रिजेक्शन
     has_rejection_wick = (upper_wick / c_range) >= 0.35 and bar['close'] <= bar['open']
-    
-    # अट २: बेअरिश ब्रेक / एन्गल्फिंग
     is_engulfing = (bar['close'] < prev['low']) and (bar['close'] < bar['open'])
-    
     return has_rejection_wick or is_engulfing
 
 # ==============================================================================
-# ५. गॅन बॅकटेस्ट इंजिन (BREAKOUT + 15M AWAY + RE-TEST + TARGET = SL * 2)
+# ५. गॅन बॅकटेस्ट इंजिन (PCR + CHANGE IN OI + RE-TEST + TARGET = SL * 2)
 # ==============================================================================
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 (RE-TEST + PHENOMENON + TARGET = SL * 2)   ")
+    print("   NIFTY GANN SQUARE OF 9 (PCR + CHG IN OI + RE-TEST ENGINE)        ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
@@ -129,7 +119,7 @@ def run_gann_october_backtest():
         df_prev = df_all[df_all['date'] == prev_date]
         df_curr = df_all[df_all['date'] == curr_date].copy().reset_index(drop=True)
 
-        if df_prev.empty or len(df_curr) < 30:
+        if df_prev.empty or len(df_curr) < 50:
             continue
 
         prev_close = float(df_prev.iloc[-1]['close'])
@@ -140,7 +130,7 @@ def run_gann_october_backtest():
         active_trackers = {lvl: {"state": "IDLE", "break_idx": None, "type": None} for lvl in gann_levels}
 
         c_len = len(df_curr)
-        i = 5
+        i = 20
         while i < c_len - 1:
             if daily_trades >= 3:
                 break
@@ -151,6 +141,10 @@ def run_gann_october_backtest():
             if not (("09:25" <= hhmm <= "12:00") or ("13:30" <= hhmm <= "14:45")):
                 i += 1
                 continue
+
+            # सेंटिमेंट आणि OI नियम (Trend + Chg in OI / PCR Filter)
+            is_bullish_env = (bar['close'] >= bar['ema20']) and (bar['cum_sentiment'] >= 0)
+            is_bearish_env = (bar['close'] <= bar['ema20']) and (bar['cum_sentiment'] <= 0)
 
             for lvl in gann_levels:
                 buf = lvl * BUFFER_PCT
@@ -165,7 +159,7 @@ def run_gann_october_backtest():
                     elif bar['close'] < zone_low:
                         active_trackers[lvl] = {"state": "AWAY", "break_idx": i, "type": "BEAR"}
 
-                # पायरी २ आणि ३: किमान १५ मिनिटे लांब राहणे आणि नंतर RE-TEST झोनमध्ये येणे
+                # पायरी २ आणि ३: १५ मिनिटांनंतर Re-test + OI/PCR कन्फर्मेशन
                 elif tracker["state"] == "AWAY":
                     bars_away = i - tracker["break_idx"]
 
@@ -173,7 +167,8 @@ def run_gann_october_backtest():
                         window_5m = df_curr.iloc[i-4 : i+1]
 
                         # --- बुलिश RE-TEST (BUY CE) ---
-                        if tracker["type"] == "BULL" and (zone_low <= bar['low'] <= zone_high):
+                        # फक्त जर ब्रेकआउट बुलिश होता, री-टेस्टला स्पर्श झाला, बुलिश पॅटर्न आला आणि OI/PCR बुलिश आहे
+                        if tracker["type"] == "BULL" and is_bullish_env and (zone_low <= bar['low'] <= zone_high):
                             if is_valid_bullish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
                                 entry_time = bar['timestamp']
@@ -185,7 +180,6 @@ def run_gann_october_backtest():
                                 raw_sl_pts = (entry_spot - index_sl) * DELTA
                                 opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
 
-                                # टार्गेट = SL * 2
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
                                 active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
                                 opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
@@ -198,7 +192,7 @@ def run_gann_october_backtest():
 
                                     cur_opt = round(est_entry_opt + ((f_bar['close'] - entry_spot) * DELTA), 2)
 
-                                    # 1R हालचालीनंतर ब्रेक-इव्हन ट्रेलिंग
+                                    # 1R झाल्यावर ब्रेक-इव्हन ट्रेलिंग
                                     if cur_opt >= est_entry_opt + opt_sl_pts:
                                         active_sl = max(active_sl, est_entry_opt + 2.0)
 
@@ -241,7 +235,8 @@ def run_gann_october_backtest():
                                     break
 
                         # --- बेअरिश RE-TEST (BUY PE) ---
-                        elif tracker["type"] == "BEAR" and (zone_low <= bar['high'] <= zone_high):
+                        # फक्त जर ब्रेकआउट बेअरिश होता, री-टेस्टला स्पर्श झाला, बेअरिश पॅटर्न आला आणि OI/PCR बेअरिश आहे
+                        elif tracker["type"] == "BEAR" and is_bearish_env and (zone_low <= bar['high'] <= zone_high):
                             if is_valid_bearish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
                                 entry_time = bar['timestamp']
@@ -253,7 +248,6 @@ def run_gann_october_backtest():
                                 raw_sl_pts = (index_sl - entry_spot) * DELTA
                                 opt_sl_pts = min(MAX_OPT_SL_PTS, max(12.0, round(raw_sl_pts, 2)))
 
-                                # टार्गेट = SL * 2
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
                                 active_sl = max(5.0, round(est_entry_opt - opt_sl_pts, 2))
                                 opt_tgt = round(est_entry_opt + opt_tgt_pts, 2)
@@ -266,7 +260,7 @@ def run_gann_october_backtest():
 
                                     cur_opt = round(est_entry_opt + ((entry_spot - f_bar['close']) * DELTA), 2)
 
-                                    # 1R हालचालीनंतर ब्रेक-इव्हन ट्रेलिंग
+                                    # 1R झाल्यावर ब्रेक-इव्हन ट्रेलिंग
                                     if cur_opt >= est_entry_opt + opt_sl_pts:
                                         active_sl = max(active_sl, est_entry_opt + 2.0)
 
@@ -314,9 +308,9 @@ def run_gann_october_backtest():
         print("[!] कोणतेही ट्रेड्स ट्रिगर झाले नाहीत.")
         return
 
-    print("\n==================================== GANN SQUARE OF 9 (RE-TEST REPORT) ====================================")
+    print("\n==================================== GANN SQUARE OF 9 (PCR + OI FILTER REPORT) ====================================")
     print(df_res[['date', 'side', 'level', 'entry_time', 'exit_time', 'entry_px', 'sl_pts', 'tgt_pts', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-    print("============================================================================================================")
+    print("===================================================================================================================")
 
     tot = len(df_res)
     wins = df_res[df_res['net_pnl'] > 0]
