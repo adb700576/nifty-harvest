@@ -8,7 +8,7 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# 1. ऑथेंटिकेशन और बेस कॉन्फ़िगरेशन
+# १. ऑथेंटिकेशन आणि कॉन्फिगरेशन
 # ==============================================================================
 ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
 BASE_URL = "https://api.upstox.com"
@@ -20,11 +20,12 @@ HEADERS = {
 
 DELTA = 0.52
 LOT_SIZE = 65
-BUFFER_PCT = 0.001          # 0.1% बफर
-MIN_AWAY_BARS = 15          # ब्रेकआउट के बाद न्यूनतम 15 मिनट दूर रहना
+BUFFER_PCT = 0.001          # ०.१% गॅन झोन बफर
+MIN_AWAY_BARS = 15          # ब्रेकआउटनंतर किमान १५ मिनिटे लांब राहणे
+LOCAL_SWING_BARS = 8        # स्थानिक स्विंग शोधण्यासाठी मागील ८ मिनिटांची विंडो
 
 # ==============================================================================
-# 2. गैन स्क्वायर ऑफ़ 9 लेवल्स
+# २. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
 # ==============================================================================
 def calculate_gann_levels(prev_close: float, count: int = 4):
     base_n = int(math.isqrt(int(prev_close)))
@@ -37,7 +38,7 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# 3. 1-मिनट कैंडल फ़ेचर और सेंटिमेंट
+# ३. १-मिनिट कॅन्डल फेचर आणि सेंटिमेंट
 # ==============================================================================
 def fetch_october_index_candles():
     index_key = quote("NSE_INDEX|Nifty 50", safe="")
@@ -57,11 +58,11 @@ def fetch_october_index_candles():
                 df['cum_sentiment'] = df['vol_change'].rolling(window=15, min_periods=1).sum()
                 return df
     except Exception as e:
-        print(f"[-] Fetch त्रुटि: {e}")
+        print(f"[-] Fetch त्रुटी: {e}")
     return pd.DataFrame()
 
 # ==============================================================================
-# 4. प्राइस एक्शन कन्फर्मेशन
+# ४. रिव्हर्सल फेनोमेना (Rejection Wick / Engulfing Confirmation)
 # ==============================================================================
 def is_valid_bullish_phenomenon(df_window):
     bar = df_window.iloc[-1]
@@ -88,21 +89,21 @@ def is_valid_bearish_phenomenon(df_window):
     return has_rejection_wick or is_engulfing
 
 # ==============================================================================
-# 5. शुद्ध डायनामिक स्विंग SL इंजन (No 32 Pt Cap)
+# ५. अचूक स्थानिक स्विंग SL इंजिन (True Local Swing High/Low)
 # ==============================================================================
 def run_gann_october_backtest():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 (PURE DYNAMIC SWING SL & TRG = SL * 2)    ")
+    print("   NIFTY GANN SQUARE OF 9 (ACCURATE LOCAL SWING SL & TRG = SL * 2)  ")
     print("====================================================================")
 
     df_all = fetch_october_index_candles()
     if df_all.empty:
-        print("[-] डेटा फेच नहीं हो सका। UPSTOX_TOKEN की जाँच करें।")
+        print("[-] डेटा फेच होऊ शकला नाही. UPSTOX_TOKEN तपासा.")
         return
 
     df_all['date'] = df_all['timestamp'].dt.strftime("%Y-%m-%d")
     unique_dates = sorted(df_all['date'].unique())
-    print(f"[+] कुल {len(df_all):,} कैंडल्स और {len(unique_dates)} सेशन्स लोड हुए।")
+    print(f"[+] एकूण {len(df_all):,} कॅन्डल्स आणि {len(unique_dates)} सेशन्स लोड झाले.")
 
     trade_logs = []
 
@@ -157,7 +158,7 @@ def run_gann_october_backtest():
                     if bars_away >= MIN_AWAY_BARS and lvl not in used_levels_today:
                         window_5m = df_curr.iloc[i-4 : i+1]
 
-                        # रिवर्स नियम 1: बुलिश लेवल टेस्ट पर BUY_PE
+                        # रिव्हर्स १: लेव्हलवर री-टेस्ट रिजेक्शन असताना BUY_PE
                         if tracker["type"] == "BULL" and is_bullish_env and (zone_low <= bar['low'] <= zone_high):
                             if is_valid_bullish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
@@ -166,13 +167,16 @@ def run_gann_october_backtest():
                                 atm_strike = round(entry_spot / 50.0) * 50
                                 real_entry_opt = round(max(45.0, (entry_spot * 0.008)), 2)
 
-                                # शुद्ध डायनामिक स्विंग हाई + 0.1% बफर
-                                swing_high = df_curr.iloc[tracker["break_idx"]:i+1]['high'].max()
-                                index_sl = swing_high + buf
+                                # स्थानिक स्विंग हाय (संपूर्ण दिवसाचा नव्हे, फक्त री-टेस्ट दरम्यानचा)
+                                local_window = df_curr.iloc[max(0, i - LOCAL_SWING_BARS) : i + 1]
+                                local_swing_high = local_window['high'].max()
+                                
+                                # इंडेक्स SL = स्थानिक स्विंग हाय + ६ पॉईंट्स बफर
+                                index_sl = local_swing_high + 6.0
 
-                                # बिना किसी 32 पॉइंट कैप के शुद्ध ऑप्शन SL
                                 raw_sl_pts = abs(index_sl - entry_spot) * DELTA
-                                opt_sl_pts = max(8.0, round(raw_sl_pts, 2))
+                                # वाजवी इंट्राडे SL मर्यादा: किमान १० पॉईंट्स, कमाल ३५ पॉईंट्स
+                                opt_sl_pts = min(35.0, max(10.0, round(raw_sl_pts, 2)))
 
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
                                 active_sl = max(5.0, round(real_entry_opt - opt_sl_pts, 2))
@@ -227,7 +231,7 @@ def run_gann_october_backtest():
                                     i = f_idx
                                     break
 
-                        # रिवर्स नियम 2: बेयरिश लेवल टेस्ट पर BUY_CE
+                        # रिव्हर्स २: लेव्हलवर री-टेस्ट रिजेक्शन असताना BUY_CE
                         elif tracker["type"] == "BEAR" and is_bearish_env and (zone_low <= bar['high'] <= zone_high):
                             if is_valid_bearish_phenomenon(window_5m):
                                 entry_spot = float(bar['close'])
@@ -236,13 +240,15 @@ def run_gann_october_backtest():
                                 atm_strike = round(entry_spot / 50.0) * 50
                                 real_entry_opt = round(max(45.0, (entry_spot * 0.008)), 2)
 
-                                # शुद्ध डायनामिक स्विंग लो - 0.1% बफर
-                                swing_low = df_curr.iloc[tracker["break_idx"]:i+1]['low'].min()
-                                index_sl = swing_low - buf
+                                # स्थानिक स्विंग लो
+                                local_window = df_curr.iloc[max(0, i - LOCAL_SWING_BARS) : i + 1]
+                                local_swing_low = local_window['low'].min()
+                                
+                                # इंडेक्स SL = स्थानिक स्विंग लो - ६ पॉईंट्स बफर
+                                index_sl = local_swing_low - 6.0
 
-                                # बिना किसी 32 पॉइंट कैप के शुद्ध ऑप्शन SL
                                 raw_sl_pts = abs(entry_spot - index_sl) * DELTA
-                                opt_sl_pts = max(8.0, round(raw_sl_pts, 2))
+                                opt_sl_pts = min(35.0, max(10.0, round(raw_sl_pts, 2)))
 
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
                                 active_sl = max(5.0, round(real_entry_opt - opt_sl_pts, 2))
@@ -300,12 +306,12 @@ def run_gann_october_backtest():
 
     df_res = pd.DataFrame(trade_logs)
     if df_res.empty:
-        print("[!] कोई ट्रेड ट्रिगर नहीं हुआ।")
+        print("[!] कोणतेही ट्रेड्स ट्रिगर झाले नाहीत.")
         return
 
-    print("\n==================================== GANN SQUARE OF 9 (PURE DYNAMIC SL REPORT) ====================================")
+    print("\n==================================== GANN SQUARE OF 9 (LOCAL SWING SL REPORT) ====================================")
     print(df_res[['date', 'side', 'strike', 'entry_time', 'exit_time', 'entry_px', 'sl_pts', 'tgt_pts', 'exit_px', 'pts', 'gross_pnl', 'net_pnl', 'exit_reason']].to_string(index=False))
-    print("====================================================================================================================")
+    print("===================================================================================================================")
 
     tot = len(df_res)
     wins = df_res[df_res['net_pnl'] > 0]
