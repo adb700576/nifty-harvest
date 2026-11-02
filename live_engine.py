@@ -3,14 +3,14 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
 
 # ==============================================================================
-# १. ऑथेंटिकेशन आणि कॉन्फिगरेशन
+# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन
 # ==============================================================================
 ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
 BASE_URL = "https://api.upstox.com"
@@ -21,7 +21,7 @@ HEADERS = {
 }
 
 LOT_SIZE = 65
-BUFFER_PCT = 0.001          # ०.१% गॅन झोन बफर
+BUFFER_PCT = 0.001          # ०.१% बफर झोन
 MIN_BOX_BARS = 12           # कन्सॉलिडेशन बॉक्ससाठी किमान १२ कॅन्डल्स
 CSV_FILE = "paper_trades.csv"
 
@@ -42,7 +42,6 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
 # ३. Upstox V3 Live Market Data Fetchers
 # ==============================================================================
 def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
-    """Upstox V3 वरून निफ्टी ५० चे थेट १-मिनिटाचे इंट्राडे कॅन्डल्स आणणे"""
     index_key = quote("NSE_INDEX|Nifty 50", safe="")
     url = f"{BASE_URL}/v3/historical-candle/intraday/{index_key}/minutes/{interval_min}"
     try:
@@ -52,29 +51,12 @@ def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
             if candles:
                 df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
-                df = df.sort_values("timestamp").reset_index(drop=True)
-                df['ema20'] = df['close'].ewm(span=20, adjust=False).mean()
-                return df
+                return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
         print(f"[-] Candle Fetch त्रुटी: {e}")
     return pd.DataFrame()
 
-def get_live_market_quote(instrument_key: str) -> float:
-    """थेट चालू बाजारभाव (LTP) आणणे"""
-    url = f"{BASE_URL}/v3/market-quote/ltp"
-    params = {"instrument_key": instrument_key}
-    try:
-        res = requests.get(url, headers=HEADERS, params=params, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get("data", {})
-            for k, val in data.items():
-                return float(val.get("last_price", 0.0))
-    except Exception:
-        pass
-    return 0.0
-
 def get_nifty_prev_close() -> float:
-    """मागील दिवसाचा क्लोजिंग भाव आणणे"""
     url = f"{BASE_URL}/v3/market-quote/quotes?instrument_key=NSE_INDEX|Nifty 50"
     try:
         res = requests.get(url, headers=HEADERS, timeout=8)
@@ -84,7 +66,7 @@ def get_nifty_prev_close() -> float:
                 return float(val.get("prev_close_price", 0.0))
     except Exception:
         pass
-    return 22800.0  # सुरक्षित फॉलबॅक
+    return 22800.0
 
 # ==============================================================================
 # ४. पेपर ट्रेडिंग लेजर व्यवस्थापक (CSV Logger)
@@ -112,15 +94,15 @@ def update_trade_in_csv(trade_id: str, updates: dict):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================================================================
-# ५. मुख्य लाइव्ह पेपर ट्रेडिंग इंजिन
+# ५. मुख्य लाइव्ह पेपर ट्रेडिंग लूप
 # ==============================================================================
 def run_live_paper_bot():
     print("====================================================================")
-    print("   NIFTY GANN SQUARE OF 9 (LIVE PAPER TRADING BOT - DARVAS BOX)    ")
+    print("   NIFTY GANN SQUARE OF 9 (LIVE PAPER BOT - DARVAS BOX BREAKOUT)    ")
     print("====================================================================")
 
     if not ACCESS_TOKEN:
-        print("[-] त्रुटी: UPSTOX_ACCESS_TOKEN सापडला नाही. एनव्हायरनमेंट सेट करा.")
+        print("[-] त्रुटी: UPSTOX_ACCESS_TOKEN सापडला नाही.")
         sys.exit(1)
 
     init_paper_ledger()
@@ -133,41 +115,33 @@ def run_live_paper_bot():
     daily_trades = 0
     active_position = None
 
-    print("[*] लाइव्ह मार्केट स्कॅनर सुरू झाला आहे... (Ctrl+C दाबून थांबू शकता)")
+    print("[*] लाइव्ह मार्केट स्कॅनर सुरू झाला आहे...")
 
     while True:
         try:
             now_str = datetime.now().strftime("%H:%M")
-            
-            # इंट्राडे वेळ मर्यादा (09:20 ते 15:25)
+
             if now_str < "09:20":
                 time.sleep(15)
                 continue
-            
-            # १५:२० वाजता सक्तीची एक्झिट (EOD)
+
+            # १५:२० ला सक्तीची एक्झिट
             if now_str >= "15:20" and active_position:
-                print("[!] १५:२० वाजले आहेत. चालू पोझिशन FORCE_EOD अंतर्गत बंद करत आहे.")
                 exit_price = active_position["current_opt_px"]
                 pts = round(exit_price - active_position["entry_px"], 2)
                 gross = round(pts * LOT_SIZE, 2)
                 net = round(gross - 52.0, 2)
-                
                 update_trade_in_csv(active_position["trade_id"], {
-                    "exit_time": now_str,
-                    "exit_px": exit_price,
-                    "pts": pts,
-                    "gross_pnl": gross,
-                    "net_pnl": net,
-                    "exit_reason": "FORCE_EOD ⏱️",
-                    "status": "CLOSED"
+                    "exit_time": now_str, "exit_px": exit_price,
+                    "pts": pts, "gross_pnl": gross, "net_pnl": net,
+                    "exit_reason": "FORCE_EOD ⏱️", "status": "CLOSED"
                 })
+                print(f"\n[✓] पोझिशन बंद: PnL ₹{net}")
                 active_position = None
-                print(f"[✓] पोझिशन बंद झाली: PnL: ₹{net}")
                 break
 
-            # १. लाइव्ह कॅन्डल्स फेच करणे
             df_curr = get_live_nifty_candles(interval_min=1)
-            if df_curr.empty or len(df_curr) < 20:
+            if df_curr.empty or len(df_curr) < 15:
                 time.sleep(10)
                 continue
 
@@ -175,13 +149,12 @@ def run_live_paper_bot():
             spot_close = float(last_bar['close'])
             c_len = len(df_curr)
 
-            # २. जर सक्रिय पोझिशन असेल तर SL / Target मॉनिटर करणे
+            # सक्रिय पोझिशन ट्रॅकिंग
             if active_position:
                 entry_spot = active_position["entry_spot"]
                 opt_type = active_position["side"]
                 entry_opt = active_position["entry_px"]
-                
-                # ऑप्शन किंमत मूव्हमेंट सिम्युलेशन (डेल्टा ०.५२)
+
                 if opt_type == "BUY_CE":
                     cur_opt = round(entry_opt + ((spot_close - entry_spot) * 0.52), 2)
                 else:
@@ -189,7 +162,7 @@ def run_live_paper_bot():
 
                 active_position["current_opt_px"] = cur_opt
 
-                # १R नफा झाल्यावर ब्रेक-इव्हन ट्रेलिंग
+                # १R वर ब्रेक-इव्हन
                 if cur_opt >= entry_opt + active_position["sl_pts"]:
                     active_position["sl_px"] = max(active_position["sl_px"], entry_opt + 2.0)
 
@@ -203,7 +176,7 @@ def run_live_paper_bot():
                         "pts": pts, "gross_pnl": gross, "net_pnl": net,
                         "exit_reason": "TARGET_HIT ✅", "status": "CLOSED"
                     })
-                    print(f"\n[🎯 TARGET HIT] {active_position['strike']} | PnL: ₹{net}")
+                    print(f"\n[🎯 TARGET HIT] PnL: ₹{net}")
                     active_position = None
 
                 elif cur_opt <= active_position["sl_px"]:
@@ -216,13 +189,13 @@ def run_live_paper_bot():
                         "pts": pts, "gross_pnl": gross, "net_pnl": net,
                         "exit_reason": exit_reason, "status": "CLOSED"
                     })
-                    print(f"\n[🛑 SL/TRAIL HIT] {active_position['strike']} | PnL: ₹{net} ({exit_reason})")
+                    print(f"\n[🛑 EXIT] PnL: ₹{net} ({exit_reason})")
                     active_position = None
 
                 time.sleep(5)
                 continue
 
-            # ३. नवीन कन्सॉलिडेशन बॉक्स शोधणे
+            # नवीन कन्सॉलिडेशन बॉक्स तपासणी
             if daily_trades < 3:
                 for lvl in gann_levels:
                     buf = lvl * BUFFER_PCT
@@ -233,7 +206,7 @@ def run_live_paper_bot():
                     if tracker["state"] == "IDLE":
                         if zone_low <= spot_close <= zone_high:
                             box_trackers[lvl] = {"state": "CONSOLIDATING", "start_idx": c_len - 1}
-                            print(f"[*] {now_str} - निफ्टी गॅन लेव्हल {lvl} जवळ आला. कन्सॉलिडेशन बॉक्स सुरू.")
+                            print(f"\n[*] {now_str} - निफ्टी {lvl} जवळ आला. बॉक्स कन्सॉलिडेशन सुरू.")
 
                     elif tracker["state"] == "CONSOLIDATING":
                         bars_in_box = (c_len - 1) - tracker["start_idx"]
@@ -243,15 +216,14 @@ def run_live_paper_bot():
                             box_high = box_window['high'].max()
                             box_low = box_window['low'].min()
 
-                            # --- अपसाइड ब्रेकआउट (BUY CE) ---
+                            # अपसाइड ब्रेकआउट
                             if spot_close > box_high:
                                 atm_strike = round(spot_close / 50.0) * 50
                                 real_opt_px = round(max(45.0, spot_close * 0.008), 2)
-                                
                                 index_sl = box_low - 6.0
                                 opt_sl_pts = min(35.0, max(8.0, round(abs(spot_close - index_sl) * 0.52, 2)))
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                                
+
                                 trade_id = f"T_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                                 active_position = {
                                     "trade_id": trade_id, "side": "BUY_CE", "strike": f"NIFTY {atm_strike} CE",
@@ -260,7 +232,7 @@ def run_live_paper_bot():
                                     "sl_px": max(5.0, round(real_opt_px - opt_sl_pts, 2)),
                                     "tgt_px": round(real_opt_px + opt_tgt_pts, 2)
                                 }
-                                
+
                                 log_trade_to_csv({
                                     "trade_id": trade_id, "date": datetime.now().strftime("%Y-%m-%d"),
                                     "side": "BUY_CE", "strike": f"NIFTY {atm_strike} CE",
@@ -273,18 +245,17 @@ def run_live_paper_bot():
                                 daily_trades += 1
                                 used_levels_today.add(lvl)
                                 box_trackers[lvl] = {"state": "IDLE", "start_idx": None}
-                                print(f"\n[🚀 PAPER BUY_CE TRIGGERED] {atm_strike} CE @ ₹{real_opt_px} | SL: {active_position['sl_px']} | TGT: {active_position['tgt_px']}")
+                                print(f"\n[🚀 BUY_CE] {atm_strike} CE @ ₹{real_opt_px} | SL: {active_position['sl_px']} | TGT: {active_position['tgt_px']}")
                                 break
 
-                            # --- डाऊनसाइड ब्रेकडाऊन (BUY PE) ---
+                            # डाऊनसाइड ब्रेकडाऊन
                             elif spot_close < box_low:
                                 atm_strike = round(spot_close / 50.0) * 50
                                 real_opt_px = round(max(45.0, spot_close * 0.008), 2)
-                                
                                 index_sl = box_high + 6.0
                                 opt_sl_pts = min(35.0, max(8.0, round(abs(index_sl - spot_close) * 0.52, 2)))
                                 opt_tgt_pts = round(opt_sl_pts * 2.0, 2)
-                                
+
                                 trade_id = f"T_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                                 active_position = {
                                     "trade_id": trade_id, "side": "BUY_PE", "strike": f"NIFTY {atm_strike} PE",
@@ -293,7 +264,7 @@ def run_live_paper_bot():
                                     "sl_px": max(5.0, round(real_opt_px - opt_sl_pts, 2)),
                                     "tgt_px": round(real_opt_px + opt_tgt_pts, 2)
                                 }
-                                
+
                                 log_trade_to_csv({
                                     "trade_id": trade_id, "date": datetime.now().strftime("%Y-%m-%d"),
                                     "side": "BUY_PE", "strike": f"NIFTY {atm_strike} PE",
@@ -306,19 +277,18 @@ def run_live_paper_bot():
                                 daily_trades += 1
                                 used_levels_today.add(lvl)
                                 box_trackers[lvl] = {"state": "IDLE", "start_idx": None}
-                                print(f"\n[🚀 PAPER BUY_PE TRIGGERED] {atm_strike} PE @ ₹{real_opt_px} | SL: {active_position['sl_px']} | TGT: {active_position['tgt_px']}")
+                                print(f"\n[🚀 BUY_PE] {atm_strike} PE @ ₹{real_opt_px} | SL: {active_position['sl_px']} | TGT: {active_position['tgt_px']}")
                                 break
 
-            # स्क्रीनवर चालू स्टेटस दाखवणे
-            sys.stdout.write(f"\r[*] वेळ: {now_str} | Nifty Spot: {spot_close:.2f} | आजचे ट्रेड्स: {daily_trades}/3")
+            sys.stdout.write(f"\r[*] वेळ: {now_str} | निफ्टी स्पॉट: {spot_close:.2f} | आजचे ट्रेड्स: {daily_trades}/3")
             sys.stdout.flush()
             time.sleep(10)
 
         except KeyboardInterrupt:
-            print("\n[!] बॉट थांबवला आहे.")
+            print("\n[!] बॉट थांबवला.")
             break
         except Exception as e:
-            print(f"\n[-] लूप त्रुटी: {e}")
+            print(f"\n[-] त्रुटी: {e}")
             time.sleep(10)
 
 if __name__ == "__main__":
