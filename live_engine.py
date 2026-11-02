@@ -3,14 +3,14 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
 
 # ==============================================================================
-# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन
+# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन (१००% डायनॅमिक)
 # ==============================================================================
 ACCESS_TOKEN = (
     os.environ.get("UPSTOX_TOKEN") or 
@@ -33,9 +33,19 @@ MIN_BOX_BARS = 12           # कन्सॉलिडेशन बॉक्स�
 CSV_FILE = "paper_trades.csv"
 
 # ==============================================================================
-# २. टेलिग्राम अलर्ट व्यवस्थापक
+# २. टाईमझोन व्यवस्थापक (GitHub Actions UTC -> IST Fix)
+# ==============================================================================
+IST_OFFSET = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now() -> datetime:
+    """GitHub Actions च्या सर्व्हरवर अचूक भारतीय वेळ (IST) मिळवणे"""
+    return datetime.now(timezone.utc).astimezone(IST_OFFSET)
+
+# ==============================================================================
+# ३. टेलिग्राम अलर्ट व्यवस्थापक
 # ==============================================================================
 def send_telegram_alert(message: str):
+    """टेलिग्रामवर थेट अलर्ट संदेश पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -50,7 +60,7 @@ def send_telegram_alert(message: str):
         print(f"[-] Telegram Alert त्रुटी: {e}")
 
 # ==============================================================================
-# ३. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
+# ४. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
 # ==============================================================================
 def calculate_gann_levels(prev_close: float, count: int = 4):
     base_n = int(math.isqrt(int(prev_close)))
@@ -63,16 +73,16 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# ४. अपस्टॉक्स V3 अधिकृत API फेचर्स (१००% Dynamic)
+# ५. अपस्टॉक्स V3 अधिकृत API फेचर्स (Zero Hardcoding)
 # ==============================================================================
 def get_nifty_prev_close_v3() -> float:
     """
     Upstox V3 Daily Historical Candle API वरून कालचा अधिकृत क्लोज मिळवणे
     URL: /v3/historical-candle/:instrument_key/days/1/:to_date/:from_date
     """
-    now = datetime.now()
-    to_date = now.strftime("%Y-%m-%d")
-    from_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    now_ist = get_ist_now()
+    to_date = now_ist.strftime("%Y-%m-%d")
+    from_date = (now_ist - timedelta(days=7)).strftime("%Y-%m-%d")
     
     inst_key = quote("NSE_INDEX|Nifty 50", safe="")
     url = f"{BASE_URL}/v3/historical-candle/{inst_key}/days/1/{to_date}/{from_date}"
@@ -82,7 +92,6 @@ def get_nifty_prev_close_v3() -> float:
         if res.status_code == 200:
             candles = res.json().get("data", {}).get("candles", [])
             if candles:
-                # आजची कॅन्डल वगळून आदल्या दिवसाची पूर्ण झालेली कॅन्डल घेणे
                 for c in candles:
                     c_date = c[0].split("T")[0]
                     if c_date < to_date:
@@ -126,7 +135,7 @@ def get_live_nifty_candles_v3() -> pd.DataFrame:
     return pd.DataFrame()
 
 def get_atm_option_contract_v2(opt_type: str = "CE") -> dict:
-    """Upstox /v2/instruments/search API + atm_offset=0 द्वारे ATM स्ट्राईक मिळवणे"""
+    """Upstox /v2/instruments/search API + atm_offset=0 द्वारे अधिकृत ATM स्ट्राईक मिळवणे"""
     url = f"{BASE_URL}/v2/instruments/search"
     params = {
         "query": "NIFTY",
@@ -169,7 +178,7 @@ def get_live_option_ltp_by_key(instrument_key: str) -> float:
     return 0.0
 
 # ==============================================================================
-# ५. लेजर व्यवस्थापक (CSV Logger)
+# ६. लेजर व्यवस्थापक (CSV Logger)
 # ==============================================================================
 def init_paper_ledger():
     if not os.path.exists(CSV_FILE):
@@ -194,7 +203,7 @@ def update_trade_in_csv(trade_id: str, updates: dict):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================================================================
-# ६. मुख्य लाइव्ह इंजिन
+# ७. मुख्य लाइव्ह इंजिन
 # ==============================================================================
 def run_live_paper_bot():
     print("====================================================================")
@@ -207,10 +216,9 @@ def run_live_paper_bot():
 
     init_paper_ledger()
     
-    # १. Upstox V3 Daily Candle द्वारे अचूक मागील क्लोज मिळवणे
     prev_close = get_nifty_prev_close_v3()
     if prev_close <= 0.0:
-        print("[-] त्रुटी: Upstox कडून मागील क्लोज भाव मिळाला नाही. टोकन किंवा इंटरनेट तपासा.")
+        print("[-] त्रुटी: Upstox कडून मागील क्लोज भाव मिळाला नाही. टोकन तपासा.")
         sys.exit(1)
 
     gann_levels = calculate_gann_levels(prev_close)
@@ -221,7 +229,7 @@ def run_live_paper_bot():
     print(f"[+] गॅन लेव्हल्स: {gann_levels}")
 
     send_telegram_alert(
-        f"🚀 *NIFTY GANN BOT STARTED (Upstox V3 Engine)*\n"
+        f"🚀 *NIFTY GANN BOT STARTED (IST Timezone Active)*\n"
         f"• *API Prev Close:* `{prev_close}`\n"
         f"• *Lot Size:* `{lot_size}`\n"
         f"• *Gann Levels:* `{gann_levels}`\n"
@@ -237,32 +245,36 @@ def run_live_paper_bot():
 
     while True:
         try:
-            now_dt = datetime.now()
+            now_dt = get_ist_now()
             now_str = now_dt.strftime("%H:%M")
             today_str = now_dt.strftime("%Y-%m-%d")
 
+            # सकाळच्या ९:२० आधी ट्रेड नाही (IST वेळ)
             if now_str < "09:20":
                 time.sleep(15)
                 continue
 
-            if now_str >= "15:20" and active_position:
-                exit_price = active_position["current_opt_px"]
-                pts = round(exit_price - active_position["entry_px"], 2)
-                gross = round(pts * active_position["lot_size"], 2)
-                net = round(gross - 52.0, 2)
-                update_trade_in_csv(active_position["trade_id"], {
-                    "exit_time": now_str, "exit_px": exit_price,
-                    "pts": pts, "gross_pnl": gross, "net_pnl": net,
-                    "exit_reason": "FORCE_EOD ⏱️", "status": "CLOSED"
-                })
-                send_telegram_alert(
-                    f"⏱️ *FORCE EOD EXIT*\n"
-                    f"• *Strike:* `{active_position['strike']}`\n"
-                    f"• *Exit:* `₹{exit_price}`\n"
-                    f"• *Points:* `{pts:+} pts`\n"
-                    f"• *Net PnL:* `₹{net:+,.2f}`"
-                )
-                active_position = None
+            # १५:२० वाजता सर्व पोझिशन्स सक्तीने बंद करणे (IST वेळ)
+            if now_str >= "15:20":
+                if active_position:
+                    exit_price = active_position["current_opt_px"]
+                    pts = round(exit_price - active_position["entry_px"], 2)
+                    gross = round(pts * active_position["lot_size"], 2)
+                    net = round(gross - 52.0, 2)
+                    update_trade_in_csv(active_position["trade_id"], {
+                        "exit_time": now_str, "exit_px": exit_price,
+                        "pts": pts, "gross_pnl": gross, "net_pnl": net,
+                        "exit_reason": "FORCE_EOD ⏱️", "status": "CLOSED"
+                    })
+                    send_telegram_alert(
+                        f"⏱️ *FORCE EOD EXIT*\n"
+                        f"• *Strike:* `{active_position['strike']}`\n"
+                        f"• *Exit:* `₹{exit_price}`\n"
+                        f"• *Points:* `{pts:+} pts`\n"
+                        f"• *Net PnL:* `₹{net:+,.2f}`"
+                    )
+                    active_position = None
+                print(f"\n[*] {now_str} IST - बाजार बंद होण्याची वेळ झाली आहे. बॉट समाप्त.")
                 break
 
             df_curr = get_live_nifty_candles_v3()
@@ -290,9 +302,11 @@ def run_live_paper_bot():
 
                 active_position["current_opt_px"] = cur_opt
 
+                # १R नफा झाल्यावर ब्रेक-इव्हन ट्रेलिंग
                 if cur_opt >= entry_opt + active_position["sl_pts"]:
                     active_position["sl_px"] = max(active_position["sl_px"], entry_opt + 2.0)
 
+                # टार्गेट हिट
                 if cur_opt >= active_position["tgt_px"]:
                     pts = round(active_position["tgt_px"] - entry_opt, 2)
                     gross = round(pts * active_lot, 2)
@@ -311,6 +325,7 @@ def run_live_paper_bot():
                     )
                     active_position = None
 
+                # स्टॉप-लॉस हिट
                 elif cur_opt <= active_position["sl_px"]:
                     exit_reason = "BREAKEVEN_EXIT" if active_position["sl_px"] > (entry_opt - active_position["sl_pts"]) else "SL_HIT ❌"
                     pts = round(active_position["sl_px"] - entry_opt, 2)
@@ -344,7 +359,7 @@ def run_live_paper_bot():
                     if tracker["state"] == "IDLE":
                         if zone_low <= spot_close <= zone_high:
                             box_trackers[lvl] = {"state": "CONSOLIDATING", "start_idx": c_len - 1}
-                            print(f"\n[*] {now_str} - निफ्टी {lvl} जवळ आला. बॉक्स कन्सॉलिडेशन सुरू.")
+                            print(f"\n[*] {now_str} IST - निफ्टी {lvl} जवळ आला. बॉक्स कन्सॉलिडेशन सुरू.")
 
                     elif tracker["state"] == "CONSOLIDATING":
                         bars_in_box = (c_len - 1) - tracker["start_idx"]
@@ -454,7 +469,7 @@ def run_live_paper_bot():
                                 )
                                 break
 
-            sys.stdout.write(f"\r[*] वेळ: {now_str} | स्पॉट: {spot_close:.2f} | आजचे ट्रेड्स: {daily_trades}/3")
+            sys.stdout.write(f"\r[*] IST वेळ: {now_str} | स्पॉट: {spot_close:.2f} | आजचे ट्रेड्स: {daily_trades}/3")
             sys.stdout.flush()
             time.sleep(10)
 
