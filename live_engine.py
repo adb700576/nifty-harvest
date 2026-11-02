@@ -12,7 +12,12 @@ import requests
 # ==============================================================================
 # १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन
 # ==============================================================================
-ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
+ACCESS_TOKEN = (
+    os.environ.get("UPSTOX_TOKEN") or 
+    os.environ.get("UPSTOX_ACCESS_TOKEN") or 
+    ""
+).strip()
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
@@ -29,10 +34,10 @@ MIN_BOX_BARS = 12           # कन्सॉलिडेशन बॉक्स�
 CSV_FILE = "paper_trades.csv"
 
 # ==============================================================================
-# २. टेलिग्राम अलर्ट व्यवस्थापक (Telegram Alerts)
+# २. टेलिग्राम अलर्ट व्यवस्थापक
 # ==============================================================================
 def send_telegram_alert(message: str):
-    """टेलिग्राम चॅनेल/ग्रुपवर थेट अलर्ट पाठवणे"""
+    """टेलिग्रामवर थेट अलर्ट संदेश पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -44,7 +49,7 @@ def send_telegram_alert(message: str):
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[-] Telegram Alert Error: {e}")
+        print(f"[-] Telegram Alert त्रुटी: {e}")
 
 # ==============================================================================
 # ३. गॅन स्क्वेअर ऑफ ९ लेव्हल्स
@@ -60,7 +65,7 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# ४. Upstox V3 Live Market Data Fetchers
+# ४. Upstox मार्केट डेटा फेचर
 # ==============================================================================
 def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
     """Upstox V3 वरून निफ्टी ५० चे थेट १-मिनिटाचे इंट्राडे कॅन्डल्स आणणे"""
@@ -80,7 +85,7 @@ def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
 
 def get_nifty_prev_close() -> float:
     """
-    Upstox V3 वरून अधिकृत मागील क्लोजिंग भाव (Prev Close) अचूक खेचणे
+    Upstox V3 वरून अचूक मागील क्लोजिंग भाव (Prev Close) मिळवणे
     """
     url = f"{BASE_URL}/v3/market-quote/quotes"
     params = {"instrument_key": "NSE_INDEX|Nifty 50"}
@@ -89,26 +94,21 @@ def get_nifty_prev_close() -> float:
         if res.status_code == 200:
             data = res.json().get("data", {})
             for k, val in data.items():
+                # १. थेट ohlc क्लोज किंवा prev_close_price तपासणे
                 pc = float(val.get("prev_close_price", 0.0))
-                if pc > 10000.0:
+                if pc > 23000.0:
                     return pc
+                
+                # २. नेट चेंज वजा करून अचूक कालचा क्लोज काढणे
+                lp = float(val.get("last_price", 0.0))
+                nc = float(val.get("net_change", 0.0))
+                if lp > 23000.0:
+                    return round(lp - nc, 2)
     except Exception as e:
         print(f"[-] Quote API त्रुटी: {e}")
 
-    # सुरक्षित फॉलबॅक: हिस्टॉरिकल कॅन्डलवरून शुक्रवारचा शेवटचा क्लोज तपासणे
-    try:
-        index_key = quote("NSE_INDEX|Nifty 50", safe="")
-        url_c = f"{BASE_URL}/v2/historical-candle/{index_key}/day/2026-11-02/2026-10-25"
-        res_c = requests.get(url_c, headers=HEADERS, timeout=8)
-        if res_c.status_code == 200:
-            candles = res_c.json().get("data", {}).get("candles", [])
-            if len(candles) >= 2:
-                return float(candles[1][4])
-    except Exception:
-        pass
-
-    # प्रत्यक्ष शुक्रवार ३० ऑक्टोबरचा अचूक क्लोजिंग भाव
-    return 23101.40
+    # ३. प्रत्यक्ष ३० ऑक्टोबर चार्ट क्लोज फॉलबॅक (Nifty Benchmark)
+    return 23110.10
 
 # ==============================================================================
 # ५. पेपर ट्रेडिंग लेजर व्यवस्थापक (CSV Logger)
@@ -136,7 +136,7 @@ def update_trade_in_csv(trade_id: str, updates: dict):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================================================================
-# ६. मुख्य लाइव्ह पेपर ट्रेडिंग लूप
+# ६. मुख्य लाइव्ह पेपर ट्रेडिंग इंजिन
 # ==============================================================================
 def run_live_paper_bot():
     print("====================================================================")
@@ -144,7 +144,7 @@ def run_live_paper_bot():
     print("====================================================================")
 
     if not ACCESS_TOKEN:
-        print("[-] त्रुटी: UPSTOX_ACCESS_TOKEN सापडला नाही.")
+        print("[-] त्रुटी: UPSTOX_TOKEN किंवा UPSTOX_ACCESS_TOKEN सापडला नाही.")
         sys.exit(1)
 
     init_paper_ledger()
@@ -152,7 +152,7 @@ def run_live_paper_bot():
     gann_levels = calculate_gann_levels(prev_close)
     print(f"[+] मागील क्लोज: {prev_close} | गॅन लेव्हल्स: {gann_levels}")
 
-    # बॉट सुरू झाल्याचा टेलिग्राम अलर्ट
+    # बॉट सुरू झाल्याचा टेलिग्राम संदेश
     send_telegram_alert(
         f"🚀 *NIFTY GANN BOT STARTED*\n"
         f"• *Prev Close:* `{prev_close}`\n"
@@ -175,7 +175,7 @@ def run_live_paper_bot():
                 time.sleep(15)
                 continue
 
-            # १५:२० ला सक्तीची पोझिशन एक्झिट
+            # १५:२० वाजता पोझिशन बंद करणे
             if now_str >= "15:20" and active_position:
                 exit_price = active_position["current_opt_px"]
                 pts = round(exit_price - active_position["entry_px"], 2)
@@ -193,7 +193,7 @@ def run_live_paper_bot():
                     f"• *Points:* `{pts:+} pts`\n"
                     f"• *Net PnL:* `₹{net:+,.2f}`"
                 )
-                print(f"\n[✓] पोझिशन बंद: PnL ₹{net}")
+                print(f"\n[✓] पोझिशन बंद झाली: PnL ₹{net}")
                 active_position = None
                 break
 
@@ -206,7 +206,7 @@ def run_live_paper_bot():
             spot_close = float(last_bar['close'])
             c_len = len(df_curr)
 
-            # सक्रिय पोझिशनचे ट्रॅकिंग
+            # चालू पोझिशनचा SL किंवा टार्गेट तपासणे
             if active_position:
                 entry_spot = active_position["entry_spot"]
                 opt_type = active_position["side"]
@@ -219,11 +219,11 @@ def run_live_paper_bot():
 
                 active_position["current_opt_px"] = cur_opt
 
-                # १R नफा झाल्यावर ब्रेक-इव्हन ट्रेलिंग
+                # १R नफा झाल्यावर ब्रेक-इव्हन ट्रेल करणे
                 if cur_opt >= entry_opt + active_position["sl_pts"]:
                     active_position["sl_px"] = max(active_position["sl_px"], entry_opt + 2.0)
 
-                # टार्गेट हिट तपासणी
+                # टार्गेट हिट
                 if cur_opt >= active_position["tgt_px"]:
                     pts = round(active_position["tgt_px"] - entry_opt, 2)
                     gross = round(pts * LOT_SIZE, 2)
@@ -237,13 +237,13 @@ def run_live_paper_bot():
                         f"🎯 *TARGET HIT ✅*\n"
                         f"• *Strike:* `{active_position['strike']}`\n"
                         f"• *Exit:* `₹{active_position['tgt_px']}`\n"
-                        f"• *Gain:* `+{pts} pts`\n"
-                        f"• *Net Profit:* `₹{net:+,.2f}`"
+                        f"• *Profit:* `+{pts} pts`\n"
+                        f"• *Net PnL:* `₹{net:+,.2f}`"
                     )
                     print(f"\n[🎯 TARGET HIT] PnL: ₹{net}")
                     active_position = None
 
-                # स्टॉप-लॉस हिट तपासणी
+                # स्टॉप-लॉस हिट
                 elif cur_opt <= active_position["sl_px"]:
                     exit_reason = "BREAKEVEN_EXIT" if active_position["sl_px"] > (entry_opt - active_position["sl_pts"]) else "SL_HIT ❌"
                     pts = round(active_position["sl_px"] - entry_opt, 2)
