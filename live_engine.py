@@ -3,14 +3,14 @@ import math
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
 
 # ==============================================================================
-# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन (१००% डायनॅमिक)
+# १. ऑथेंटिकेशन आणि बेस कॉन्फिगरेशन
 # ==============================================================================
 ACCESS_TOKEN = (
     os.environ.get("UPSTOX_TOKEN") or 
@@ -36,7 +36,6 @@ CSV_FILE = "paper_trades.csv"
 # २. टेलिग्राम अलर्ट व्यवस्थापक
 # ==============================================================================
 def send_telegram_alert(message: str):
-    """टेलिग्रामवर थेट अलर्ट संदेश पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -64,33 +63,56 @@ def calculate_gann_levels(prev_close: float, count: int = 4):
     return sorted(levels)
 
 # ==============================================================================
-# ४. अपस्टॉक्स मार्केट डेटा आणि इन्स्ट्रुमेंट्स सर्च (Zero Hardcoding)
+# ४. अपस्टॉक्स V3 अधिकृत API फेचर्स (१००% Dynamic)
 # ==============================================================================
-def get_nifty_quote_data() -> dict:
-    """Upstox V3 Quotes API वरून निफ्टीचा चालू भाव आणि मागील क्लोज मिळवणे"""
-    url = f"{BASE_URL}/v3/market-quote/quotes"
-    params = {"instrument_key": "NSE_INDEX|Nifty 50"}
+def get_nifty_prev_close_v3() -> float:
+    """
+    Upstox V3 Daily Historical Candle API वरून कालचा अधिकृत क्लोज मिळवणे
+    URL: /v3/historical-candle/:instrument_key/days/1/:to_date/:from_date
+    """
+    now = datetime.now()
+    to_date = now.strftime("%Y-%m-%d")
+    from_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    inst_key = quote("NSE_INDEX|Nifty 50", safe="")
+    url = f"{BASE_URL}/v3/historical-candle/{inst_key}/days/1/{to_date}/{from_date}"
+    
     try:
-        res = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        res = requests.get(url, headers=HEADERS, timeout=10)
         if res.status_code == 200:
-            data = res.json().get("data", {})
-            for _, val in data.items():
-                lp = float(val.get("last_price", 0.0))
-                pc = float(val.get("prev_close_price", 0.0))
-                nc = float(val.get("net_change", 0.0))
-                
-                if pc <= 0.0 and lp > 0.0:
-                    pc = round(lp - nc, 2)
-
-                return {"last_price": lp, "prev_close": pc}
+            candles = res.json().get("data", {}).get("candles", [])
+            if candles:
+                # आजची कॅन्डल वगळून आदल्या दिवसाची पूर्ण झालेली कॅन्डल घेणे
+                for c in candles:
+                    c_date = c[0].split("T")[0]
+                    if c_date < to_date:
+                        return float(c[4])  # Close प्राईस
+                return float(candles[0][4])
     except Exception as e:
-        print(f"[-] Live Quote त्रुटी: {e}")
-    return {}
+        print(f"[-] V3 Daily Candle Fetch त्रुटी: {e}")
 
-def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
-    """Upstox V3 वरून निफ्टी ५० चे १-मिनिट इंट्राडे कॅन्डल्स मिळवणे"""
-    index_key = quote("NSE_INDEX|Nifty 50", safe="")
-    url = f"{BASE_URL}/v3/historical-candle/intraday/{index_key}/minutes/{interval_min}"
+    # बॅकअप: Quotes API
+    try:
+        q_url = f"{BASE_URL}/v3/market-quote/quotes"
+        r = requests.get(q_url, headers=HEADERS, params={"instrument_key": "NSE_INDEX|Nifty 50"}, timeout=8)
+        if r.status_code == 200:
+            val = list(r.json().get("data", {}).values())[0]
+            pc = float(val.get("prev_close_price", 0.0))
+            if pc > 0:
+                return pc
+            lp = float(val.get("last_price", 0.0))
+            nc = float(val.get("net_change", 0.0))
+            if lp > 0:
+                return round(lp - nc, 2)
+    except Exception:
+        pass
+
+    return 0.0
+
+def get_live_nifty_candles_v3() -> pd.DataFrame:
+    """Upstox V3 Intraday 1-minute Candle API वरून आजचा थेट डेटा आणणे"""
+    inst_key = quote("NSE_INDEX|Nifty 50", safe="")
+    url = f"{BASE_URL}/v3/historical-candle/intraday/{inst_key}/minutes/1"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         if res.status_code == 200:
@@ -100,22 +122,19 @@ def get_live_nifty_candles(interval_min: int = 1) -> pd.DataFrame:
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
-        print(f"[-] Candle Fetch त्रुटी: {e}")
+        print(f"[-] V3 Intraday Candle त्रुटी: {e}")
     return pd.DataFrame()
 
-def get_atm_option_contract(opt_type: str = "CE") -> dict:
-    """
-    Upstox Instruments Search API वापरून अधिकृत ATM स्ट्राईक आणि लॉट साईझ शोधणे
-    (कोणत्याही २५, ५० किंवा १०० च्या सूत्राशिवाय - थेट Upstox कडून)
-    """
+def get_atm_option_contract_v2(opt_type: str = "CE") -> dict:
+    """Upstox /v2/instruments/search API + atm_offset=0 द्वारे ATM स्ट्राईक मिळवणे"""
     url = f"{BASE_URL}/v2/instruments/search"
     params = {
         "query": "NIFTY",
         "exchanges": "NSE",
         "segments": "FO",
-        "instrument_types": opt_type,      # 'CE' किंवा 'PE'
-        "expiry": "current_week",          # ऑटो रोलओव्हर चालू आठवडा
-        "atm_offset": 0,                   # ० = At The Money (ATM)
+        "instrument_types": opt_type,
+        "expiry": "current_week",
+        "atm_offset": 0,
         "records": 5
     }
     try:
@@ -123,35 +142,34 @@ def get_atm_option_contract(opt_type: str = "CE") -> dict:
         if res.status_code == 200:
             data = res.json().get("data", [])
             if data:
-                contract = data[0]
+                c = data[0]
                 return {
-                    "strike_price": float(contract.get("strike_price", 0.0)),
-                    "instrument_key": contract.get("instrument_key"),
-                    "trading_symbol": contract.get("trading_symbol"),
-                    "lot_size": int(contract.get("lot_size", 65))
+                    "strike_price": float(c.get("strike_price", 0.0)),
+                    "instrument_key": c.get("instrument_key"),
+                    "trading_symbol": c.get("trading_symbol"),
+                    "lot_size": int(c.get("lot_size", 65))
                 }
     except Exception as e:
-        print(f"[-] ATM Contract Search त्रुटी: {e}")
+        print(f"[-] Search ATM त्रुटी: {e}")
     return {}
 
 def get_live_option_ltp_by_key(instrument_key: str) -> float:
-    """थेट Upstox Market Quote API वरून ऑप्शनचा चालू भाव (LTP) मिळवणे"""
+    """ऑप्शनचा थेट चालू बाजारभाव (LTP) मिळवणे"""
     if not instrument_key:
         return 0.0
     url = f"{BASE_URL}/v3/market-quote/quotes"
-    params = {"instrument_key": instrument_key}
     try:
-        res = requests.get(url, headers=HEADERS, params=params, timeout=8)
+        res = requests.get(url, headers=HEADERS, params={"instrument_key": instrument_key}, timeout=8)
         if res.status_code == 200:
             data = res.json().get("data", {})
             for _, val in data.items():
                 return float(val.get("last_price", 0.0))
     except Exception as e:
-        print(f"[-] Option Quote त्रुटी: {e}")
+        print(f"[-] Option LTP त्रुटी: {e}")
     return 0.0
 
 # ==============================================================================
-# ५. पेपर ट्रेडिंग लेजर व्यवस्थापक (CSV Logger)
+# ५. लेजर व्यवस्थापक (CSV Logger)
 # ==============================================================================
 def init_paper_ledger():
     if not os.path.exists(CSV_FILE):
@@ -176,7 +194,7 @@ def update_trade_in_csv(trade_id: str, updates: dict):
         df.to_csv(CSV_FILE, index=False)
 
 # ==============================================================================
-# ६. मुख्य लाइव्ह ट्रेडिंग इंजिन
+# ६. मुख्य लाइव्ह इंजिन
 # ==============================================================================
 def run_live_paper_bot():
     print("====================================================================")
@@ -184,30 +202,26 @@ def run_live_paper_bot():
     print("====================================================================")
 
     if not ACCESS_TOKEN:
-        print("[-] त्रुटी: UPSTOX_TOKEN किंवा UPSTOX_ACCESS_TOKEN उपलब्ध नाही.")
+        print("[-] त्रुटी: UPSTOX_TOKEN उपलब्ध नाही. GitHub Secrets तपासा.")
         sys.exit(1)
 
     init_paper_ledger()
     
-    # थेट Upstox कडून मार्केट डेटा आणणे
-    q_data = get_nifty_quote_data()
-    prev_close = q_data.get("prev_close", 0.0)
-
+    # १. Upstox V3 Daily Candle द्वारे अचूक मागील क्लोज मिळवणे
+    prev_close = get_nifty_prev_close_v3()
     if prev_close <= 0.0:
-        print("[-] त्रुटी: Upstox कडून मागील क्लोज भाव मिळाला नाही. टोकन तपासा.")
+        print("[-] त्रुटी: Upstox कडून मागील क्लोज भाव मिळाला नाही. टोकन किंवा इंटरनेट तपासा.")
         sys.exit(1)
 
     gann_levels = calculate_gann_levels(prev_close)
-    
-    # सध्याचा अधिकृत लॉट साईझ टेस्ट तपासणी
-    sample_contract = get_atm_option_contract(opt_type="CE")
-    lot_size = sample_contract.get("lot_size", 65)
+    sample_c = get_atm_option_contract_v2(opt_type="CE")
+    lot_size = sample_c.get("lot_size", 65)
 
     print(f"[+] API मागील क्लोज: {prev_close} | चालू लॉट साईझ: {lot_size}")
     print(f"[+] गॅन लेव्हल्स: {gann_levels}")
 
     send_telegram_alert(
-        f"🚀 *NIFTY GANN BOT STARTED (100% Dynamic)*\n"
+        f"🚀 *NIFTY GANN BOT STARTED (Upstox V3 Engine)*\n"
         f"• *API Prev Close:* `{prev_close}`\n"
         f"• *Lot Size:* `{lot_size}`\n"
         f"• *Gann Levels:* `{gann_levels}`\n"
@@ -227,12 +241,10 @@ def run_live_paper_bot():
             now_str = now_dt.strftime("%H:%M")
             today_str = now_dt.strftime("%Y-%m-%d")
 
-            # सकाळच्या ९:२० आधी ट्रेड नाही
             if now_str < "09:20":
                 time.sleep(15)
                 continue
 
-            # १५:२० वाजता सर्व पोझिशन्स सक्तीने बंद करणे
             if now_str >= "15:20" and active_position:
                 exit_price = active_position["current_opt_px"]
                 pts = round(exit_price - active_position["entry_px"], 2)
@@ -253,7 +265,7 @@ def run_live_paper_bot():
                 active_position = None
                 break
 
-            df_curr = get_live_nifty_candles(interval_min=1)
+            df_curr = get_live_nifty_candles_v3()
             if df_curr.empty or len(df_curr) < 15:
                 time.sleep(10)
                 continue
@@ -262,14 +274,13 @@ def run_live_paper_bot():
             spot_close = float(last_bar['close'])
             c_len = len(df_curr)
 
-            # चालू पोझिशनचे ट्रॅकिंग
+            # चालू पोझिशन ट्रॅकिंग
             if active_position:
                 entry_spot = active_position["entry_spot"]
                 opt_type = active_position["side"]
                 entry_opt = active_position["entry_px"]
                 active_lot = active_position["lot_size"]
 
-                # थेट Upstox कडून ऑप्शनचा चालू भाव मिळवणे
                 live_opt = get_live_option_ltp_by_key(active_position["instrument_key"])
                 if live_opt <= 0:
                     diff = (spot_close - entry_spot) if opt_type == "BUY_CE" else (entry_spot - spot_close)
@@ -279,11 +290,9 @@ def run_live_paper_bot():
 
                 active_position["current_opt_px"] = cur_opt
 
-                # १R नफा झाल्यावर ब्रेक-इव्हन ट्रेलिंग
                 if cur_opt >= entry_opt + active_position["sl_pts"]:
                     active_position["sl_px"] = max(active_position["sl_px"], entry_opt + 2.0)
 
-                # टार्गेट हिट
                 if cur_opt >= active_position["tgt_px"]:
                     pts = round(active_position["tgt_px"] - entry_opt, 2)
                     gross = round(pts * active_lot, 2)
@@ -302,7 +311,6 @@ def run_live_paper_bot():
                     )
                     active_position = None
 
-                # स्टॉप-लॉस हिट
                 elif cur_opt <= active_position["sl_px"]:
                     exit_reason = "BREAKEVEN_EXIT" if active_position["sl_px"] > (entry_opt - active_position["sl_pts"]) else "SL_HIT ❌"
                     pts = round(active_position["sl_px"] - entry_opt, 2)
@@ -325,7 +333,7 @@ def run_live_paper_bot():
                 time.sleep(5)
                 continue
 
-            # कन्सॉलिडेशन बॉक्स शोधणे
+            # कन्सॉलिडेशन बॉक्स ट्रॅकर
             if daily_trades < 3:
                 for lvl in gann_levels:
                     buf = lvl * BUFFER_PCT
@@ -348,7 +356,7 @@ def run_live_paper_bot():
 
                             # BUY CE ब्रेकआउट
                             if spot_close > box_high:
-                                contract = get_atm_option_contract(opt_type="CE")
+                                contract = get_atm_option_contract_v2(opt_type="CE")
                                 atm_strike = contract.get("strike_price", round(spot_close / 50.0) * 50)
                                 opt_key = contract.get("instrument_key", "")
                                 trade_lot = contract.get("lot_size", 65)
@@ -398,7 +406,7 @@ def run_live_paper_bot():
 
                             # BUY PE ब्रेकडाऊन
                             elif spot_close < box_low:
-                                contract = get_atm_option_contract(opt_type="PE")
+                                contract = get_atm_option_contract_v2(opt_type="PE")
                                 atm_strike = contract.get("strike_price", round(spot_close / 50.0) * 50)
                                 opt_key = contract.get("instrument_key", "")
                                 trade_lot = contract.get("lot_size", 65)
