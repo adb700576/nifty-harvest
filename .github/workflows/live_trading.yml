@@ -1,38 +1,25 @@
 name: Nifty Live Auto Trade
 
 on:
-  schedule:
-    # सोम-शुक्र सकाळी 9:15 IST (UTC 3:45 AM)
-    - cron: '45 3 * * 1-5'
-  workflow_dispatch: # Actions टॅबमधून मॅन्युअली टेस्ट करण्यासाठी
+  workflow_dispatch:
 
 jobs:
   run-live:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: setup-python@v4
         with:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: |
-          pip install requests pandas numpy pytz urllib3
+        run: pip install requests pandas numpy
 
-      - name: Run Live Trading Engine
+      - name: Run Live Engine
         env:
-          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python -u live_engine.py
-
-      - name: Upload Vault & Trade Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: live-nifty-vault
-          path: nifty_vault.db
+        run: python -u live_engine.py
