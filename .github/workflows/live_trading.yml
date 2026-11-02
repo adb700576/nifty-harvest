@@ -7,22 +7,23 @@ jobs:
   run-live:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v3
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Install Packages
+      - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas numpy
+          pip install requests pandas numpy pytz urllib3
 
       - name: Run Live Engine
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -u live_engine.py
+        run: |
+          python -u live_engine.py
