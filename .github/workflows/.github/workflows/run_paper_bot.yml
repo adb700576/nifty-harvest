@@ -1,0 +1,23 @@
+name: Run Live Paper Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Python सेटअप
+        uses: setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: लायब्ररी इन्स्टॉल
+        run: pip install requests pandas numpy
+
+      - name: बॉट रन करा
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        run: python -u live_paper_trader.py
