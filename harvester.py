@@ -14,6 +14,13 @@ from urllib3.util.retry import Retry
 # ==============================================================================
 # १. कॉन्फिगरेशन व क्रेडेंशियल्स
 # ==============================================================================
+ACCESS_TOKEN = ""
+if os.path.exists("token.txt"):
+    with open("token.txt", "r") as f:
+        ACCESS_TOKEN = f.read().strip()
+
+if not ACCESS_TOKEN:
+    ACCESS_TOKEN = (os.environ.get("UPSTOX_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN") or "").strip()
 DB_FILE = 'nifty_vault.db'
 ACCESS_TOKEN = (
     os.environ.get("UPSTOX_TOKEN") or 
