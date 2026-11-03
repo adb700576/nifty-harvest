@@ -22,12 +22,6 @@ if os.path.exists("token.txt"):
 if not ACCESS_TOKEN:
     ACCESS_TOKEN = (os.environ.get("UPSTOX_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN") or "").strip()
 DB_FILE = 'nifty_vault.db'
-ACCESS_TOKEN = (
-    os.environ.get("UPSTOX_TOKEN") or 
-    os.environ.get("UPSTOX_ACCESS_TOKEN") or 
-    ""
-).strip()
-
 BASE_URL = "https://api.upstox.com"
 HEADERS = {
     "Accept": "application/json",
