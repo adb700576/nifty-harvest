@@ -2,7 +2,6 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    # दररोज दुपारी 3:35 IST (UTC 10:05 AM) मार्केट बंद झाल्यानंतर डेटा साठवण्यासाठी
     - cron: '5 10 * * 1-5'
   workflow_dispatch:
 
@@ -19,14 +18,20 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: |
-          pip install requests pandas numpy pytz urllib3
+        run: pip install requests pandas numpy pytz urllib3 pyotp
+
+      - name: Auto-Generate Fresh Upstox Token
+        env:
+          UPSTOX_API_KEY: ${{ secrets.UPSTOX_API_KEY }}
+          UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
+          UPSTOX_REDIRECT_URI: ${{ secrets.UPSTOX_REDIRECT_URI }}
+          UPSTOX_MOBILE: ${{ secrets.UPSTOX_MOBILE }}
+          UPSTOX_PIN: ${{ secrets.UPSTOX_PIN }}
+          UPSTOX_TOTP_KEY: ${{ secrets.UPSTOX_TOTP_KEY }}
+        run: python -u get_token_auto.py
 
       - name: Run Harvester
-        env:
-          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-        run: |
-          python -u harvester.py
+        run: python -u harvester.py
 
       - name: Upload Harvested DB Artifact
         if: always()
