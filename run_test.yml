@@ -1,0 +1,24 @@
+name: Run Yesterday Signal Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install requests pandas
+
+      - name: Run Test Script
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: python -u test_yesterday_signals.py
