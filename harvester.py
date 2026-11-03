@@ -21,6 +21,7 @@ if os.path.exists("token.txt"):
 
 if not ACCESS_TOKEN:
     ACCESS_TOKEN = (os.environ.get("UPSTOX_TOKEN") or os.environ.get("UPSTOX_ACCESS_TOKEN") or "").strip()
+
 DB_FILE = 'nifty_vault.db'
 BASE_URL = "https://api.upstox.com"
 HEADERS = {
@@ -34,6 +35,31 @@ IST = timezone(timedelta(hours=5, minutes=30))
 session = requests.Session()
 retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
+
+
+def send_telegram_alert(message: str):
+    """टेलिग्रामवर मेसेज पाठवणे"""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
+    if not bot_token or not chat_id:
+        print("[-] [Telegram] Secrets सापडले नाहीत. मेसेज पाठवला नाही.", flush=True)
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            print("[+] [Telegram] अलर्ट यशस्वीरीत्या पाठवला!", flush=True)
+        else:
+            print(f"[-] [Telegram] त्रुटी ({res.status_code}): {res.text}", flush=True)
+    except Exception as e:
+        print(f"[-] [Telegram] अपवाद: {e}", flush=True)
 
 
 def init_vault_db():
@@ -71,7 +97,6 @@ def get_live_expiries():
     except Exception as e:
         print(f"[-] Expiries API त्रुटी: {e}", flush=True)
 
-    # लाइव्ह ऑप्शन चेन बॅकअप
     try:
         res_live = session.get(f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050", headers=HEADERS, timeout=8)
         if res_live.status_code == 200:
@@ -89,7 +114,6 @@ def get_today_active_expiry(expiries_list):
 
 
 def get_current_nifty_spot() -> float:
-    """Upstox V3 Market Quote API वरून निफ्टीचा चालू स्पॉट भाव मिळवणे"""
     url = f"{BASE_URL}/v3/market-quote/quotes"
     params = {"instrument_key": "NSE_INDEX|Nifty 50"}
     try:
@@ -105,7 +129,6 @@ def get_current_nifty_spot() -> float:
     except Exception as e:
         print(f"[-] Spot Fetch Exception: {e}", flush=True)
 
-    # बॅकअप: Intraday 1-minute Candle चा शेवटचा भाव
     try:
         inst_key = quote("NSE_INDEX|Nifty 50", safe="")
         c_url = f"{BASE_URL}/v3/historical-candle/intraday/{inst_key}/minutes/1"
@@ -113,25 +136,25 @@ def get_current_nifty_spot() -> float:
         if res_c.status_code == 200:
             candles = res_c.json().get("data", {}).get("candles", [])
             if candles:
-                return float(candles[0][4])  # Latest close
+                return float(candles[0][4])
     except Exception as e:
         print(f"[-] Spot Candle Backup Exception: {e}", flush=True)
 
     return 0.0
 
 
-def harvest_and_vault():
+def harvest_and_vault() -> int:
     init_vault_db()
     print("🌾 [Harvester] डेटा गोळा करण्याचे काम सुरू होत आहे...", flush=True)
 
     if not ACCESS_TOKEN:
         print("[-] [Harvester] UPSTOX_TOKEN आढळले नाही. GitHub Secrets तपासा.", flush=True)
-        return
+        return 0
 
     spot_px = get_current_nifty_spot()
     if spot_px <= 0:
         print("[-] [Harvester] स्पॉट प्राईस मिळाली नाही.", flush=True)
-        return
+        return 0
 
     print(f"[+] [Harvester] चालू NIFTY 50 स्पॉट: {spot_px}", flush=True)
 
@@ -143,7 +166,6 @@ def harvest_and_vault():
     strikes_to_track = [atm_strike + (i * 50.0) for i in range(-3, 4)]
     print(f"[+] [Harvester] ट्रॅक करायचे स्ट्राइक्स (ATM {atm_strike}): {strikes_to_track}", flush=True)
 
-    # ऑप्शन कॉन्ट्रॅक्ट्स मिळवणे
     url_c = f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={active_expiry}"
     contracts = []
     try:
@@ -173,7 +195,6 @@ def harvest_and_vault():
             opt_type = c.get('instrument_type', '').upper()
 
             enc_key = quote(inst_key, safe='')
-            # अधिकृत Upstox V3 Intraday 1-minute Candle URL
             c_url = f"{BASE_URL}/v3/historical-candle/intraday/{enc_key}/minutes/1"
             try:
                 r_c = session.get(c_url, headers=HEADERS, timeout=6)
@@ -200,9 +221,29 @@ def harvest_and_vault():
         conn.commit()
         conn.close()
         print(f"✅ [Harvester] {len(records_to_insert)} कॅन्डल्स व्हॉल्टमध्ये यशस्वीरीत्या साठवल्या.", flush=True)
+        return len(records_to_insert)
     else:
         print("ℹ️ [Harvester] साठवण्यासाठी नवीन कॅन्डल्स सापडल्या नाहीत.", flush=True)
+        return 0
 
 
 if __name__ == "__main__":
-    harvest_and_vault()
+    count = harvest_and_vault()
+    current_time = datetime.now(IST).strftime("%d-%m-%Y %I:%M %p")
+    
+    if count > 0:
+        msg = (
+            f"🌾 *NIFTY Harvester Report*\n\n"
+            f"✅ *Status:* डेटा यशस्वीरीत्या गोळा झाला!\n"
+            f"📊 *साठवलेल्या कॅन्डल्स:* `{count}`\n"
+            f"⏰ *वेळ:* `{current_time} IST`\n"
+            f"📁 *Database:* `nifty_vault.db` अद्ययावत झाला."
+        )
+    else:
+        msg = (
+            f"⚠️ *NIFTY Harvester Alert*\n\n"
+            f"रनिंग पूर्ण झाले, परंतु नवीन डेटा सापडला नाही.\n"
+            f"⏰ *वेळ:* `{current_time} IST`"
+        )
+    
+    send_telegram_alert(msg)
