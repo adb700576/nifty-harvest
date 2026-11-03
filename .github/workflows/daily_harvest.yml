@@ -18,7 +18,9 @@ jobs:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests pandas numpy pytz urllib3 pyotp
+        run: |
+          pip install requests pandas numpy pytz urllib3 pyotp playwright
+          playwright install --with-deps chromium
 
       - name: Auto-Generate Fresh Upstox Token
         env:
