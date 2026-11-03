@@ -20,6 +20,8 @@ def get_auth_code_via_headless():
 
     print("[*] हेडलेस ऑथेंटिकेशन सुरू होत आहे...", flush=True)
 
+    captured_code = None
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -29,22 +31,32 @@ def get_auth_code_via_headless():
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = context.new_page()
+
+        # १. रिडिरॅक्ट होताना येणारी रिक्वेस्ट ट्रॅक करणे
+        def on_request(request):
+            nonlocal captured_code
+            if request.url.startswith(REDIRECT_URI) and "code=" in request.url:
+                parsed = urllib.parse.urlparse(request.url)
+                captured_code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+                print(f"[+] Auth Code पकडला गेला!", flush=True)
+
+        page.on("request", on_request)
+
         page.goto(auth_dialog_url, wait_until="networkidle", timeout=60000)
 
-        # १. मोबाईल नंबर शोधणे व भरणे
+        # २. मोबाईल नंबर भरणे
         print("[*] मोबाईल नंबर इनपुट शोधत आहे...", flush=True)
         mobile_selector = '#mobileNum, input[name="mobileNumber"], input[type="tel"], input[type="text"]'
         page.wait_for_selector(mobile_selector, timeout=30000)
         page.locator(mobile_selector).first.fill(MOBILE_NO)
         
-        # Get OTP बटण क्लिक
         page.keyboard.press("Enter")
         try:
             page.locator('button:has-text("Get OTP"), button:has-text("Continue"), #getOtp').first.click(timeout=5000)
         except Exception:
             pass
 
-        # २. चालू TOTP भरणे
+        # ३. OTP भरणे
         totp = pyotp.TOTP(TOTP_KEY)
         otp = totp.now()
         print(f"[*] जनरेट झालेला OTP टाकत आहे: {otp}", flush=True)
@@ -59,7 +71,7 @@ def get_auth_code_via_headless():
         except Exception:
             pass
 
-        # ३. ६-अंकी लॉगिन PIN भरणे
+        # ४. PIN भरणे
         print("[*] ६-अंकी लॉगिन PIN टाकत आहे...", flush=True)
         pin_selector = '#pinCode, input[type="password"], input[name="pin"]'
         page.wait_for_selector(pin_selector, timeout=30000)
@@ -71,15 +83,15 @@ def get_auth_code_via_headless():
         except Exception:
             pass
 
-        # ४. Redirect URL मधून Code घेणे
-        print("[*] Redirect URL ची वाट पाहत आहे...", flush=True)
-        page.wait_for_url(f"{REDIRECT_URI}*", timeout=40000)
-        final_url = page.url
-        browser.close()
+        print("[*] Redirect कोड मिळण्याची वाट पाहत आहे...", flush=True)
+        # रिडिरॅक्ट रिक्वेस्ट येईपर्यंत ५ ते १० सेकंद वाट पाहणे
+        for _ in range(30):
+            if captured_code:
+                break
+            page.wait_for_timeout(500)
 
-        parsed = urllib.parse.urlparse(final_url)
-        code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
-        return code
+        browser.close()
+        return captured_code
 
 def fetch_access_token(auth_code):
     token_url = "https://api.upstox.com/v2/login/authorization/token"
