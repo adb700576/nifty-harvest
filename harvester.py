@@ -15,7 +15,11 @@ from urllib3.util.retry import Retry
 # १. कॉन्फिगरेशन व क्रेडेंशियल्स
 # ==============================================================================
 DB_FILE = 'nifty_vault.db'
-ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN", "").strip()
+ACCESS_TOKEN = (
+    os.environ.get("UPSTOX_TOKEN") or 
+    os.environ.get("UPSTOX_ACCESS_TOKEN") or 
+    ""
+).strip()
 
 BASE_URL = "https://api.upstox.com"
 HEADERS = {
@@ -63,8 +67,8 @@ def get_live_expiries():
             expiries = res.json().get('data', [])
             if expiries:
                 return sorted(list(set(expiries)))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[-] Expiries API त्रुटी: {e}", flush=True)
 
     # लाइव्ह ऑप्शन चेन बॅकअप
     try:
@@ -72,8 +76,8 @@ def get_live_expiries():
         if res_live.status_code == 200:
             contracts = res_live.json().get('data', [])
             return sorted(list(set(c['expiry'] for c in contracts if 'expiry' in c)))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[-] Live Option Chain त्रुटी: {e}", flush=True)
     return []
 
 
@@ -83,17 +87,35 @@ def get_today_active_expiry(expiries_list):
     return valid[0] if valid else today_str
 
 
-def get_current_nifty_spot():
-    index_key = quote("NSE_INDEX|Nifty 50", safe="")
-    url = f"{BASE_URL}/v2/market-quote/ltp?instrument_key={index_key}"
+def get_current_nifty_spot() -> float:
+    """Upstox V3 Market Quote API वरून निफ्टीचा चालू स्पॉट भाव मिळवणे"""
+    url = f"{BASE_URL}/v3/market-quote/quotes"
+    params = {"instrument_key": "NSE_INDEX|Nifty 50"}
     try:
-        res = session.get(url, headers=HEADERS, timeout=4)
+        res = session.get(url, headers=HEADERS, params=params, timeout=6)
         if res.status_code == 200:
             data = res.json().get("data", {})
-            first_val = next(iter(data.values()), {})
-            return float(first_val.get("last_price", 0.0))
-    except Exception:
-        pass
+            for _, val in data.items():
+                lp = float(val.get("last_price", 0.0))
+                if lp > 0.0:
+                    return lp
+        else:
+            print(f"[-] Spot API Error ({res.status_code}): {res.text}", flush=True)
+    except Exception as e:
+        print(f"[-] Spot Fetch Exception: {e}", flush=True)
+
+    # बॅकअप: Intraday 1-minute Candle चा शेवटचा भाव
+    try:
+        inst_key = quote("NSE_INDEX|Nifty 50", safe="")
+        c_url = f"{BASE_URL}/v3/historical-candle/intraday/{inst_key}/minutes/1"
+        res_c = session.get(c_url, headers=HEADERS, timeout=6)
+        if res_c.status_code == 200:
+            candles = res_c.json().get("data", {}).get("candles", [])
+            if candles:
+                return float(candles[0][4])  # Latest close
+    except Exception as e:
+        print(f"[-] Spot Candle Backup Exception: {e}", flush=True)
+
     return 0.0
 
 
@@ -101,29 +123,36 @@ def harvest_and_vault():
     init_vault_db()
     print("🌾 [Harvester] डेटा गोळा करण्याचे काम सुरू होत आहे...", flush=True)
 
-    expiries = get_live_expiries()
-    active_expiry = get_today_active_expiry(expiries)
-    spot_px = get_current_nifty_spot()
+    if not ACCESS_TOKEN:
+        print("[-] [Harvester] UPSTOX_TOKEN आढळले नाही. GitHub Secrets तपासा.", flush=True)
+        return
 
+    spot_px = get_current_nifty_spot()
     if spot_px <= 0:
         print("[-] [Harvester] स्पॉट प्राईस मिळाली नाही.", flush=True)
         return
 
+    print(f"[+] [Harvester] चालू NIFTY 50 स्पॉट: {spot_px}", flush=True)
+
+    expiries = get_live_expiries()
+    active_expiry = get_today_active_expiry(expiries)
+    print(f"[+] [Harvester] ॲक्टिव्ह एक्सपायरी: {active_expiry}", flush=True)
+
     atm_strike = round(spot_px / 50.0) * 50.0
     strikes_to_track = [atm_strike + (i * 50.0) for i in range(-3, 4)]
+    print(f"[+] [Harvester] ट्रॅक करायचे स्ट्राइक्स (ATM {atm_strike}): {strikes_to_track}", flush=True)
 
-    # चालू आठवड्याचे ऑप्शन्स कॉन्ट्रॅक्ट्स मिळवणे
+    # ऑप्शन कॉन्ट्रॅक्ट्स मिळवणे
     url_c = f"{BASE_URL}/v2/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={active_expiry}"
     contracts = []
     try:
         res = session.get(url_c, headers=HEADERS, timeout=8)
         if res.status_code == 200:
             contracts = res.json().get('data', [])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[-] Option Contracts त्रुटी: {e}", flush=True)
 
     if not contracts:
-        # Expired API फॉलबॅक
         url_exp = f"{BASE_URL}/v2/expired-instruments/option/contract?instrument_key=NSE_INDEX%7CNifty%2050&expiry_date={active_expiry}"
         try:
             r_exp = session.get(url_exp, headers=HEADERS, timeout=8)
@@ -143,7 +172,8 @@ def harvest_and_vault():
             opt_type = c.get('instrument_type', '').upper()
 
             enc_key = quote(inst_key, safe='')
-            c_url = f"{BASE_URL}/v2/historical-candle/intraday/{enc_key}/1minute"
+            # अधिकृत Upstox V3 Intraday 1-minute Candle URL
+            c_url = f"{BASE_URL}/v3/historical-candle/intraday/{enc_key}/minutes/1"
             try:
                 r_c = session.get(c_url, headers=HEADERS, timeout=6)
                 if r_c.status_code == 200:
@@ -162,13 +192,13 @@ def harvest_and_vault():
     if records_to_insert:
         conn = sqlite3.connect(DB_FILE)
         conn.executemany('''
-        INSERT OR REPLACE INTO nifty_options_1m
+        INSERT OR REPLACE INTO nifty_options_1m 
         (date, timestamp, symbol, instrument_key, expiry, strike, option_type, open, high, low, close, volume, oi)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', records_to_insert)
         conn.commit()
         conn.close()
-        print(f"✅ [Harvester] {len(records_to_insert)} कॅन्डल्स व्हॉल्टमध्ये यशस्वी साठवल्या.", flush=True)
+        print(f"✅ [Harvester] {len(records_to_insert)} कॅन्डल्स व्हॉल्टमध्ये यशस्वीरीत्या साठवल्या.", flush=True)
     else:
         print("ℹ️ [Harvester] साठवण्यासाठी नवीन कॅन्डल्स सापडल्या नाहीत.", flush=True)
 
