@@ -15,39 +15,64 @@ TOTP_KEY = os.environ.get("UPSTOX_TOTP_KEY", "").strip()
 def get_auth_code_via_headless():
     auth_dialog_url = (
         f"https://api.upstox.com/v2/login/authorization/dialog?"
-        f"response_type=code&client_id={API_KEY}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+        f"response_type=code&client_id={API_KEY}&redirect_uri={urllib.parse.quote(REDIRECT_URI, safe='')}"
     )
 
     print("[*] हेडलेस ऑथेंटिकेशन सुरू होत आहे...", flush=True)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(auth_dialog_url, timeout=60000)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        page.goto(auth_dialog_url, wait_until="networkidle", timeout=60000)
 
-        # १. मोबाईल नंबर टाकणे
-        print("[*] मोबाईल नंबर टाकत आहे...", flush=True)
-        page.wait_for_selector('input[type="tel"]', timeout=30000)
-        page.fill('input[type="tel"]', MOBILE_NO)
-        page.click('button:has-text("Get OTP")')
+        # १. मोबाईल नंबर शोधणे व भरणे
+        print("[*] मोबाईल नंबर इनपुट शोधत आहे...", flush=True)
+        mobile_selector = '#mobileNum, input[name="mobileNumber"], input[type="tel"], input[type="text"]'
+        page.wait_for_selector(mobile_selector, timeout=30000)
+        page.locator(mobile_selector).first.fill(MOBILE_NO)
+        
+        # Get OTP बटण क्लिक
+        page.keyboard.press("Enter")
+        try:
+            page.locator('button:has-text("Get OTP"), button:has-text("Continue"), #getOtp').first.click(timeout=5000)
+        except Exception:
+            pass
 
-        # २. TOTP जनरेट करून भरणे
+        # २. चालू TOTP भरणे
         totp = pyotp.TOTP(TOTP_KEY)
         otp = totp.now()
         print(f"[*] जनरेट झालेला OTP टाकत आहे: {otp}", flush=True)
 
-        page.wait_for_selector('input[type="number"], input[inputmode="numeric"]', timeout=30000)
-        page.fill('input[type="number"], input[inputmode="numeric"]', otp)
-        page.click('button:has-text("Continue")')
+        otp_selector = '#otpNum, input[name="otp"], input[type="number"], input[inputmode="numeric"]'
+        page.wait_for_selector(otp_selector, timeout=30000)
+        page.locator(otp_selector).first.fill(otp)
+        
+        page.keyboard.press("Enter")
+        try:
+            page.locator('button:has-text("Continue"), button:has-text("Verify"), #verifyOtp').first.click(timeout=5000)
+        except Exception:
+            pass
 
-        # ३. ६-अंकी PIN भरणे
+        # ३. ६-अंकी लॉगिन PIN भरणे
         print("[*] ६-अंकी लॉगिन PIN टाकत आहे...", flush=True)
-        page.wait_for_selector('input[type="password"]', timeout=30000)
-        page.fill('input[type="password"]', PIN)
-        page.click('button:has-text("Continue")')
+        pin_selector = '#pinCode, input[type="password"], input[name="pin"]'
+        page.wait_for_selector(pin_selector, timeout=30000)
+        page.locator(pin_selector).first.fill(PIN)
 
-        # ४. रिडिरॅक्ट URL मधून कोड मिळवणे
-        print("[*] रिडिरॅक्शन कोडची वाट पाहत आहे...", flush=True)
+        page.keyboard.press("Enter")
+        try:
+            page.locator('button:has-text("Continue"), button:has-text("Login"), #pinContinueBtn').first.click(timeout=5000)
+        except Exception:
+            pass
+
+        # ४. Redirect URL मधून Code घेणे
+        print("[*] Redirect URL ची वाट पाहत आहे...", flush=True)
         page.wait_for_url(f"{REDIRECT_URI}*", timeout=40000)
         final_url = page.url
         browser.close()
