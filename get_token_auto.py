@@ -3,6 +3,7 @@ import sys
 import urllib.parse
 import pyotp
 import requests
+from playwright.sync_api import sync_playwright
 
 API_KEY = os.environ.get("UPSTOX_API_KEY", "").strip()
 API_SECRET = os.environ.get("UPSTOX_API_SECRET", "").strip()
@@ -11,56 +12,51 @@ MOBILE_NO = os.environ.get("UPSTOX_MOBILE", "").strip()
 PIN = os.environ.get("UPSTOX_PIN", "").strip()
 TOTP_KEY = os.environ.get("UPSTOX_TOTP_KEY", "").strip()
 
-def generate_upstox_token():
-    if not all([API_KEY, API_SECRET, REDIRECT_URI, MOBILE_NO, PIN, TOTP_KEY]):
-        print("[-] त्रुटी: आवश्यक Secrets उपलब्ध नाहीत.")
-        sys.exit(1)
+def get_auth_code_via_headless():
+    auth_dialog_url = (
+        f"https://api.upstox.com/v2/login/authorization/dialog?"
+        f"response_type=code&client_id={API_KEY}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+    )
 
-    session = requests.Session()
+    print("[*] हेडलेस ऑथेंटिकेशन सुरू होत आहे...", flush=True)
 
-    # १. चालू OTP जनरेट करणे
-    totp = pyotp.TOTP(TOTP_KEY)
-    current_otp = totp.now()
-    print(f"[*] चालू OTP जनरेट केला: {current_otp}", flush=True)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(auth_dialog_url, timeout=60000)
 
-    # २. Upstox TOTP व्हॅलिडेशन
-    otp_url = "https://api.upstox.com/v2/login/v2/totp"
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
-    payload = {
-        "code": current_otp,
-        "mobileNumber": MOBILE_NO
-    }
+        # १. मोबाईल नंबर टाकणे
+        print("[*] मोबाईल नंबर टाकत आहे...", flush=True)
+        page.wait_for_selector('input[type="tel"]', timeout=30000)
+        page.fill('input[type="tel"]', MOBILE_NO)
+        page.click('button:has-text("Get OTP")')
 
-    res_otp = session.post(otp_url, json=payload, headers=headers, timeout=10)
-    if res_otp.status_code != 200:
-        print(f"[-] TOTP Validation अयशस्वी ({res_otp.status_code}): {res_otp.text}")
-        sys.exit(1)
+        # २. TOTP जनरेट करून भरणे
+        totp = pyotp.TOTP(TOTP_KEY)
+        otp = totp.now()
+        print(f"[*] जनरेट झालेला OTP टाकत आहे: {otp}", flush=True)
 
-    # ३. ६-अंकी लॉगिन PIN व्हॅलिडेशन
-    pin_url = "https://api.upstox.com/v2/login/v2/pin"
-    res_pin = session.post(pin_url, json={"pin": PIN}, headers=headers, timeout=10)
-    if res_pin.status_code != 200:
-        print(f"[-] PIN Validation अयशस्वी ({res_pin.status_code}): {res_pin.text}")
-        sys.exit(1)
+        page.wait_for_selector('input[type="number"], input[inputmode="numeric"]', timeout=30000)
+        page.fill('input[type="number"], input[inputmode="numeric"]', otp)
+        page.click('button:has-text("Continue")')
 
-    # ४. Authorization Code मिळवणे
-    auth_dialog_url = "https://api.upstox.com/v2/login/authorization/dialog"
-    params = {
-        "response_type": "code",
-        "client_id": API_KEY,
-        "redirect_uri": REDIRECT_URI
-    }
-    res_auth = session.get(auth_dialog_url, params=params, allow_redirects=False, timeout=10)
-    redirect_location = res_auth.headers.get("Location", "")
+        # ३. ६-अंकी PIN भरणे
+        print("[*] ६-अंकी लॉगिन PIN टाकत आहे...", flush=True)
+        page.wait_for_selector('input[type="password"]', timeout=30000)
+        page.fill('input[type="password"]', PIN)
+        page.click('button:has-text("Continue")')
 
-    parsed = urllib.parse.urlparse(redirect_location)
-    auth_code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+        # ४. रिडिरॅक्ट URL मधून कोड मिळवणे
+        print("[*] रिडिरॅक्शन कोडची वाट पाहत आहे...", flush=True)
+        page.wait_for_url(f"{REDIRECT_URI}*", timeout=40000)
+        final_url = page.url
+        browser.close()
 
-    if not auth_code:
-        print("[-] Auth Code मिळाला नाही.")
-        sys.exit(1)
+        parsed = urllib.parse.urlparse(final_url)
+        code = urllib.parse.parse_qs(parsed.query).get('code', [None])[0]
+        return code
 
-    # ५. Auth Code द्वारे नवीन Access Token मिळवणे
+def fetch_access_token(auth_code):
     token_url = "https://api.upstox.com/v2/login/authorization/token"
     token_data = {
         "code": auth_code,
@@ -69,15 +65,31 @@ def generate_upstox_token():
         "redirect_uri": REDIRECT_URI,
         "grant_type": "authorization_code"
     }
-    res_token = session.post(token_url, data=token_data, timeout=10)
-    if res_token.status_code == 200:
-        access_token = res_token.json().get("access_token")
-        print("✅ नवीन Upstox Access Token यशस्वीरीत्या मिळाला!", flush=True)
-        with open("token.txt", "w") as f:
-            f.write(access_token)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    res = requests.post(token_url, data=token_data, headers=headers, timeout=10)
+    if res.status_code == 200:
+        return res.json().get("access_token")
     else:
-        print(f"[-] Token एक्सचेंज अयशस्वी: {res_token.text}")
-        sys.exit(1)
+        print(f"[-] Token Exchange Failed: {res.text}", flush=True)
+        return None
 
 if __name__ == "__main__":
-    generate_upstox_token()
+    try:
+        code = get_auth_code_via_headless()
+        if not code:
+            print("[-] Auth code मिळाला नाही.", flush=True)
+            sys.exit(1)
+
+        token = fetch_access_token(code)
+        if token:
+            print("✅ नवीन Upstox Access Token यशस्वीरीत्या मिळाला!", flush=True)
+            with open("token.txt", "w") as f:
+                f.write(token)
+        else:
+            sys.exit(1)
+    except Exception as e:
+        print(f"[-] अपवाद आला: {e}", flush=True)
+        sys.exit(1)
