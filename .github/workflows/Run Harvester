@@ -1,0 +1,8 @@
+- name: Run Harvester
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u harvester.py
+
+      - name: Inspect Vault Data
+        run: python -u view_vault_data.py
