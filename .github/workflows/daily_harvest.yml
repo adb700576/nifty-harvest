@@ -2,7 +2,8 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '5 10 * * 1-5'
+    # दर सोमवार ते शुक्रवार सकाळी 8:45 AM IST (UTC 3:15 AM) वाजता चालेल
+    - cron: '15 3 * * 1-5'
   workflow_dispatch:
 
 jobs:
