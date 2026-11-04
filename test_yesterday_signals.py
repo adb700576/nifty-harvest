@@ -1,36 +1,277 @@
+import os
 import sqlite3
 import pandas as pd
-from strategy_vwap_1m import VWAP1MinStrategy
+import requests
 
-DB_FILE = 'nifty_vault.db'
+DB_PATH = "nifty_vault.db"
+BASE_URL = "https://api.upstox.com"
+ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN") or ""
 
-def test_today_vwap():
-    print("==================================================", flush=True)
-    print("📊 [VWAP 1-Min Strategy: Practical Backtest]", flush=True)
-    print("==================================================", flush=True)
+LOT_SIZE = 65
+DELTA_TARGET = 0.52
+MIN_OPT_SL_PTS = 10.0
 
-    conn = sqlite3.connect(DB_FILE)
-    df_fut = pd.read_sql_query("SELECT timestamp, open, high, low, close, volume FROM nifty_index_1m ORDER BY timestamp ASC", conn)
-    df_options = pd.read_sql_query("SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi FROM nifty_options_1m ORDER BY timestamp ASC", conn)
-    df_sentiment = pd.read_sql_query("SELECT date, pcr FROM market_sentiment_summary", conn)
-    conn.close()
 
-    if df_fut.empty or df_options.empty:
-        print("[-] व्हॉल्टमध्ये डेटा सापडला नाही.", flush=True)
+def get_upstox_charges(
+    instrument_token: str,
+    quantity: int,
+    buy_price: float,
+    sell_price: float,
+    token: str = None,
+) -> dict:
+    url = f"{BASE_URL}/v2/charges/brokerage"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token or ACCESS_TOKEN}",
+    }
+
+    buy_params = {
+        "instrument_token": instrument_token,
+        "quantity": str(quantity),
+        "product": "I",
+        "transaction_type": "BUY",
+        "price": str(buy_price),
+    }
+    sell_params = {
+        "instrument_token": instrument_token,
+        "quantity": str(quantity),
+        "product": "I",
+        "transaction_type": "SELL",
+        "price": str(sell_price),
+    }
+
+    total_brokerage = 0.0
+    total_stt = 0.0
+    total_other = 0.0
+
+    if ACCESS_TOKEN:
+        try:
+            res_b = requests.get(url, headers=headers, params=buy_params, timeout=2)
+            if res_b.status_code == 200:
+                db = res_b.json().get("data", {}).get("charges", {})
+                total_brokerage += float(db.get("brokerage", 20.0))
+                total_stt += float(db.get("stt", 0.0))
+                total_other += (
+                    float(db.get("gst", 0.0))
+                    + float(db.get("stamp_duty", 0.0))
+                    + float(db.get("other_charges", 0.0))
+                )
+
+            res_s = requests.get(url, headers=headers, params=sell_params, timeout=2)
+            if res_s.status_code == 200:
+                ds = res_s.json().get("data", {}).get("charges", {})
+                total_brokerage += float(ds.get("brokerage", 20.0))
+                total_stt += float(ds.get("stt", 0.0))
+                total_other += float(ds.get("gst", 0.0)) + float(
+                    ds.get("other_charges", 0.0)
+                )
+
+            total_taxes = round(total_brokerage + total_stt + total_other, 2)
+            if total_taxes > 0:
+                return {
+                    "total_charges": total_taxes,
+                    "brokerage": round(total_brokerage, 2),
+                    "stt": round(total_stt, 2),
+                }
+        except Exception:
+            pass
+
+    # Upstox API कॉल न झाल्यास अचूक डिफॉल्ट चार्जेस (₹२० Buy + ₹२० Sell + STT/GST = ₹५२.००)
+    return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
+
+
+def run_harvest_pnl_engine():
+    if not os.path.exists(DB_PATH):
+        print(f"[-] {DB_PATH} सापडला नाही. आधी Harvester चालवून डेटा गोळा करा.", flush=True)
         return
 
-    print(f"✅ डेटा लोड झाला: Index Candles = {len(df_fut)}, Option Candles = {len(df_options)}", flush=True)
+    conn = sqlite3.connect(DB_PATH)
+    
+    # व्हॉल्टमधील तारखा शोधणे
+    avail_dates = pd.read_sql_query("SELECT DISTINCT substr(timestamp, 1, 10) as t_date FROM nifty_options_1m ORDER BY t_date DESC", conn)
+    if avail_dates.empty:
+        print("[-] व्हॉल्टमध्ये कँडल्स सापडल्या नाहीत.", flush=True)
+        conn.close()
+        return
 
-    strat = VWAP1MinStrategy(risk_reward_ratio=2.0)
-    trades = strat.run_backtest(df_fut, df_options, df_sentiment)
+    dates_list = avail_dates['t_date'].tolist()
+    # आजची किंवा सर्वात ताजी तारीख निवडणे
+    target_date = dates_list[0]
 
-    if not trades.empty:
-        print("\n🎯 [आज निघालेले ट्रेड्स]:\n", flush=True)
-        print(trades.to_string(index=False), flush=True)
-        total_pnl = trades['P&L %'].sum()
-        print(f"\n💰 एकूण P&L: {round(total_pnl, 2)}%\n", flush=True)
+    print("=" * 70, flush=True)
+    print(f"🚀 [Auto PnL Engine] चाचणी सुरू तारीख: {target_date} (Paper Trade Mode)", flush=True)
+    print("=" * 70, flush=True)
+
+    query = f"""
+        SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
+        FROM nifty_options_1m
+        WHERE timestamp LIKE '{target_date}%'
+        ORDER BY timestamp ASC, symbol ASC
+    """
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+
+    if df.empty:
+        print(f"[-] {target_date} साठी डेटा उपलब्ध नाही.", flush=True)
+        return
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.drop_duplicates(subset=["symbol", "timestamp"]).reset_index(drop=True)
+
+    all_processed = []
+    for sym in df["symbol"].unique():
+        sub = df[df["symbol"] == sym].copy().sort_values("timestamp")
+        if len(sub) < 25:
+            continue
+        sub["vol_sma20"] = sub["volume"].rolling(20).mean().replace(0, 1.0)
+        sub["vol_ratio"] = sub["volume"] / sub["vol_sma20"]
+
+        prev_c = sub["close"].shift(1)
+        tr = pd.concat([
+            sub["high"] - sub["low"],
+            (sub["high"] - prev_c).abs(),
+            (sub["low"] - prev_c).abs(),
+        ], axis=1).max(axis=1)
+        sub["atr14"] = tr.rolling(14).mean().fillna(5.0)
+        all_processed.append(sub)
+
+    if not all_processed:
+        print("[-] तांत्रिक विश्लेषणासाठी पुरेशा कँडल्स नाहीत.", flush=True)
+        return
+
+    df_data = pd.concat(all_processed, axis=0).sort_values(by=["timestamp", "symbol"])
+
+    all_trades = []
+    morning_trades = 0
+    afternoon_trades = 0
+    active_trade = None
+    cooldown_until = None
+    timestamps = df_data["timestamp"].unique()
+
+    for ts in timestamps:
+        ts_pd = pd.to_datetime(ts)
+        hhmm = ts_pd.strftime("%H:%M")
+        snap = df_data[df_data["timestamp"] == ts]
+
+        # चालू ट्रेड मॉनिटरिंग
+        if active_trade:
+            curr_match = snap[snap["symbol"] == active_trade["symbol"]]
+            if not curr_match.empty:
+                bar = curr_match.iloc[0]
+                exit_p, exit_reason = None, ""
+
+                if bar["low"] <= active_trade["opt_sl"]:
+                    exit_p = active_trade["opt_sl"]
+                    exit_reason = "SL_HIT ❌"
+                elif bar["high"] >= active_trade["opt_target"]:
+                    exit_p = active_trade["opt_target"]
+                    exit_reason = "TARGET_HIT ✅"
+                elif hhmm >= "15:20":
+                    exit_p = float(bar["close"])
+                    exit_reason = "FORCE_EOD ⏱️"
+
+                if exit_p:
+                    captured_pts = round(exit_p - active_trade["entry_price"], 2)
+                    gross_pnl = round(captured_pts * LOT_SIZE, 2)
+                    charges_dict = get_upstox_charges(
+                        active_trade["symbol"],
+                        LOT_SIZE,
+                        active_trade["entry_price"],
+                        exit_p,
+                    )
+                    total_charges = charges_dict["total_charges"]
+                    net_pnl = round(gross_pnl - total_charges, 2)
+
+                    all_trades.append({
+                        "date": target_date,
+                        "side": active_trade["side"],
+                        "symbol": active_trade["symbol"],
+                        "entry_time": active_trade["entry_time"].strftime("%H:%M"),
+                        "exit_time": hhmm,
+                        "entry_px": active_trade["entry_price"],
+                        "exit_px": round(exit_p, 2),
+                        "pts_captured": captured_pts,
+                        "net_pnl": net_pnl,
+                        "exit_reason": exit_reason,
+                    })
+                    active_trade = None
+                    cooldown_until = ts_pd + pd.Timedelta(minutes=15)
+            continue
+
+        if cooldown_until and ts_pd < cooldown_until:
+            continue
+
+        # ट्रेडिंग सेशन सेशन्स
+        is_morning = ("09:30" <= hhmm <= "11:30") and (morning_trades < 2)
+        is_afternoon = ("12:30" <= hhmm <= "14:45") and (afternoon_trades < 2)
+
+        if (active_trade is None) and (is_morning or is_afternoon):
+            candidates = []
+            for _, row in snap.iterrows():
+                # लिक्विड प्रीमियम रेंज (₹७० ते ₹३२०)
+                if not (70.0 <= row["close"] <= 320.0):
+                    continue
+
+                c_range = row["high"] - row["low"]
+                c_body = abs(row["close"] - row["open"])
+                b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
+
+                has_vol = row["vol_ratio"] >= 1.25
+                is_range_exp = c_range >= (1.20 * row["atr14"])
+                is_solid = b_ratio >= 0.40
+
+                # ऑप्शन स्वतः हिरवा क्लोज आणि व्हॉल्यूम/रेंज ब्रेकआऊट
+                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
+                    candidates.append(row)
+
+            if candidates:
+                cand_df = pd.DataFrame(candidates)
+                # एटीएम जवळचा (०.५० डेल्टा जवळचा) ऑप्शन निवडणे
+                cand_df["atm_dist"] = (cand_df["delta"].abs() - 0.50).abs()
+                best = cand_df.sort_values(by="atm_dist").iloc[0]
+
+                entry_opt_price = float(best["close"])
+                calc_sl_pts = best["atr14"] * 1.2 * DELTA_TARGET
+                opt_sl_pts = max(MIN_OPT_SL_PTS, calc_sl_pts)
+                opt_target_pts = opt_sl_pts * 1.50
+
+                active_trade = {
+                    "symbol": best["symbol"],
+                    "side": f"BUY_{best['option_type']}",
+                    "entry_time": ts_pd,
+                    "entry_price": entry_opt_price,
+                    "opt_sl": max(0.05, round(entry_opt_price - opt_sl_pts, 2)),
+                    "opt_target": round(entry_opt_price + opt_target_pts, 2),
+                }
+
+                if is_morning:
+                    morning_trades += 1
+                else:
+                    afternoon_trades += 1
+
+    df_all = pd.DataFrame(all_trades)
+    print("\n" + "=" * 70, flush=True)
+    print(f"📊 *NIFTY ALGO निकाल ({target_date})*", flush=True)
+    print("=" * 70, flush=True)
+
+    if not df_all.empty:
+        total_trades = len(df_all)
+        wins = len(df_all[df_all["net_pnl"] > 0])
+        losses = len(df_all[df_all["net_pnl"] <= 0])
+        net_total = df_all["net_pnl"].sum()
+
+        print(f"🔹 एकूण ट्रेड्स: {total_trades} (जिंकले: {wins}, तोटा: {losses})", flush=True)
+        print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}", flush=True)
+        print("\n📋 ट्रेड तपशील:", flush=True)
+
+        for idx, tr in df_all.iterrows():
+            print(f"{idx + 1}. *{tr['side']}* | `{tr['symbol']}`", flush=True)
+            print(f"   ⏱️ {tr['entry_time']} ➡️ {tr['exit_time']} | पॉईंट्स: `{tr['pts_captured']}`", flush=True)
+            print(f"   💵 निव्वळ PnL: `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})", flush=True)
+        print("=" * 70, flush=True)
     else:
-        print("\nℹ️ आजच्या सत्रात VWAP पुलबॅक किंवा रीव्हर्सल ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात कडक नियमांनुसार (Volume / ATR Expansion) कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+
 
 if __name__ == "__main__":
-    test_today_vwap()
+    run_harvest_pnl_engine()
