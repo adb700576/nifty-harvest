@@ -10,14 +10,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
-DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
 
 
 def send_telegram(text: str):
     """टेलिग्राम बॉटवर थेट निकाल पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN किंवा TELEGRAM_CHAT_ID) सापडले नाहीत.", flush=True)
+        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) सापडले नाहीत.", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -102,6 +101,11 @@ def get_upstox_charges(
     return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
 
 
+def get_atm_strike(spot_price: float, step: int = 50) -> float:
+    """स्पॉट भावाला ५० च्या पटीत राउंड ऑफ करून अचूक ATM स्ट्राइक काढणे"""
+    return round(spot_price / step) * step
+
+
 def run_harvest_pnl_engine():
     if not os.path.exists(DB_PATH):
         print(f"[-] {DB_PATH} सापडला नाही. आधी Harvester चालवून डेटा गोळा करा.", flush=True)
@@ -124,28 +128,40 @@ def run_harvest_pnl_engine():
     print(f"🚀 [Auto PnL Engine] चाचणी सुरू: {target_date} (Paper Trade Mode)", flush=True)
     print("=" * 80, flush=True)
 
-    query = f"""
+    # १. NIFTY Spot 1-Min डेटा लोड करा
+    df_spot = pd.read_sql_query(
+        f"SELECT timestamp, close as spot_close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
+        conn
+    )
+    
+    # २. Options डेटा लोड करा
+    query_opt = f"""
         SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
         FROM nifty_options_1m
         WHERE timestamp LIKE '{target_date}%'
     """
-    df = pd.read_sql_query(query, conn)
+    df_opt = pd.read_sql_query(query_opt, conn)
     conn.close()
 
-    if df.empty:
-        print(f"[-] {target_date} साठी डेटा उपलब्ध नाही.", flush=True)
+    if df_opt.empty or df_spot.empty:
+        print(f"[-] {target_date} साठी स्पॉट किंवा ऑप्शन्स डेटा उपलब्ध नाही.", flush=True)
         return
 
-    # १. अचूक IST टाईमस्टॅम्प पार्सिंग व सॉर्टिंग
-    df["dt"] = pd.to_datetime(df["timestamp"])
-    if df["dt"].dt.tz is not None:
-        df["dt"] = df["dt"].dt.tz_convert("Asia/Kolkata")
-    df["hhmm"] = df["dt"].dt.strftime("%H:%M")
-    df = df.drop_duplicates(subset=["symbol", "dt"]).sort_values(by=["symbol", "dt"]).reset_index(drop=True)
+    # ३. IST टाईमस्टॅम्प मॅपिंग
+    df_spot["dt"] = pd.to_datetime(df_spot["timestamp"])
+    if df_spot["dt"].dt.tz is not None:
+        df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
+    df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+    spot_map = dict(zip(df_spot["dt"], df_spot["spot_close"]))
+
+    df_opt["dt"] = pd.to_datetime(df_opt["timestamp"])
+    if df_opt["dt"].dt.tz is not None:
+        df_opt["dt"] = df_opt["dt"].dt.tz_convert("Asia/Kolkata")
+    df_opt = df_opt.drop_duplicates(subset=["symbol", "dt"]).sort_values(by=["symbol", "dt"]).reset_index(drop=True)
 
     all_processed = []
-    for sym in df["symbol"].unique():
-        sub = df[df["symbol"] == sym].copy().sort_values("dt").reset_index(drop=True)
+    for sym in df_opt["symbol"].unique():
+        sub = df_opt[df_opt["symbol"] == sym].copy().sort_values("dt").reset_index(drop=True)
         if len(sub) < 25:
             continue
         sub["vol_sma20"] = sub["volume"].rolling(20).mean().replace(0, 1.0)
@@ -211,6 +227,7 @@ def run_harvest_pnl_engine():
                         "date": target_date,
                         "side": active_trade["side"],
                         "symbol": active_trade["symbol"],
+                        "spot_px": active_trade["spot_entry"],
                         "entry_time": active_trade["entry_time"].strftime("%H:%M"),
                         "exit_time": hhmm,
                         "entry_px": active_trade["entry_price"],
@@ -232,9 +249,17 @@ def run_harvest_pnl_engine():
         is_afternoon = ("12:30" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
         if (active_trade is None) and (is_morning or is_afternoon):
-            candidates = []
-            for _, row in snap.iterrows():
-                # लिक्विड प्रीमियम रेंज (₹७० ते ₹३२०)
+            # चालू कँडलचा स्पॉट भाव मिळवणे
+            cur_spot = spot_map.get(ts_pd)
+            if cur_spot is None:
+                continue
+
+            atm_strike = get_atm_strike(cur_spot, step=50)
+
+            # फक्त अचूक ATM स्ट्राइकची कँडल तपासणे
+            atm_candidates = snap[snap["strike"] == atm_strike]
+
+            for _, row in atm_candidates.iterrows():
                 if not (70.0 <= row["close"] <= 320.0):
                     continue
 
@@ -242,36 +267,30 @@ def run_harvest_pnl_engine():
                 c_body = abs(row["close"] - row["open"])
                 b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
 
-                has_vol = row["vol_ratio"] >= 1.25
-                is_range_exp = c_range >= (1.20 * row["atr14"])
+                has_vol = row["vol_ratio"] >= 1.20
+                is_range_exp = c_range >= (1.15 * row["atr14"])
                 is_solid = b_ratio >= 0.40
 
                 if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
-                    candidates.append(row)
+                    entry_opt_price = float(row["close"])
+                    opt_sl_pts = MIN_OPT_SL_PTS
+                    opt_target_pts = opt_sl_pts * 1.50
 
-            if candidates:
-                cand_df = pd.DataFrame(candidates)
-                cand_df["atm_dist"] = (cand_df["delta"].abs() - 0.50).abs()
-                best = cand_df.sort_values(by="atm_dist").iloc[0]
+                    active_trade = {
+                        "symbol": row["symbol"],
+                        "side": f"BUY_{row['option_type']}",
+                        "spot_entry": round(cur_spot, 1),
+                        "entry_time": ts_pd,
+                        "entry_price": entry_opt_price,
+                        "opt_sl": max(0.05, round(entry_opt_price - opt_sl_pts, 2)),
+                        "opt_target": round(entry_opt_price + opt_target_pts, 2),
+                    }
 
-                entry_opt_price = float(best["close"])
-                calc_sl_pts = best["atr14"] * 1.2 * DELTA_TARGET
-                opt_sl_pts = max(MIN_OPT_SL_PTS, calc_sl_pts)
-                opt_target_pts = opt_sl_pts * 1.50
-
-                active_trade = {
-                    "symbol": best["symbol"],
-                    "side": f"BUY_{best['option_type']}",
-                    "entry_time": ts_pd,
-                    "entry_price": entry_opt_price,
-                    "opt_sl": max(0.05, round(entry_opt_price - opt_sl_pts, 2)),
-                    "opt_target": round(entry_opt_price + opt_target_pts, 2),
-                }
-
-                if is_morning:
-                    morning_trades += 1
-                else:
-                    afternoon_trades += 1
+                    if is_morning:
+                        morning_trades += 1
+                    else:
+                        afternoon_trades += 1
+                    break
 
     df_all = pd.DataFrame(all_trades)
     print("\n" + "=" * 80, flush=True)
@@ -297,21 +316,21 @@ def run_harvest_pnl_engine():
 
         for idx, tr in df_all.iterrows():
             print(f"{idx + 1}. {tr['side']} | {tr['symbol']}", flush=True)
-            print(f"   ⏱️ वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
-            print(f"   🎯 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
-            print(f"   💵 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:.2f} ({tr['exit_reason']})\n", flush=True)
+            print(f"   🎯 NIFTY Spot: {tr['spot_px']} | वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
+            print(f"   💵 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
+            print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:.2f} ({tr['exit_reason']})\n", flush=True)
 
             tg_lines.append(
                 f"{idx + 1}. *{tr['side']}* | `{tr['symbol']}`\n"
-                f"   ⏱️ {tr['entry_time']} ➡️ {tr['exit_time']} | पॉईंट्स: `{tr['pts_captured']:+.2f}`\n"
+                f"   📍 *Spot:* `{tr['spot_px']}` | ⏱️ `{tr['entry_time']} ➡️ {tr['exit_time']}`\n"
                 f"   🎯 Buy: `{tr['entry_px']:.2f}` | 🛑 SL: `{tr['sl_px']:.2f}` | 🏁 TRG: `{tr['trg_px']:.2f}`\n"
-                f"   💵 PnL: `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})\n"
+                f"   💵 पॉईंट्स: `{tr['pts_captured']:+.2f}` | *PnL:* `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})\n"
             )
 
         print("=" * 80, flush=True)
         send_telegram("\n".join(tg_lines))
     else:
-        print("ℹ️ आजच्या सत्रात कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात शुद्ध ATM नियमांनुसार कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
 
 
 if __name__ == "__main__":
