@@ -14,9 +14,9 @@ MIN_OPT_SL_PTS = 10.0
 
 
 def send_telegram(text: str):
-    """Send structured execution summary to Telegram using HTML parse mode."""
+    """टेलिग्राम बॉटवर सुरक्षित HTML फॉरमॅटमध्ये निकाल पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) not configured.", flush=True)
+        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) उपलब्ध नाहीत.", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -41,7 +41,6 @@ def get_upstox_charges(
     sell_price: float,
     token: str = None,
 ) -> dict:
-    """Fetch exact statutory brokerage and exchange charges via Upstox API or fallback model."""
     url = f"{BASE_URL}/v2/charges/brokerage"
     headers = {
         "Accept": "application/json",
@@ -103,12 +102,10 @@ def get_upstox_charges(
 
 
 def get_atm_strike(spot_price: float, step: int = 50) -> float:
-    """Calculate the exact ATM strike rounded to nearest step (50)."""
     return round(spot_price / step) * step
 
 
 def run_harvest_pnl_engine():
-    """Institutional Orderflow & Adaptive Trailing Engine."""
     if not os.path.exists(DB_PATH):
         print(f"[-] Database file {DB_PATH} not found.", flush=True)
         return
@@ -127,16 +124,15 @@ def run_harvest_pnl_engine():
     target_date = dates_list[0]
 
     print("=" * 80, flush=True)
-    print(f"🚀 [Institutional PnL Engine] Execution Target: {target_date} (Paper Trade)", flush=True)
+    print(f"🚀 [Institutional Structure Engine] Target Date: {target_date} (Paper Trade)", flush=True)
     print("=" * 80, flush=True)
 
-    # 1. Load 1-minute Index Spot Data
+    # १. स्पॉट डेटा आणि ट्रेंड इंडिकेटर (EMA 15)
     df_spot = pd.read_sql_query(
-        f"SELECT timestamp, open as spot_open, high as spot_high, low as spot_low, close as spot_close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
+        f"SELECT timestamp, close as spot_close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
         conn,
     )
 
-    # 2. Load 1-minute Option Chains Data
     query_opt = f"""
         SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
         FROM nifty_options_1m
@@ -146,14 +142,16 @@ def run_harvest_pnl_engine():
     conn.close()
 
     if df_opt.empty or df_spot.empty:
-        print(f"[-] Incomplete spot or option data for {target_date}.", flush=True)
+        print(f"[-] Incomplete data for {target_date}.", flush=True)
         return
 
-    # 3. Standardize Timestamp to IST
     df_spot["dt"] = pd.to_datetime(df_spot["timestamp"])
     if df_spot["dt"].dt.tz is not None:
         df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
     df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
+    
+    # स्पॉट ट्रेंड: 15-कँडल मूव्हिंग सरासरी (दिशानिर्देश)
+    df_spot["spot_trend"] = df_spot["spot_close"].rolling(15).mean()
     spot_records = df_spot.set_index("dt").to_dict("index")
 
     df_opt["dt"] = pd.to_datetime(df_opt["timestamp"])
@@ -161,7 +159,6 @@ def run_harvest_pnl_engine():
         df_opt["dt"] = df_opt["dt"].dt.tz_convert("Asia/Kolkata")
     df_opt = df_opt.drop_duplicates(subset=["symbol", "dt"]).sort_values(by=["symbol", "dt"]).reset_index(drop=True)
 
-    # 4. Compute Technical Benchmarks (ATR14 and 20-period Volume SMA)
     all_processed = []
     for sym in df_opt["symbol"].unique():
         sub = df_opt[df_opt["symbol"] == sym].copy().sort_values("dt").reset_index(drop=True)
@@ -180,7 +177,7 @@ def run_harvest_pnl_engine():
         all_processed.append(sub)
 
     if not all_processed:
-        print("[-] Insufficient depth for historical ATR calculation.", flush=True)
+        print("[-] Insufficient candles for ATR calculation.", flush=True)
         return
 
     df_data = pd.concat(all_processed, axis=0).sort_values(by=["dt", "symbol"]).reset_index(drop=True)
@@ -192,51 +189,36 @@ def run_harvest_pnl_engine():
     cooldown_until = None
     all_timestamps = df_data["dt"].unique()
 
-    # 5. Iterative Candle Processing Loop
     for ts in all_timestamps:
         ts_pd = pd.to_datetime(ts)
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # Active Trade Management: De-Risking, Dynamic Trailing, and Time Exits
+        # चालू ट्रेड मॉनिटरिंग
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
                 bar = curr_match.iloc[0]
                 exit_p, exit_reason = None, ""
                 
-                # Elapsed minutes in position
-                minutes_in_trade = (ts_pd - active_trade["entry_time"]).total_seconds() / 60.0
-                unrealized_gain = bar["high"] - active_trade["entry_price"]
+                max_gain = bar["high"] - active_trade["entry_price"]
 
-                # Rule A: Move Stop Loss to Break-Even when profit exceeds +10 points
-                if unrealized_gain >= 10.0:
+                # संस्थात्मक डी-रिस्किंग: भाव +12 पॉईंट्स गेल्यानंतरच SL कॉस्टवर आणणे
+                if max_gain >= 12.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
-                # Rule B: Trailing Stop Loss on Extended Runaways (+15 pts gain)
-                if unrealized_gain >= 15.0:
-                    trailing_floor = bar["close"] - 8.0
-                    active_trade["opt_sl"] = max(active_trade["opt_sl"], trailing_floor)
+                # ट्रेलिंग: भाव +18 पॉईंट्सच्या पुढे गेल्यास SL 10 पॉईंट्स मागे ठेवणे
+                if max_gain >= 18.0:
+                    trailing_level = bar["close"] - 10.0
+                    active_trade["opt_sl"] = max(active_trade["opt_sl"], trailing_level)
 
-                # Check Stop Loss / Trailing Stop Trigger
+                # एक्झिट तपासणी
                 if bar["low"] <= active_trade["opt_sl"]:
                     exit_p = active_trade["opt_sl"]
-                    if active_trade["opt_sl"] >= active_trade["entry_price"]:
-                        exit_reason = "TRAILED_EXIT ✅"
-                    else:
-                        exit_reason = "SL_HIT ❌"
-
-                # Check Pre-Determined Expansion Target Trigger
+                    exit_reason = "TRAILED_EXIT ✅" if active_trade["opt_sl"] >= active_trade["entry_price"] else "SL_HIT ❌"
                 elif bar["high"] >= active_trade["opt_target"]:
                     exit_p = active_trade["opt_target"]
                     exit_reason = "TARGET_HIT ✅"
-
-                # Rule C: Time-Decay Rejection (Stagnant movement for >6 mins inside chop)
-                elif minutes_in_trade >= 6.0 and abs(bar["close"] - active_trade["entry_price"]) <= 2.5:
-                    exit_p = float(bar["close"])
-                    exit_reason = "CHOP_TIME_EXIT ⏱️"
-
-                # End of Day Square-Off
                 elif hhmm >= "15:20":
                     exit_p = float(bar["close"])
                     exit_reason = "FORCE_EOD ⏱️"
@@ -276,20 +258,24 @@ def run_harvest_pnl_engine():
             continue
 
         is_morning = ("09:30" <= hhmm <= "11:30") and (morning_trades < 2)
-        is_afternoon = ("12:30" <= hhmm <= "14:45") and (afternoon_trades < 2)
+        is_afternoon = ("12:15" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
-        # Scanning for Momentum and Structural Retest Setups
+        # नवीन एन्ट्री स्कॅनिंग
         if (active_trade is None) and (is_morning or is_afternoon):
             spot_info = spot_records.get(ts_pd)
-            if spot_info is None:
+            if spot_info is None or pd.isna(spot_info.get("spot_trend")):
                 continue
 
             cur_spot = spot_info["spot_close"]
+            spot_trend = spot_info["spot_trend"]
+
+            # संस्थात्मक नियम: स्पॉट जर ट्रेंडच्या वर असेल तर केवळ CE, खाली असेल तर केवळ PE
+            allowed_side = "CE" if cur_spot > spot_trend else "PE"
+
             atm_strike = get_atm_strike(cur_spot, step=50)
-            atm_candidates = snap[snap["strike"] == atm_strike]
+            atm_candidates = snap[(snap["strike"] == atm_strike) & (snap["option_type"] == allowed_side)]
 
             for _, row in atm_candidates.iterrows():
-                # Avoid illiquid/extreme pricing contracts
                 if not (70.0 <= row["close"] <= 320.0):
                     continue
 
@@ -301,11 +287,10 @@ def run_harvest_pnl_engine():
                 is_range_exp = c_range >= (1.15 * row["atr14"])
                 is_solid = b_ratio >= 0.40
 
-                # Validate solid expansion candle closing green
                 if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
                     entry_opt_price = float(row["close"])
                     opt_sl_pts = MIN_OPT_SL_PTS
-                    opt_target_pts = opt_sl_pts * 2.0  # Target 1:2 expansion with active trailing
+                    opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR
 
                     active_trade = {
                         "symbol": row["symbol"],
@@ -361,7 +346,7 @@ def run_harvest_pnl_engine():
         print("=" * 80, flush=True)
         send_telegram("\n".join(tg_lines))
     else:
-        print("ℹ️ आजच्या सत्रात कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात कोणताही वैध संस्थात्मक सेटअप ट्रिगर झाला नाही.", flush=True)
 
 
 if __name__ == "__main__":
