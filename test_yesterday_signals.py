@@ -6,10 +6,33 @@ import requests
 DB_PATH = "nifty_vault.db"
 BASE_URL = "https://api.upstox.com"
 ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN") or ""
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
 DELTA_TARGET = 0.52
 MIN_OPT_SL_PTS = 10.0
+
+
+def send_telegram(text: str):
+    """टेलिग्राम बॉटवर थेट निकाल पाठवणे"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN किंवा TELEGRAM_CHAT_ID) सापडले नाहीत.", flush=True)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    try:
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code == 200:
+            print("✅ टेलिग्रामवर निकाल यशस्वीरीत्या पाठवला!", flush=True)
+        else:
+            print(f"[-] Telegram API त्रुटी: {res.text}", flush=True)
+    except Exception as e:
+        print(f"[-] Telegram Network त्रुटी: {e}", flush=True)
 
 
 def get_upstox_charges(
@@ -76,7 +99,6 @@ def get_upstox_charges(
         except Exception:
             pass
 
-    # Upstox API कॉल न झाल्यास अचूक डिफॉल्ट चार्जेस (₹२० Buy + ₹२० Sell + STT/GST = ₹५२.००)
     return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
 
 
@@ -86,27 +108,26 @@ def run_harvest_pnl_engine():
         return
 
     conn = sqlite3.connect(DB_PATH)
-    
-    # व्हॉल्टमधील तारखा शोधणे
-    avail_dates = pd.read_sql_query("SELECT DISTINCT substr(timestamp, 1, 10) as t_date FROM nifty_options_1m ORDER BY t_date DESC", conn)
+    avail_dates = pd.read_sql_query(
+        "SELECT DISTINCT substr(timestamp, 1, 10) as t_date FROM nifty_options_1m ORDER BY t_date DESC",
+        conn,
+    )
     if avail_dates.empty:
         print("[-] व्हॉल्टमध्ये कँडल्स सापडल्या नाहीत.", flush=True)
         conn.close()
         return
 
-    dates_list = avail_dates['t_date'].tolist()
-    # आजची किंवा सर्वात ताजी तारीख निवडणे
+    dates_list = avail_dates["t_date"].tolist()
     target_date = dates_list[0]
 
-    print("=" * 70, flush=True)
-    print(f"🚀 [Auto PnL Engine] चाचणी सुरू तारीख: {target_date} (Paper Trade Mode)", flush=True)
-    print("=" * 70, flush=True)
+    print("=" * 80, flush=True)
+    print(f"🚀 [Auto PnL Engine] चाचणी सुरू: {target_date} (Paper Trade Mode)", flush=True)
+    print("=" * 80, flush=True)
 
     query = f"""
         SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
         FROM nifty_options_1m
         WHERE timestamp LIKE '{target_date}%'
-        ORDER BY timestamp ASC, symbol ASC
     """
     df = pd.read_sql_query(query, conn)
     conn.close()
@@ -115,12 +136,16 @@ def run_harvest_pnl_engine():
         print(f"[-] {target_date} साठी डेटा उपलब्ध नाही.", flush=True)
         return
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.drop_duplicates(subset=["symbol", "timestamp"]).reset_index(drop=True)
+    # १. अचूक IST टाईमस्टॅम्प पार्सिंग व सॉर्टिंग
+    df["dt"] = pd.to_datetime(df["timestamp"])
+    if df["dt"].dt.tz is not None:
+        df["dt"] = df["dt"].dt.tz_convert("Asia/Kolkata")
+    df["hhmm"] = df["dt"].dt.strftime("%H:%M")
+    df = df.drop_duplicates(subset=["symbol", "dt"]).sort_values(by=["symbol", "dt"]).reset_index(drop=True)
 
     all_processed = []
     for sym in df["symbol"].unique():
-        sub = df[df["symbol"] == sym].copy().sort_values("timestamp")
+        sub = df[df["symbol"] == sym].copy().sort_values("dt").reset_index(drop=True)
         if len(sub) < 25:
             continue
         sub["vol_sma20"] = sub["volume"].rolling(20).mean().replace(0, 1.0)
@@ -139,19 +164,19 @@ def run_harvest_pnl_engine():
         print("[-] तांत्रिक विश्लेषणासाठी पुरेशा कँडल्स नाहीत.", flush=True)
         return
 
-    df_data = pd.concat(all_processed, axis=0).sort_values(by=["timestamp", "symbol"])
+    df_data = pd.concat(all_processed, axis=0).sort_values(by=["dt", "symbol"]).reset_index(drop=True)
 
     all_trades = []
     morning_trades = 0
     afternoon_trades = 0
     active_trade = None
     cooldown_until = None
-    timestamps = df_data["timestamp"].unique()
+    all_timestamps = df_data["dt"].unique()
 
-    for ts in timestamps:
+    for ts in all_timestamps:
         ts_pd = pd.to_datetime(ts)
         hhmm = ts_pd.strftime("%H:%M")
-        snap = df_data[df_data["timestamp"] == ts]
+        snap = df_data[df_data["dt"] == ts_pd]
 
         # चालू ट्रेड मॉनिटरिंग
         if active_trade:
@@ -189,6 +214,8 @@ def run_harvest_pnl_engine():
                         "entry_time": active_trade["entry_time"].strftime("%H:%M"),
                         "exit_time": hhmm,
                         "entry_px": active_trade["entry_price"],
+                        "sl_px": active_trade["opt_sl"],
+                        "trg_px": active_trade["opt_target"],
                         "exit_px": round(exit_p, 2),
                         "pts_captured": captured_pts,
                         "net_pnl": net_pnl,
@@ -201,7 +228,6 @@ def run_harvest_pnl_engine():
         if cooldown_until and ts_pd < cooldown_until:
             continue
 
-        # ट्रेडिंग सेशन सेशन्स
         is_morning = ("09:30" <= hhmm <= "11:30") and (morning_trades < 2)
         is_afternoon = ("12:30" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
@@ -220,13 +246,11 @@ def run_harvest_pnl_engine():
                 is_range_exp = c_range >= (1.20 * row["atr14"])
                 is_solid = b_ratio >= 0.40
 
-                # ऑप्शन स्वतः हिरवा क्लोज आणि व्हॉल्यूम/रेंज ब्रेकआऊट
                 if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
                     candidates.append(row)
 
             if candidates:
                 cand_df = pd.DataFrame(candidates)
-                # एटीएम जवळचा (०.५० डेल्टा जवळचा) ऑप्शन निवडणे
                 cand_df["atm_dist"] = (cand_df["delta"].abs() - 0.50).abs()
                 best = cand_df.sort_values(by="atm_dist").iloc[0]
 
@@ -250,9 +274,9 @@ def run_harvest_pnl_engine():
                     afternoon_trades += 1
 
     df_all = pd.DataFrame(all_trades)
-    print("\n" + "=" * 70, flush=True)
+    print("\n" + "=" * 80, flush=True)
     print(f"📊 *NIFTY ALGO निकाल ({target_date})*", flush=True)
-    print("=" * 70, flush=True)
+    print("=" * 80, flush=True)
 
     if not df_all.empty:
         total_trades = len(df_all)
@@ -261,16 +285,33 @@ def run_harvest_pnl_engine():
         net_total = df_all["net_pnl"].sum()
 
         print(f"🔹 एकूण ट्रेड्स: {total_trades} (जिंकले: {wins}, तोटा: {losses})", flush=True)
-        print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}", flush=True)
-        print("\n📋 ट्रेड तपशील:", flush=True)
+        print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}\n", flush=True)
+        print("📋 चार्ट लेव्हल्स व अचूक किमती:", flush=True)
+
+        tg_lines = [
+            f"📊 *NIFTY ALGO निकाल ({target_date})*\n",
+            f"🔹 *एकूण ट्रेड्स:* `{total_trades}` (जिंकले: `{wins}`, तोटा: `{losses}`)",
+            f"💰 *निव्वळ नफा (Net PnL):* `₹ {net_total:+,.2f}`\n",
+            "📋 *ट्रेड तपशील:*",
+        ]
 
         for idx, tr in df_all.iterrows():
-            print(f"{idx + 1}. *{tr['side']}* | `{tr['symbol']}`", flush=True)
-            print(f"   ⏱️ {tr['entry_time']} ➡️ {tr['exit_time']} | पॉईंट्स: `{tr['pts_captured']}`", flush=True)
-            print(f"   💵 निव्वळ PnL: `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})", flush=True)
-        print("=" * 70, flush=True)
+            print(f"{idx + 1}. {tr['side']} | {tr['symbol']}", flush=True)
+            print(f"   ⏱️ वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
+            print(f"   🎯 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
+            print(f"   💵 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:.2f} ({tr['exit_reason']})\n", flush=True)
+
+            tg_lines.append(
+                f"{idx + 1}. *{tr['side']}* | `{tr['symbol']}`\n"
+                f"   ⏱️ {tr['entry_time']} ➡️ {tr['exit_time']} | पॉईंट्स: `{tr['pts_captured']:+.2f}`\n"
+                f"   🎯 Buy: `{tr['entry_px']:.2f}` | 🛑 SL: `{tr['sl_px']:.2f}` | 🏁 TRG: `{tr['trg_px']:.2f}`\n"
+                f"   💵 PnL: `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})\n"
+            )
+
+        print("=" * 80, flush=True)
+        send_telegram("\n".join(tg_lines))
     else:
-        print("ℹ️ आजच्या सत्रात कडक नियमांनुसार (Volume / ATR Expansion) कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
 
 
 if __name__ == "__main__":
