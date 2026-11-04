@@ -124,10 +124,10 @@ def run_harvest_pnl_engine():
     target_date = dates_list[0]
 
     print("=" * 80, flush=True)
-    print(f"🚀 [Institutional Structure Engine] Target Date: {target_date} (Paper Trade)", flush=True)
+    print(f"🚀 [Institutional Pullback Engine] Target Date: {target_date} (Paper Trade)", flush=True)
     print("=" * 80, flush=True)
 
-    # १. स्पॉट डेटा आणि ट्रेंड इंडिकेटर (EMA 15)
+    # १. स्पॉट १-मिनिट डेटा आणि २०-EMA / मूव्हिंग डिस्टन्स
     df_spot = pd.read_sql_query(
         f"SELECT timestamp, close as spot_close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
         conn,
@@ -150,8 +150,9 @@ def run_harvest_pnl_engine():
         df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
     df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     
-    # स्पॉट ट्रेंड: 15-कँडल मूव्हिंग सरासरी (दिशानिर्देश)
-    df_spot["spot_trend"] = df_spot["spot_close"].rolling(15).mean()
+    # स्पॉट ट्रेंड आणि ओव्हर-एक्सटेंशन (Exhaustion Filter)
+    df_spot["ema20"] = df_spot["spot_close"].ewm(span=20, adjust=False).mean()
+    df_spot["dist_ema"] = df_spot["spot_close"] - df_spot["ema20"]
     spot_records = df_spot.set_index("dt").to_dict("index")
 
     df_opt["dt"] = pd.to_datetime(df_opt["timestamp"])
@@ -174,6 +175,9 @@ def run_harvest_pnl_engine():
             (sub["low"] - prev_c).abs(),
         ], axis=1).max(axis=1)
         sub["atr14"] = tr.rolling(14).mean().fillna(5.0)
+        
+        # ऑप्शनवरील पुलबॅक ट्रॅकिंग: मागील ३ कँडल्सचा हाय
+        sub["prev_high3"] = sub["high"].shift(1).rolling(3).max()
         all_processed.append(sub)
 
     if not all_processed:
@@ -194,7 +198,7 @@ def run_harvest_pnl_engine():
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # चालू ट्रेड मॉनिटरिंग
+        # चालू ट्रेड व्यवस्थापन (Adaptive Ride & Trailing)
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
@@ -203,12 +207,12 @@ def run_harvest_pnl_engine():
                 
                 max_gain = bar["high"] - active_trade["entry_price"]
 
-                # संस्थात्मक डी-रिस्किंग: भाव +12 पॉईंट्स गेल्यानंतरच SL कॉस्टवर आणणे
-                if max_gain >= 12.0:
+                # संस्थात्मक डी-रिस्किंग: भाव +15 पॉईंट्स वाढल्यानंतरच SL कॉस्टवर शिफ्ट
+                if max_gain >= 15.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
-                # ट्रेलिंग: भाव +18 पॉईंट्सच्या पुढे गेल्यास SL 10 पॉईंट्स मागे ठेवणे
-                if max_gain >= 18.0:
+                # ट्रेलिंग राइड: भाव +20 च्या पुढे गेल्यास मागील कँडलच्या क्लोजपेक्षा 10 पॉईंट्स मागे ठेवणे
+                if max_gain >= 20.0:
                     trailing_level = bar["close"] - 10.0
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], trailing_level)
 
@@ -263,14 +267,20 @@ def run_harvest_pnl_engine():
         # नवीन एन्ट्री स्कॅनिंग
         if (active_trade is None) and (is_morning or is_afternoon):
             spot_info = spot_records.get(ts_pd)
-            if spot_info is None or pd.isna(spot_info.get("spot_trend")):
+            if spot_info is None or pd.isna(spot_info.get("ema20")):
                 continue
 
             cur_spot = spot_info["spot_close"]
-            spot_trend = spot_info["spot_trend"]
+            ema20 = spot_info["ema20"]
+            dist = spot_info["dist_ema"]
 
-            # संस्थात्मक नियम: स्पॉट जर ट्रेंडच्या वर असेल तर केवळ CE, खाली असेल तर केवळ PE
-            allowed_side = "CE" if cur_spot > spot_trend else "PE"
+            # १. एक्झॉशन / ट्रॅप फिल्टर (Exhaustion Filter)
+            # जर स्पॉट EMA पासून खूप जास्त ताणला गेला असेल (उदा. > 65 पॉईंट्स दूर), तर ट्रेड न घेणे
+            if abs(dist) > 65.0:
+                continue
+
+            # २. दिशा निश्चिती: EMA च्या वर असेल तर CE, खाली असेल तर PE
+            allowed_side = "CE" if cur_spot > ema20 else "PE"
 
             atm_strike = get_atm_strike(cur_spot, step=50)
             atm_candidates = snap[(snap["strike"] == atm_strike) & (snap["option_type"] == allowed_side)]
@@ -283,14 +293,17 @@ def run_harvest_pnl_engine():
                 c_body = abs(row["close"] - row["open"])
                 b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
 
-                has_vol = row["vol_ratio"] >= 1.20
-                is_range_exp = c_range >= (1.15 * row["atr14"])
+                has_vol = row["vol_ratio"] >= 1.15
+                is_range_exp = c_range >= (1.10 * row["atr14"])
                 is_solid = b_ratio >= 0.40
 
-                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
+                # ३. पुलबॅक कन्फर्मेशन: आधीच्या हायच्या जवळ क्लोज होऊन कँडल ग्रीन असणे
+                is_pullback_break = row["close"] > row["open"] and (row["close"] >= row.get("prev_high3", row["open"]))
+
+                if (has_vol or is_range_exp) and is_solid and is_pullback_break:
                     entry_opt_price = float(row["close"])
                     opt_sl_pts = MIN_OPT_SL_PTS
-                    opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR
+                    opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR (20 पॉईंट्स)
 
                     active_trade = {
                         "symbol": row["symbol"],
