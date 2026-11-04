@@ -14,15 +14,15 @@ MIN_OPT_SL_PTS = 10.0
 
 
 def send_telegram(text: str):
-    """टेलिग्राम बॉटवर थेट निकाल पाठवणे"""
+    """टेलिग्राम बॉटवर सुरक्षित HTML फॉरमॅटमध्ये निकाल पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) सापडले नाहीत.", flush=True)
+        print("[!] Telegram Secrets (TELEGRAM_BOT_TOKEN किंवा TELEGRAM_CHAT_ID) सापडले नाहीत.", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "parse_mode": "Markdown"
+        "parse_mode": "HTML"
     }
     try:
         res = requests.post(url, json=payload, timeout=10)
@@ -131,9 +131,9 @@ def run_harvest_pnl_engine():
     # १. NIFTY Spot 1-Min डेटा लोड करा
     df_spot = pd.read_sql_query(
         f"SELECT timestamp, close as spot_close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
-        conn
+        conn,
     )
-    
+
     # २. Options डेटा लोड करा
     query_opt = f"""
         SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
@@ -249,14 +249,11 @@ def run_harvest_pnl_engine():
         is_afternoon = ("12:30" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
         if (active_trade is None) and (is_morning or is_afternoon):
-            # चालू कँडलचा स्पॉट भाव मिळवणे
             cur_spot = spot_map.get(ts_pd)
             if cur_spot is None:
                 continue
 
             atm_strike = get_atm_strike(cur_spot, step=50)
-
-            # फक्त अचूक ATM स्ट्राइकची कँडल तपासणे
             atm_candidates = snap[snap["strike"] == atm_strike]
 
             for _, row in atm_candidates.iterrows():
@@ -308,10 +305,10 @@ def run_harvest_pnl_engine():
         print("📋 चार्ट लेव्हल्स व अचूक किमती:", flush=True)
 
         tg_lines = [
-            f"📊 *NIFTY ALGO निकाल ({target_date})*\n",
-            f"🔹 *एकूण ट्रेड्स:* `{total_trades}` (जिंकले: `{wins}`, तोटा: `{losses}`)",
-            f"💰 *निव्वळ नफा (Net PnL):* `₹ {net_total:+,.2f}`\n",
-            "📋 *ट्रेड तपशील:*",
+            f"📊 <b>NIFTY ALGO निकाल ({target_date})</b>\n",
+            f"🔹 एकूण ट्रेड्स: <b>{total_trades}</b> (जिंकले: {wins}, तोटा: {losses})",
+            f"💰 निव्वळ नफा (Net PnL): <b>₹ {net_total:+,.2f}</b>\n",
+            "📋 <b>ट्रेड तपशील:</b>\n",
         ]
 
         for idx, tr in df_all.iterrows():
@@ -321,10 +318,10 @@ def run_harvest_pnl_engine():
             print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:.2f} ({tr['exit_reason']})\n", flush=True)
 
             tg_lines.append(
-                f"{idx + 1}. *{tr['side']}* | `{tr['symbol']}`\n"
-                f"   📍 *Spot:* `{tr['spot_px']}` | ⏱️ `{tr['entry_time']} ➡️ {tr['exit_time']}`\n"
-                f"   🎯 Buy: `{tr['entry_px']:.2f}` | 🛑 SL: `{tr['sl_px']:.2f}` | 🏁 TRG: `{tr['trg_px']:.2f}`\n"
-                f"   💵 पॉईंट्स: `{tr['pts_captured']:+.2f}` | *PnL:* `₹ {tr['net_pnl']:.2f}` ({tr['exit_reason']})\n"
+                f"{idx + 1}. <b>{tr['side']}</b> | <code>{tr['symbol']}</code>\n"
+                f"   📍 Spot: <code>{tr['spot_px']}</code> | ⏱️ <code>{tr['entry_time']} ➡️ {tr['exit_time']}</code>\n"
+                f"   🎯 Buy: <code>₹{tr['entry_px']:.2f}</code> | 🛑 SL: <code>₹{tr['sl_px']:.2f}</code> | 🏁 TRG: <code>₹{tr['trg_px']:.2f}</code>\n"
+                f"   📊 पॉईंट्स: <b>{tr['pts_captured']:+.2f}</b> | PnL: <b>₹ {tr['net_pnl']:.2f}</b> ({tr['exit_reason']})\n"
             )
 
         print("=" * 80, flush=True)
