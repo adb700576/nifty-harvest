@@ -39,8 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u harvester.py
 
-      - name: Inspect Vault Data
-      run: python -u test_yesterday_signals.py
+    - name: Inspect Vault Data
         run: |
           python -u -c "
           import sqlite3, pandas as pd
@@ -53,6 +52,9 @@ jobs:
           print(df_samp.to_string(index=False))
           conn.close()
           "
+
+      - name: Run Signal Test
+        run: python -u test_yesterday_signals.py
 
       - name: Upload Harvested DB Artifact
         if: always()
