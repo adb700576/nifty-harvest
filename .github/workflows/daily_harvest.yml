@@ -40,6 +40,7 @@ jobs:
         run: python -u harvester.py
 
       - name: Inspect Vault Data
+      run: python -u test_yesterday_signals.py
         run: |
           python -u -c "
           import sqlite3, pandas as pd
