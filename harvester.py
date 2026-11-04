@@ -8,16 +8,13 @@ import pandas as pd
 DB_PATH = "nifty_vault.db"
 BASE_URL = "https://api.upstox.com"
 
-# टोकन फाईलमधून किंवा एन्व्हायर्नमेंटमधून वाचणे
+# टोकन तपासणी
 ACCESS_TOKEN = ""
 if os.path.exists("ACCESS_TOKEN.txt"):
     with open("ACCESS_TOKEN.txt", "r") as f:
         ACCESS_TOKEN = f.read().strip()
 if not ACCESS_TOKEN:
     ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
 def init_db():
@@ -56,31 +53,49 @@ def init_db():
 
 def get_nifty_spot_history(target_date: str):
     print(f"🌾 [Vault Harvester] {target_date} चा डेटा गोळा करण्याचे काम सुरू होत आहे...", flush=True)
+    
+    # Upstox V2 Historical API
+    # NSE_INDEX|Nifty 50 key url-encode: NSE_INDEX%7CNifty%2050
     instrument_key = "NSE_INDEX|Nifty 50"
-    url = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{target_date}/{target_date}"
+    
+    # Upstox API साठी to_date ही किमान १ दिवस पुढे किंवा चालू तारीख असावी लागते
+    dt_obj = datetime.datetime.strptime(target_date, "%Y-%m-%d")
+    next_day = (dt_obj + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    url = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{next_day}/{target_date}"
     headers = {"Accept": "application/json"}
-    
+    if ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
+
     res = requests.get(url, headers=headers, timeout=15)
-    if res.status_code != 200:
-        print(f"[-] NIFTY 50 स्पॉट डेटा मिळाला नाही: {res.text}", flush=True)
-        return None
+    candles = []
+    if res.status_code == 200:
+        candles = res.json().get("data", {}).get("candles", [])
     
-    candles = res.json().get("data", {}).get("candles", [])
+    # बॅकअप ट्राय जर नेक्स्ट डे ने डेटा नाही आला तर थेट target_date ट्राय करणे
     if not candles:
-        print("[-] कॅन्डल्स रिकाम्या आहेत (मार्केट सुट्टी असू शकते).", flush=True)
+        url_alt = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{target_date}"
+        res_alt = requests.get(url_alt, headers=headers, timeout=15)
+        if res_alt.status_code == 200:
+            candles = res_alt.json().get("data", {}).get("candles", [])
+
+    # फक्त target_date च्याच कॅन्डल्स ठेवणे
+    candles = [c for c in candles if str(c[0]).startswith(target_date)]
+
+    if not candles:
+        print(f"[-] NIFTY 50 स्पॉट कॅन्डल्स मिळाल्या नाहीत. API Status: {res.status_code}", flush=True)
         return None
-    
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    spot_close_latest = candles[0][4]
-    
+    spot_close_latest = float(candles[0][4])
+
     for c in candles:
-        # Upstox format: [timestamp, open, high, low, close, volume, oi]
         cur.execute("""
             INSERT OR REPLACE INTO nifty_index_1m (timestamp, open, high, low, close, volume)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (c[0], c[1], c[2], c[3], c[4], c[5]))
-    
+        """, (c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])))
+
     conn.commit()
     conn.close()
     print(f"[+] [Harvester] चालू NIFTY 50 स्पॉट: {spot_close_latest}", flush=True)
@@ -88,7 +103,6 @@ def get_nifty_spot_history(target_date: str):
 
 
 def harvest_options_for_date(target_date: str, spot_price: float):
-    # Upstox Options Contract Master शोधणे
     contracts_url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
     print("[+] Options Instruments मास्टर डाऊनलोड होत आहे...", flush=True)
     try:
@@ -97,8 +111,13 @@ def harvest_options_for_date(target_date: str, spot_price: float):
         print(f"[-] Instruments लोड करता आले नाहीत: {e}", flush=True)
         return
 
-    # NIFTY ऑप्शन्स फिल्टर
-    df_opt = df_inst[(df_inst["exchange"] == "NSE_FO") & (df_inst["name"] == "NIFTY") & (df_inst["instrument_type"] == "OPTIDX")].copy()
+    # NIFTY ऑप्शन्स
+    df_opt = df_inst[
+        (df_inst["exchange"] == "NSE_FO") & 
+        (df_inst["name"] == "NIFTY") & 
+        (df_inst["instrument_type"] == "OPTIDX")
+    ].copy()
+
     if df_opt.empty:
         print("[-] NIFTY ऑप्शन्स सापडले नाहीत.", flush=True)
         return
@@ -116,7 +135,17 @@ def harvest_options_for_date(target_date: str, spot_price: float):
     strikes_to_track = [atm_strike + (i * 50) for i in range(-8, 9)]
     print(f"[+] [Harvester] ट्रॅक करायचे स्ट्राइक्स (ATM {atm_strike}): {strikes_to_track}", flush=True)
 
-    df_target = df_opt[(df_opt["expiry"] == active_expiry) & (df_opt["strike"].isin(strikes_to_track))].copy()
+    df_target = df_opt[
+        (df_opt["expiry"] == active_expiry) & 
+        (df_opt["strike"].isin(strikes_to_track))
+    ].copy()
+
+    dt_obj = datetime.datetime.strptime(target_date, "%Y-%m-%d")
+    next_day = (dt_obj + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    headers = {"Accept": "application/json"}
+    if ACCESS_TOKEN:
+        headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -128,20 +157,30 @@ def harvest_options_for_date(target_date: str, spot_price: float):
         strike = float(row["strike"])
         opt_type = row["option_type"]
 
-        url = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{target_date}/{target_date}"
-        res = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+        url = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{next_day}/{target_date}"
+        res = requests.get(url, headers=headers, timeout=10)
+        c_list = []
         if res.status_code == 200:
             c_list = res.json().get("data", {}).get("candles", [])
-            for c in c_list:
-                cur.execute("""
-                    INSERT OR REPLACE INTO nifty_options_1m 
-                    (timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, iv, delta)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (c[0], sym, strike, opt_type, c[1], c[2], c[3], c[4], c[5], c[6] if len(c) > 6 else 0, 0.0, 0.0))
-                total_opt_candles += 1
+
+        if not c_list:
+            url_alt = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{target_date}"
+            res_alt = requests.get(url_alt, headers=headers, timeout=10)
+            if res_alt.status_code == 200:
+                c_list = res_alt.json().get("data", {}).get("candles", [])
+
+        c_list = [c for c in c_list if str(c[0]).startswith(target_date)]
+
+        for c in c_list:
+            cur.execute("""
+                INSERT OR REPLACE INTO nifty_options_1m 
+                (timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, iv, delta)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (c[0], sym, strike, opt_type, float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5]), float(c[6]) if len(c) > 6 else 0.0, 0.0, 0.0))
+            total_opt_candles += 1
 
     conn.commit()
-    
+
     cur.execute("SELECT COUNT(*) FROM nifty_index_1m")
     spot_count = cur.fetchone()[0]
     conn.close()
@@ -151,19 +190,18 @@ def harvest_options_for_date(target_date: str, spot_price: float):
 
 if __name__ == "__main__":
     init_db()
-    
-    # IST नुसार चालू तारीख
+
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.datetime.now(ist)
-    
-    # जर शनिवार/रविवार असेल तर शुक्रवारचा डेटा
+
+    # वीकेंड असल्यास शुक्रवारची तारीख
     if now_ist.weekday() == 5:
         now_ist -= datetime.timedelta(days=1)
     elif now_ist.weekday() == 6:
         now_ist -= datetime.timedelta(days=2)
-        
+
     t_date = now_ist.strftime("%Y-%m-%d")
-    
+
     spot = get_nifty_spot_history(t_date)
     if spot:
         harvest_options_for_date(t_date, spot)
