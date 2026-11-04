@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import pandas as pd
+import numpy as np
 import requests
 
 DB_PATH = "nifty_vault.db"
@@ -10,7 +11,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
-MIN_OPT_SL_PTS = 12.0  # 5-मिनिटाच्या व्होलॅटिलिटीसाठी योग्य ब्रीदिंग स्पेस
+MIN_OPT_SL_PTS = 12.0
 
 
 def send_telegram(text: str):
@@ -124,12 +125,12 @@ def run_harvest_pnl_engine():
     target_date = dates_list[0]
 
     print("=" * 80, flush=True)
-    print(f"🚀 [Institutional 5-Min Engine] Target Date: {target_date} (Paper Trade)", flush=True)
+    print(f"🚀 [Institutional VWAP Engine] Target Date: {target_date} (Paper Trade)", flush=True)
     print("=" * 80, flush=True)
 
-    # १. स्पॉट डेटा लोड करणे आणि ५-मिनिट कँडल्समध्ये रूपांतरित करणे
+    # १. स्पॉट डेटा आणि 5-मिनिट VWAP कॅल्क्युलेशन
     df_spot = pd.read_sql_query(
-        f"SELECT timestamp, open, high, low, close FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
+        f"SELECT timestamp, open, high, low, close, volume FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
         conn,
     )
 
@@ -149,22 +150,18 @@ def run_harvest_pnl_engine():
     df_spot["dt"] = pd.to_datetime(df_spot["timestamp"])
     if df_spot["dt"].dt.tz is not None:
         df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
-    df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").set_index("dt")
+    df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
 
-    # ५-मिनिट स्पॉट बार तयार करणे
-    df_spot_5m = df_spot.resample("5min").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last"
-    }).dropna().reset_index()
+    # NIFTY 1-मिनिट VWAP गणना (इन्स्टिट्यूशनल बेंचमार्क)
+    typical_price = (df_spot["high"] + df_spot["low"] + df_spot["close"]) / 3.0
+    vol = df_spot["volume"].replace(0, 1.0)
+    df_spot["cum_pv"] = (typical_price * vol).cumsum()
+    df_spot["cum_v"] = vol.cumsum()
+    df_spot["vwap"] = df_spot["cum_pv"] / df_spot["cum_v"]
 
-    df_spot_5m["ema9"] = df_spot_5m["close"].ewm(span=9, adjust=False).mean()
-    df_spot_5m["ema21"] = df_spot_5m["close"].ewm(span=21, adjust=False).mean()
-
-    # स्पॉट १-मिनिट मॅप
-    df_spot_1m = df_spot.reset_index()
-    spot_map = dict(zip(df_spot_1m["dt"], df_spot_1m["close"]))
+    # 15-कँडल EMA (मोमेंटम रिव्हर्सल ट्रॅकर)
+    df_spot["ema15"] = df_spot["close"].ewm(span=15, adjust=False).mean()
+    spot_records = df_spot.set_index("dt").to_dict("index")
 
     df_opt["dt"] = pd.to_datetime(df_opt["timestamp"])
     if df_opt["dt"].dt.tz is not None:
@@ -178,10 +175,18 @@ def run_harvest_pnl_engine():
             continue
         sub["vol_sma20"] = sub["volume"].rolling(20).mean().replace(0, 1.0)
         sub["vol_ratio"] = sub["volume"] / sub["vol_sma20"]
+
+        prev_c = sub["close"].shift(1)
+        tr = pd.concat([
+            sub["high"] - sub["low"],
+            (sub["high"] - prev_c).abs(),
+            (sub["low"] - prev_c).abs(),
+        ], axis=1).max(axis=1)
+        sub["atr14"] = tr.rolling(14).mean().fillna(5.0)
         all_processed.append(sub)
 
     if not all_processed:
-        print("[-] Insufficient candles.", flush=True)
+        print("[-] Insufficient candles for ATR calculation.", flush=True)
         return
 
     df_data = pd.concat(all_processed, axis=0).sort_values(by=["dt", "symbol"]).reset_index(drop=True)
@@ -193,28 +198,12 @@ def run_harvest_pnl_engine():
     cooldown_until = None
     all_timestamps = df_data["dt"].unique()
 
-    # ५-मिनिट सिग्नल मॅपिंग
-    signal_5m = {}
-    for idx in range(1, len(df_spot_5m)):
-        prev_bar = df_spot_5m.iloc[idx - 1]
-        curr_bar = df_spot_5m.iloc[idx]
-        t_start = curr_bar["dt"]
-
-        # ट्रेंड आणि स्ट्रक्चरल कँडल कन्फर्मेशन
-        is_bull = (prev_bar["close"] > prev_bar["open"]) and (prev_bar["close"] > prev_bar["ema9"])
-        is_bear = (prev_bar["close"] < prev_bar["open"]) and (prev_bar["close"] < prev_bar["ema9"])
-
-        if is_bull:
-            signal_5m[t_start] = "CE"
-        elif is_bear:
-            signal_5m[t_start] = "PE"
-
     for ts in all_timestamps:
         ts_pd = pd.to_datetime(ts)
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # चालू ट्रेड व्यवस्थापन
+        # चालू ट्रेड मॉनिटरिंग
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
@@ -223,7 +212,7 @@ def run_harvest_pnl_engine():
                 
                 max_gain = bar["high"] - active_trade["entry_price"]
 
-                # डी-रिस्किंग: +15 पॉईंट्सवर SL कॉस्टवर
+                # डी-रिस्किंग: +15 पॉईंट्सवर SL कॉस्टवर आणणे
                 if max_gain >= 15.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
@@ -276,20 +265,28 @@ def run_harvest_pnl_engine():
         if cooldown_until and ts_pd < cooldown_until:
             continue
 
-        # ५-मिनिट कँडल क्लोजवरच एन्ट्री स्कॅन (दर ५ मिनिटांनी: 09:35, 09:40, 09:45...)
-        if ts_pd.minute % 5 != 0:
-            continue
-
         is_morning = ("09:35" <= hhmm <= "11:30") and (morning_trades < 2)
         is_afternoon = ("12:15" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
         if (active_trade is None) and (is_morning or is_afternoon):
-            cur_spot = spot_map.get(ts_pd)
-            if cur_spot is None:
+            spot_info = spot_records.get(ts_pd)
+            if spot_info is None or pd.isna(spot_info.get("vwap")):
                 continue
 
-            floor_5m = ts_pd.floor("5min")
-            allowed_side = signal_5m.get(floor_5m)
+            cur_spot = spot_info["close"]
+            vwap = spot_info["vwap"]
+            ema15 = spot_info["ema15"]
+
+            # संस्थात्मक नियम:
+            # १. स्पॉट VWAP च्या वर आणि EMA15 च्या वर असेल तरच CE (बुलिश फ्लो)
+            # २. स्पॉट VWAP च्या खाली आणि EMA15 च्या खाली असेल तरच PE (बेअरिश फ्लो)
+            # ३. १२:१५ नंतर तळाशी असताना PE पूर्णपणे प्रतिबंधित
+            allowed_side = None
+            if cur_spot > vwap or (hhmm >= "12:15" and cur_spot > ema15):
+                allowed_side = "CE"
+            elif cur_spot < vwap and cur_spot < ema15 and hhmm < "12:15":
+                allowed_side = "PE"
+
             if not allowed_side:
                 continue
 
@@ -300,8 +297,15 @@ def run_harvest_pnl_engine():
                 if not (70.0 <= row["close"] <= 320.0):
                     continue
 
-                # ५-मिनिट ट्रेंडच्या दिशेने मोमेंटम असणे
-                if row["close"] > row["open"] and row["vol_ratio"] >= 1.10:
+                c_range = row["high"] - row["low"]
+                c_body = abs(row["close"] - row["open"])
+                b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
+
+                has_vol = row["vol_ratio"] >= 1.15
+                is_range_exp = c_range >= (1.10 * row["atr14"])
+                is_solid = b_ratio >= 0.40
+
+                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
                     entry_opt_price = float(row["close"])
                     opt_sl_pts = MIN_OPT_SL_PTS
                     opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR
@@ -360,7 +364,7 @@ def run_harvest_pnl_engine():
         print("=" * 80, flush=True)
         send_telegram("\n".join(tg_lines))
     else:
-        print("ℹ️ आजच्या सत्रात ५-मिनिट कँडल नियमांनुसार कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात संस्थात्मक VWAP नियमांनुसार कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
 
 
 if __name__ == "__main__":
