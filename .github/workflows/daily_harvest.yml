@@ -39,7 +39,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u harvester.py
 
-    - name: Inspect Vault Data
+      - name: Inspect Vault Data
         run: |
           python -u -c "
           import sqlite3, pandas as pd
