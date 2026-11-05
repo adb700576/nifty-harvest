@@ -1,7 +1,6 @@
 import os
 import sqlite3
 import pandas as pd
-import numpy as np
 import requests
 
 DB_PATH = "nifty_vault.db"
@@ -112,6 +111,14 @@ def run_harvest_pnl_engine():
         return
 
     conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='nifty_options_1m'")
+    if not cursor.fetchone():
+        print("[-] nifty_options_1m टेबल तयार नाही.", flush=True)
+        conn.close()
+        return
+
     avail_dates = pd.read_sql_query(
         "SELECT DISTINCT substr(timestamp, 1, 10) as t_date FROM nifty_options_1m ORDER BY t_date DESC",
         conn,
@@ -125,17 +132,16 @@ def run_harvest_pnl_engine():
     target_date = dates_list[0]
 
     print("=" * 80, flush=True)
-    print(f"🚀 [Institutional VWAP Engine] Target Date: {target_date} (Paper Trade)", flush=True)
+    print(f"🚀 [Institutional VWAP + PCR + ΔOI Engine] Target Date: {target_date} (Paper Trade)", flush=True)
     print("=" * 80, flush=True)
 
-    # १. स्पॉट डेटा आणि 5-मिनिट VWAP कॅल्क्युलेशन
     df_spot = pd.read_sql_query(
         f"SELECT timestamp, open, high, low, close, volume FROM nifty_index_1m WHERE timestamp LIKE '{target_date}%'",
         conn,
     )
 
     query_opt = f"""
-        SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, delta
+        SELECT timestamp, symbol, strike, option_type, open, high, low, close, volume, oi
         FROM nifty_options_1m
         WHERE timestamp LIKE '{target_date}%'
     """
@@ -146,20 +152,17 @@ def run_harvest_pnl_engine():
         print(f"[-] Incomplete data for {target_date}.", flush=True)
         return
 
-    # IST रूपांतरण
     df_spot["dt"] = pd.to_datetime(df_spot["timestamp"])
     if df_spot["dt"].dt.tz is not None:
         df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
     df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
 
-    # NIFTY 1-मिनिट VWAP गणना (इन्स्टिट्यूशनल बेंचमार्क)
+    # NIFTY 1-मिनिट VWAP आणि EMA गणना
     typical_price = (df_spot["high"] + df_spot["low"] + df_spot["close"]) / 3.0
     vol = df_spot["volume"].replace(0, 1.0)
     df_spot["cum_pv"] = (typical_price * vol).cumsum()
     df_spot["cum_v"] = vol.cumsum()
     df_spot["vwap"] = df_spot["cum_pv"] / df_spot["cum_v"]
-
-    # 15-कँडल EMA (मोमेंटम रिव्हर्सल ट्रॅकर)
     df_spot["ema15"] = df_spot["close"].ewm(span=15, adjust=False).mean()
     spot_records = df_spot.set_index("dt").to_dict("index")
 
@@ -168,6 +171,7 @@ def run_harvest_pnl_engine():
         df_opt["dt"] = df_opt["dt"].dt.tz_convert("Asia/Kolkata")
     df_opt = df_opt.drop_duplicates(subset=["symbol", "dt"]).sort_values(by=["symbol", "dt"]).reset_index(drop=True)
 
+    # व्हॉल्यूम, ATR आणि Change in OI (ΔOI) गणना
     all_processed = []
     for sym in df_opt["symbol"].unique():
         sub = df_opt[df_opt["symbol"] == sym].copy().sort_values("dt").reset_index(drop=True)
@@ -183,10 +187,13 @@ def run_harvest_pnl_engine():
             (sub["low"] - prev_c).abs(),
         ], axis=1).max(axis=1)
         sub["atr14"] = tr.rolling(14).mean().fillna(5.0)
+
+        # Change in OI (मागील कँडलपेक्षा OI मधील बदल)
+        sub["change_oi"] = sub["oi"].diff().fillna(0.0)
         all_processed.append(sub)
 
     if not all_processed:
-        print("[-] Insufficient candles for ATR calculation.", flush=True)
+        print("[-] Insufficient candles for indicator calculation.", flush=True)
         return
 
     df_data = pd.concat(all_processed, axis=0).sort_values(by=["dt", "symbol"]).reset_index(drop=True)
@@ -196,6 +203,7 @@ def run_harvest_pnl_engine():
     afternoon_trades = 0
     active_trade = None
     cooldown_until = None
+    daily_target_locked = False
     all_timestamps = df_data["dt"].unique()
 
     for ts in all_timestamps:
@@ -203,16 +211,15 @@ def run_harvest_pnl_engine():
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # चालू ट्रेड मॉनिटरिंग
+        # चालू ट्रेड व्यवस्थापन
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
                 bar = curr_match.iloc[0]
                 exit_p, exit_reason = None, ""
-                
                 max_gain = bar["high"] - active_trade["entry_price"]
 
-                # डी-रिस्किंग: +15 पॉईंट्सवर SL कॉस्टवर आणणे
+                # डी-रिस्किंग: +15 पॉईंट्सवर SL थेट कॉस्टवर
                 if max_gain >= 15.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
@@ -227,6 +234,7 @@ def run_harvest_pnl_engine():
                 elif bar["high"] >= active_trade["opt_target"]:
                     exit_p = active_trade["opt_target"]
                     exit_reason = "TARGET_HIT ✅"
+                    daily_target_locked = True  # मोठा टार्गेट हिट झाल्यानंतर नफा लॉक
                 elif hhmm >= "15:20":
                     exit_p = float(bar["close"])
                     exit_reason = "FORCE_EOD ⏱️"
@@ -256,16 +264,23 @@ def run_harvest_pnl_engine():
                         "exit_px": round(exit_p, 2),
                         "pts_captured": captured_pts,
                         "net_pnl": net_pnl,
+                        "pcr": active_trade["pcr"],
+                        "oi": active_trade["oi"],
+                        "change_oi": active_trade["change_oi"],
                         "exit_reason": exit_reason,
                     })
                     active_trade = None
                     cooldown_until = ts_pd + pd.Timedelta(minutes=15)
             continue
 
+        if daily_target_locked:
+            continue
+
         if cooldown_until and ts_pd < cooldown_until:
             continue
 
-        is_morning = ("09:35" <= hhmm <= "11:30") and (morning_trades < 2)
+        # ओपनिंग चॉप फिल्टर: 10:15 नंतरच पहिली एन्ट्री शोधणे
+        is_morning = ("10:15" <= hhmm <= "11:30") and (morning_trades < 2)
         is_afternoon = ("12:15" <= hhmm <= "14:45") and (afternoon_trades < 2)
 
         if (active_trade is None) and (is_morning or is_afternoon):
@@ -277,15 +292,17 @@ def run_harvest_pnl_engine():
             vwap = spot_info["vwap"]
             ema15 = spot_info["ema15"]
 
-            # संस्थात्मक नियम:
-            # १. स्पॉट VWAP च्या वर आणि EMA15 च्या वर असेल तरच CE (बुलिश फ्लो)
-            # २. स्पॉट VWAP च्या खाली आणि EMA15 च्या खाली असेल तरच PE (बेअरिश फ्लो)
-            # ३. १२:१५ नंतर तळाशी असताना PE पूर्णपणे प्रतिबंधित
+            # १. रिअल-टाईम PCR गणना (Put OI / Call OI)
+            pe_oi_sum = snap[snap["option_type"] == "PE"]["oi"].sum()
+            ce_oi_sum = snap[snap["option_type"] == "CE"]["oi"].sum()
+            pcr = round(pe_oi_sum / (ce_oi_sum if ce_oi_sum > 0 else 1.0), 2)
+
+            # २. संस्थात्मक कल (VWAP + EMA + PCR Confluence)
             allowed_side = None
-            if cur_spot > vwap or (hhmm >= "12:15" and cur_spot > ema15):
-                allowed_side = "CE"
-            elif cur_spot < vwap and cur_spot < ema15 and hhmm < "12:15":
-                allowed_side = "PE"
+            if (cur_spot > vwap or (hhmm >= "12:15" and cur_spot > ema15)) and pcr >= 0.90:
+                allowed_side = "CE"  # बुलिश कल आणि मजबूत पुट बेस
+            elif cur_spot < vwap and cur_spot < ema15 and hhmm < "12:15" and pcr <= 1.10:
+                allowed_side = "PE"  # बेअरिश कल आणि कॉल रायटिंग
 
             if not allowed_side:
                 continue
@@ -305,10 +322,13 @@ def run_harvest_pnl_engine():
                 is_range_exp = c_range >= (1.10 * row["atr14"])
                 is_solid = b_ratio >= 0.40
 
-                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]):
+                # ३. Change in OI फिल्टर: ऑप्शनमध्ये OI वाढलेला असावा (Fresh Buying / Buildup)
+                has_oi_buildup = row["change_oi"] >= 0
+
+                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]) and has_oi_buildup:
                     entry_opt_price = float(row["close"])
                     opt_sl_pts = MIN_OPT_SL_PTS
-                    opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR
+                    opt_target_pts = opt_sl_pts * 2.0  # 1:2 RRR (24 पॉईंट्स)
 
                     active_trade = {
                         "symbol": row["symbol"],
@@ -318,6 +338,9 @@ def run_harvest_pnl_engine():
                         "entry_price": entry_opt_price,
                         "opt_sl": max(0.05, round(entry_opt_price - opt_sl_pts, 2)),
                         "opt_target": round(entry_opt_price + opt_target_pts, 2),
+                        "pcr": pcr,
+                        "oi": int(row["oi"]),
+                        "change_oi": int(row["change_oi"]),
                     }
 
                     if is_morning:
@@ -328,7 +351,7 @@ def run_harvest_pnl_engine():
 
     df_all = pd.DataFrame(all_trades)
     print("\n" + "=" * 80, flush=True)
-    print(f"📊 NIFTY ALGO निकाल ({target_date})", flush=True)
+    print(f"📊 NIFTY ALGO निकाल ({target_date}) [PCR & ΔOI Filtered]", flush=True)
     print("=" * 80, flush=True)
 
     if not df_all.empty:
@@ -339,7 +362,7 @@ def run_harvest_pnl_engine():
 
         print(f"🔹 एकूण ट्रेड्स: {total_trades} (जिंकले: {wins}, तोटा: {losses})", flush=True)
         print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}\n", flush=True)
-        print("📋 चार्ट लेव्हल्स व अचूक किमती:", flush=True)
+        print("📋 चार्ट लेव्हल्स, PCR व OI आकडेवारी:", flush=True)
 
         tg_lines = [
             f"📊 <b>NIFTY ALGO निकाल ({target_date})</b>\n",
@@ -351,20 +374,22 @@ def run_harvest_pnl_engine():
         for idx, tr in df_all.iterrows():
             print(f"{idx + 1}. {tr['side']} | {tr['symbol']}", flush=True)
             print(f"   🎯 NIFTY Spot: {tr['spot_px']} | वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
+            print(f"   📈 PCR: {tr['pcr']:.2f} | OI: {tr['oi']:,} | ΔOI: {tr['change_oi']:+,}", flush=True)
             print(f"   💵 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
-            print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:.2f} ({tr['exit_reason']})\n", flush=True)
+            print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:+,.2f} ({tr['exit_reason']})\n", flush=True)
 
             tg_lines.append(
                 f"{idx + 1}. <b>{tr['side']}</b> | <code>{tr['symbol']}</code>\n"
                 f"   📍 Spot: <code>{tr['spot_px']}</code> | ⏱️ <code>{tr['entry_time']} ➡️ {tr['exit_time']}</code>\n"
+                f"   📈 PCR: <b>{tr['pcr']:.2f}</b> | OI: <b>{tr['oi']:,}</b> (ΔOI: <b>{tr['change_oi']:+,}</b>)\n"
                 f"   🎯 Buy: <code>₹{tr['entry_px']:.2f}</code> | 🛑 SL: <code>₹{tr['sl_px']:.2f}</code> | 🏁 TRG: <code>₹{tr['trg_px']:.2f}</code>\n"
-                f"   📊 पॉईंट्स: <b>{tr['pts_captured']:+.2f}</b> | PnL: <b>₹ {tr['net_pnl']:.2f}</b> ({tr['exit_reason']})\n"
+                f"   📊 पॉईंट्स: <b>{tr['pts_captured']:+.2f}</b> | PnL: <b>₹ {tr['net_pnl']:+,.2f}</b> ({tr['exit_reason']})\n"
             )
 
         print("=" * 80, flush=True)
         send_telegram("\n".join(tg_lines))
     else:
-        print("ℹ️ आजच्या सत्रात संस्थात्मक VWAP नियमांनुसार कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
+        print("ℹ️ आजच्या सत्रात PCR व ΔOI नियमांनुसार कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
 
 
 if __name__ == "__main__":
