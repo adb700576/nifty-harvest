@@ -10,31 +10,34 @@ import requests
 import pandas as pd
 import numpy as np
 
-# ========================= कॉन्फिगरेशन =========================
+# ========================= कॉन्फिगरेशन व टोकन लोडर =========================
 BASE_URL = "https://api.upstox.com"
-TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 
-if not TOKEN and os.path.exists("ACCESS_TOKEN.txt"):
-    with open("ACCESS_TOKEN.txt", "r") as f:
-        TOKEN = f.read().strip()
+def fetch_token() -> str:
+    token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
+    if not token and os.path.exists("ACCESS_TOKEN.txt"):
+        with open("ACCESS_TOKEN.txt", "r", encoding="utf-8") as f:
+            token = f.read().strip()
+    return token
+
+TOKEN = fetch_token()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
 MIN_OPT_SL_PTS = 12.0
-TARGET_RRR = 2.0  # 1:2 Risk to Reward (२४ पॉईंट्स)
-POLL_INTERVAL = 1.0  # चालू भाव ट्रॅकिंग (१ सेकंद)
-STRATEGY_INTERVAL = 30.0  # सेटअप स्कॅनिंग (३० सेकंद)
+TARGET_RRR = 2.0  # 1:2 RRR (२४ पॉईंट्स टार्गेट)
+POLL_INTERVAL = 1.0  # १ सेकंद टिक ट्रॅकिंग
+STRATEGY_INTERVAL = 30.0  # ३० सेकंद सेटअप स्कॅनिंग
 
-DAILY_PROFIT_GOAL = 1000.0  # दैनिक नफा लॉक मर्यादा (₹)
-DAILY_MAX_LOSS = -2000.0    # कमाल दैनिक तोटा मर्यादा (₹)
+DAILY_PROFIT_GOAL = 600.0   # दैनिक नफा लॉक मर्यादा (₹)
+DAILY_MAX_LOSS = -1500.0    # कमाल दैनिक तोटा मर्यादा (₹)
 
 SESSION_START = "09:20"
 ENTRY_END = "15:00"
 FORCE_EXIT = "15:20"
 
-# जर्नल डिरेक्टरी सेटअप
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
 TODAY_STR = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
@@ -43,9 +46,8 @@ JOURNAL_CSV = JOURNAL_DIR / f"trades_journal_{TODAY_STR}.csv"
 
 # ========================= टेलिग्राम मेसेजिंग =========================
 def send_telegram(text: str):
-    """टेलिग्राम बॉटवर सुरक्षित HTML फॉरमॅटमध्ये निकाल पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[Telegram Disconnected] {text[:100]}...")
+        print(f"[Telegram Disconnected] {text[:100]}...", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -56,7 +58,7 @@ def send_telegram(text: str):
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[-] Telegram Error: {e}")
+        print(f"[-] Telegram Error: {e}", flush=True)
 
 
 def now_ist() -> datetime:
@@ -135,22 +137,21 @@ class LivePaperTrader:
         self.load_expiry()
 
     def load_expiry(self):
-        """मास्टर फाईलमधून NIFTY ची चालू वीकली एक्सपायरी निवडणे"""
         try:
             url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
             df = pd.read_csv(url, compression="gzip", low_memory=False)
             df.columns = [c.strip().lower() for c in df.columns]
-            nifty_opts = df[(df["exchange"] == "NSE_FO") & (df["name"] == "NIFTY") & (df["instrument_type"] == "OPTIDX")]
+            sym_col = "tradingsymbol" if "tradingsymbol" in df.columns else "trading_symbol"
+            nifty_opts = df[(df["exchange"] == "NSE_FO") & (df["name"] == "NIFTY") & (df["instrument_type"] == "OPTIDX")].copy()
             nifty_opts["expiry"] = pd.to_datetime(nifty_opts["expiry"]).dt.strftime("%Y-%m-%d")
             valid = sorted([x for x in nifty_opts["expiry"].unique() if x >= TODAY_STR])
             self.expiry = valid[0]
-            print(f"[+] निवडलेली चालू एक्सपायरी: {self.expiry}")
+            print(f"[+] निवडलेली चालू एक्सपायरी: {self.expiry}", flush=True)
         except Exception as e:
-            print(f"[-] एक्सपायरी लोड एरर: {e}")
+            print(f"[-] एक्सपायरी लोड एरर: {e}", flush=True)
             self.expiry = TODAY_STR
 
     def log_journal_csv(self, row: dict):
-        """ट्रेड जर्नल फाईलमध्ये एन्ट्री सेव्ह करणे"""
         exists = JOURNAL_CSV.exists()
         with open(JOURNAL_CSV, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -215,14 +216,14 @@ class LivePaperTrader:
             "peak_price": entry_price
         }
 
-        print(f"\n[एन्ट्री ट्रिगर] {self.active_position['side']} @ ₹{entry_price}")
+        print(f"\n[एन्ट्री ट्रिगर] {self.active_position['side']} @ ₹{entry_price}", flush=True)
         self.send_entry_alert(self.active_position)
 
     def execute_exit(self, exit_price: float, reason: str):
         pos = self.active_position
         pts = round(exit_price - pos["entry_px"], 2)
         gross_pnl = round(pts * LOT_SIZE, 2)
-        net_pnl = round(gross_pnl - 52.0, 2)  # ब्रोकरेज व टॅक्स वजावट
+        net_pnl = round(gross_pnl - 52.0, 2)
         self.cumulative_pnl += net_pnl
 
         pos["exit_time"] = ts_now()
@@ -232,23 +233,21 @@ class LivePaperTrader:
         pos["exit_reason"] = reason
         pos["cumulative_pnl"] = self.cumulative_pnl
 
-        print(f"\n[एक्झिट ट्रिगर] {pos['side']} Exit @ ₹{exit_price} | PnL: ₹{net_pnl} ({reason})")
+        print(f"\n[एक्झिट ट्रिगर] {pos['side']} Exit @ ₹{exit_price} | PnL: ₹{net_pnl} ({reason})", flush=True)
         self.send_exit_alert(pos)
         self.log_journal_csv(pos)
 
-        # दैनिक नफा/तोटा सुरक्षा नियम
         if self.cumulative_pnl >= DAILY_PROFIT_GOAL:
             self.daily_locked = True
-            send_telegram(f"🔒 <b>दैनिक टार्गेट पूर्ण!</b>\nदिवसाचा लक्ष्यांक (₹{self.cumulative_pnl:,.2f}) पूर्ण झाला आहे. आजचे नवीन ट्रेड्स थांबवले आहेत.")
+            send_telegram(f"🔒 <b>दैनिक टार्गेट पूर्ण!</b>\nलक्ष्यांक (₹{self.cumulative_pnl:,.2f}) पूर्ण झाला. आजचे नवीन ट्रेड्स थांबवले आहेत.")
         elif self.cumulative_pnl <= DAILY_MAX_LOSS:
             self.daily_locked = True
-            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदिवसाचा कमाल तोटा (₹{self.cumulative_pnl:,.2f}) हिट झाला आहे. सिस्टीम आजसाठी बंद केली आहे.")
+            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{self.cumulative_pnl:,.2f}) छू झाली. सिस्टीम बंद केली आहे.")
 
         self.active_position = None
-        self.cooldown_until = time.monotonic() + 900  # १५ मिनिटांचा कूलडाउन
+        self.cooldown_until = time.monotonic() + 900
 
     def check_position_management(self):
-        """दर सेकंदाला ट्रेलिंग आणि एक्झिट तपासणे"""
         pos = self.active_position
         if not pos:
             return
@@ -260,18 +259,15 @@ class LivePaperTrader:
         pos["peak_price"] = max(pos["peak_price"], ltp)
         gain = ltp - pos["entry_px"]
 
-        # डी-रिस्किंग: +१२ पॉईंट्स नफ्यावर स्टॉपलॉस खरेदी किमतीवर आणणे
         if gain >= 12.0 and pos["sl_px"] < pos["entry_px"]:
             pos["sl_px"] = pos["entry_px"]
             send_telegram(f"🛡️ <b>SL कॉस्टवर आणला (₹{pos['entry_px']:.2f})</b> | ट्रेड #{pos['trade_id']}")
 
-        # ट्रेलिंग: +१८ पॉईंट्सच्या पुढे स्टॉपलॉस नफ्यामध्ये ट्रेल करणे
         if gain >= 18.0:
             new_sl = round(ltp - 8.0, 2)
             if new_sl > pos["sl_px"]:
                 pos["sl_px"] = new_sl
 
-        # एक्झिट अटी
         hhmm = now_ist().strftime("%H:%M")
         if ltp <= pos["sl_px"]:
             reason = "TRAILED_EXIT ✅" if pos["sl_px"] >= pos["entry_px"] else "SL_HIT ❌"
@@ -282,7 +278,6 @@ class LivePaperTrader:
             self.execute_exit(ltp, "FORCE_EOD_EXIT ⏱️")
 
     def run_strategy_scan(self):
-        """संस्थात्मक सिग्नल्स शोधणे"""
         if self.active_position or self.daily_locked:
             return
         if self.cooldown_until and time.monotonic() < self.cooldown_until:
@@ -296,7 +291,6 @@ class LivePaperTrader:
         if len(df_spot) < 30:
             return
 
-        # NIFTY VWAP आणि 20-EMA गणना
         df_spot["tp"] = (df_spot["high"] + df_spot["low"] + df_spot["close"]) / 3.0
         v = df_spot["volume"].replace(0, 1.0)
         df_spot["vwap"] = (df_spot["tp"] * v).cumsum() / v.cumsum()
@@ -307,7 +301,6 @@ class LivePaperTrader:
         vwap = float(last_bar["vwap"])
         ema20 = float(last_bar["ema20"])
 
-        # ओव्हर-एक्सटेंशन टाळणे (VWAP पासून ७५ पॉईंट्सपेक्षा जास्त दूर नसावा)
         if abs(spot_px - vwap) > 75.0:
             return
 
@@ -319,7 +312,6 @@ class LivePaperTrader:
         ce_oi_sum = sum([r.get("call_options", {}).get("market_data", {}).get("oi", 0) for r in chain_rows])
         pcr = round(pe_oi_sum / (ce_oi_sum if ce_oi_sum > 0 else 1.0), 2)
 
-        # कल निश्चिती
         signal_side = None
         if spot_px > vwap and spot_px > ema20 and pcr >= 0.95:
             signal_side = "CE"
@@ -339,7 +331,6 @@ class LivePaperTrader:
                 prev_oi = int(md.get("prev_oi", oi))
                 chg_oi = oi - prev_oi
 
-                # योग्य प्रीमियम व्हॅल्यू व ओपन इंटरेस्ट वाढ
                 if 80.0 <= ltp <= 320.0 and chg_oi >= 0:
                     opt_data = {
                         "trading_symbol": opt.get("trading_symbol"),
@@ -354,22 +345,24 @@ class LivePaperTrader:
 
 # ========================= मुख्य लूप =========================
 def main():
+    global TOKEN
     if not TOKEN:
-        raise RuntimeError("UPSTOX_ACCESS_TOKEN उपलब्ध नाही.")
+        TOKEN = fetch_token()
+
+    if not TOKEN:
+        raise RuntimeError("UPSTOX_ACCESS_TOKEN उपलब्ध नाही. कृपया ACCESS_TOKEN.txt तपासा.")
 
     api = UpstoxClient(TOKEN)
     trader = LivePaperTrader(api)
-    
+
     send_telegram(f"🟢 <b>NIFTY ALGO इंजिन: सुरू झाले</b>\nतारीख: <code>{TODAY_STR}</code>\nमोड: <b>Live Paper Trading + Telegram Journal</b>")
-    print(f"[*] Engine Started. Tracking live market for {TODAY_STR}...")
+    print(f"[*] Engine Started. Tracking live market for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
         while True:
-            # १. चालू पोझिशन मॅनेजमेंट (दर १ सेकंदाला)
             trader.check_position_management()
 
-            # २. नवीन सेटअप स्कॅन (दर ३० सेकंदांनी)
             if time.monotonic() - last_strat >= STRATEGY_INTERVAL:
                 trader.run_strategy_scan()
                 last_strat = time.monotonic()
@@ -377,7 +370,7 @@ def main():
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[!] सिस्टीम थांबवली.")
+        print("\n[!] मॅन्युअली थांबवले.", flush=True)
         send_telegram("⚠️ <b>NIFTY ALGO इंजिन: मॅन्युअली थांबवले</b>")
 
 
