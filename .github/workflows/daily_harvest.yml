@@ -70,3 +70,16 @@ jobs:
         with:
           name: harvested-nifty-vault
           path: nifty_vault.db
+      - name: Run Live Paper Trader Engine
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -u live_engine.py
+
+      - name: Upload Live Trade Journal Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-trades-journal
+          path: live_journal/
