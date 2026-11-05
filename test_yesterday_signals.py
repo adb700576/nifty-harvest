@@ -5,17 +5,19 @@ import requests
 
 DB_PATH = "nifty_vault.db"
 BASE_URL = "https://api.upstox.com"
-ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or os.environ.get("UPSTOX_TOKEN") or ""
+ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or ""
+if not ACCESS_TOKEN and os.path.exists("ACCESS_TOKEN.txt"):
+    with open("ACCESS_TOKEN.txt", "r") as f:
+        ACCESS_TOKEN = f.read().strip()
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
 MIN_OPT_SL_PTS = 12.0
-DAILY_PROFIT_GOAL = 900.0  # दिवसाला ₹900+ नफा झाला की ट्रेडिंग आपोआप लॉक (Capital Protection)
-
+DAILY_PROFIT_GOAL = 450.0  # ₹450+ नफा झाला की दिवस ग्रीनमध्ये लॉक (Capital Protection)
 
 def send_telegram(text: str):
-    """टेलिग्राम बॉटवर निकाल पाठवणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -29,20 +31,12 @@ def send_telegram(text: str):
     except Exception:
         pass
 
-
-def get_upstox_charges(
-    instrument_token: str,
-    quantity: int,
-    buy_price: float,
-    sell_price: float,
-    token: str = None,
-) -> dict:
+def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
     url = f"{BASE_URL}/v2/charges/brokerage"
     headers = {
         "Accept": "application/json",
-        "Authorization": f"Bearer {token or ACCESS_TOKEN}",
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
     }
-
     buy_params = {
         "instrument_token": instrument_token,
         "quantity": str(quantity),
@@ -58,48 +52,33 @@ def get_upstox_charges(
         "price": str(sell_price),
     }
 
-    total_brokerage = 0.0
-    total_stt = 0.0
-    total_other = 0.0
-
     if ACCESS_TOKEN:
         try:
-            res_b = requests.get(url, headers=headers, params=buy_params, timeout=2)
-            if res_b.status_code == 200:
-                db = res_b.json().get("data", {}).get("charges", {})
-                total_brokerage += float(db.get("brokerage", 20.0))
-                total_stt += float(db.get("stt", 0.0))
-                total_other += (
-                    float(db.get("gst", 0.0))
-                    + float(db.get("stamp_duty", 0.0))
-                    + float(db.get("other_charges", 0.0))
-                )
+            total_b, total_s, total_o = 0.0, 0.0, 0.0
+            rb = requests.get(url, headers=headers, params=buy_params, timeout=2)
+            if rb.status_code == 200:
+                d = rb.json().get("data", {}).get("charges", {})
+                total_b += float(d.get("brokerage", 20.0))
+                total_s += float(d.get("stt", 0.0))
+                total_o += float(d.get("gst", 0.0)) + float(d.get("stamp_duty", 0.0)) + float(d.get("other_charges", 0.0))
 
-            res_s = requests.get(url, headers=headers, params=sell_params, timeout=2)
-            if res_s.status_code == 200:
-                ds = res_s.json().get("data", {}).get("charges", {})
-                total_brokerage += float(ds.get("brokerage", 20.0))
-                total_stt += float(ds.get("stt", 0.0))
-                total_other += float(ds.get("gst", 0.0)) + float(
-                    ds.get("other_charges", 0.0)
-                )
+            rs = requests.get(url, headers=headers, params=sell_params, timeout=2)
+            if rs.status_code == 200:
+                d = rs.json().get("data", {}).get("charges", {})
+                total_b += float(d.get("brokerage", 20.0))
+                total_s += float(d.get("stt", 0.0))
+                total_o += float(d.get("gst", 0.0)) + float(d.get("other_charges", 0.0))
 
-            total_taxes = round(total_brokerage + total_stt + total_other, 2)
-            if total_taxes > 0:
-                return {
-                    "total_charges": total_taxes,
-                    "brokerage": round(total_brokerage, 2),
-                    "stt": round(total_stt, 2),
-                }
+            tot = round(total_b + total_s + total_o, 2)
+            if tot > 0:
+                return {"total_charges": tot}
         except Exception:
             pass
 
-    return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
-
+    return {"total_charges": 52.0}
 
 def get_atm_strike(spot_price: float, step: int = 50) -> float:
     return round(spot_price / step) * step
-
 
 def run_harvest_pnl_engine():
     if not os.path.exists(DB_PATH):
@@ -116,8 +95,7 @@ def run_harvest_pnl_engine():
         conn.close()
         return
 
-    dates_list = avail_dates["t_date"].tolist()
-    target_date = dates_list[0]
+    target_date = avail_dates["t_date"].tolist()[0]
 
     print("=" * 80, flush=True)
     print(f"🚀 [High-Accuracy Institutional Engine] Target Date: {target_date} (Paper Trade)", flush=True)
@@ -145,7 +123,6 @@ def run_harvest_pnl_engine():
         df_spot["dt"] = df_spot["dt"].dt.tz_convert("Asia/Kolkata")
     df_spot = df_spot.drop_duplicates(subset=["dt"]).sort_values("dt").reset_index(drop=True)
 
-    # NIFTY VWAP आणि 20-EMA कॅल्क्युलेशन
     typical_price = (df_spot["high"] + df_spot["low"] + df_spot["close"]) / 3.0
     vol = df_spot["volume"].replace(0, 1.0)
     df_spot["cum_pv"] = (typical_price * vol).cumsum()
@@ -181,8 +158,6 @@ def run_harvest_pnl_engine():
     df_data = pd.concat(all_processed, axis=0).sort_values(by=["dt", "symbol"]).reset_index(drop=True)
 
     all_trades = []
-    morning_trades = 0
-    afternoon_trades = 0
     active_trade = None
     cooldown_until = None
     realized_net_pnl = 0.0
@@ -194,7 +169,7 @@ def run_harvest_pnl_engine():
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # चालू ट्रेड व्यवस्थापन
+        # चालू पोझिशन व्यवस्थापन
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
@@ -202,13 +177,13 @@ def run_harvest_pnl_engine():
                 exit_p, exit_reason = None, ""
                 max_gain = bar["high"] - active_trade["entry_price"]
 
-                # डी-रिस्किंग: +12 पॉईंट्सवर SL कॉस्टवर
-                if max_gain >= 12.0:
+                # डी-रिस्किंग: +8 पॉईंट्सवर स्टॉपलॉस कॉस्टवर
+                if max_gain >= 8.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
-                # ट्रेलिंग: +16 पॉईंट्सच्या पुढे SL ट्रेल करणे
-                if max_gain >= 16.0:
-                    trailing_level = bar["close"] - 8.0
+                # ट्रेलिंग
+                if max_gain >= 14.0:
+                    trailing_level = bar["close"] - 6.0
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], trailing_level)
 
                 if bar["low"] <= active_trade["opt_sl"]:
@@ -252,13 +227,13 @@ def run_harvest_pnl_engine():
                         "exit_reason": exit_reason,
                     })
 
-                    # नफा सुरक्षितता नियम (Daily Profit Target Lock)
+                    # कॅपिटल प्रोटेक्शन नियम: नफा मिळताच दिवस लॉक करणे
                     if realized_net_pnl >= DAILY_PROFIT_GOAL:
                         daily_locked = True
-                        print(f"🔒 [PROFIT LOCK] दैनिक नफा टार्गेट (₹{realized_net_pnl}) पूर्ण! नवीन ट्रेड्स थांबवले.", flush=True)
+                        print(f"🔒 [PROFIT LOCK] दिवस नफ्यात लॉक केला (₹{realized_net_pnl:+,.2f})! पुढील ट्रेड्स थांबवले.", flush=True)
 
                     active_trade = None
-                    cooldown_until = ts_pd + pd.Timedelta(minutes=25)  # 25-मिनिट संस्थात्मक कूलडाऊन
+                    cooldown_until = ts_pd + pd.Timedelta(minutes=30)
             continue
 
         if daily_locked:
@@ -267,9 +242,9 @@ def run_harvest_pnl_engine():
         if cooldown_until and ts_pd < cooldown_until:
             continue
 
-        # ओपनिंग चॉप टाळणे (१०:१५ नंतरच सुरु)
-        is_morning = ("10:15" <= hhmm <= "11:30") and (morning_trades < 2)
-        is_afternoon = ("12:15" <= hhmm <= "14:45") and (afternoon_trades < 2)
+        # केवळ हाय-प्रोबॅबिलिटी टाईम विंडो (सकाळी 10:15 ते 11:30 आणि दुपारी 13:30 नंतर)
+        is_morning = ("10:15" <= hhmm <= "11:30")
+        is_afternoon = ("13:15" <= hhmm <= "14:45")
 
         if (active_trade is None) and (is_morning or is_afternoon):
             spot_info = spot_records.get(ts_pd)
@@ -281,12 +256,10 @@ def run_harvest_pnl_engine():
             ema20 = spot_info["ema20"]
             dist_vwap = spot_info["dist_vwap"]
 
-            # १. डिस्टन्स एक्सटेंशन फिल्टर (Exhaustion / Over-stretched Filter)
-            # जर भाव VWAP पासून > ७५ पॉईंट्स दूर असेल, तर नवीन ट्रेड न घेणे (ट्रॅप रोखणे)
-            if abs(dist_vwap) > 75.0:
+            # ओव्हर-एक्सटेंशन फिल्टर (VWAP पासून > 65 पॉईंट्स दूर असताना नवीन ट्रेड नाही)
+            if abs(dist_vwap) > 65.0:
                 continue
 
-            # २. रिअल-टाईम PCR गणना
             pe_oi_sum = snap[snap["option_type"] == "PE"]["oi"].sum()
             ce_oi_sum = snap[snap["option_type"] == "CE"]["oi"].sum()
             pcr = round(pe_oi_sum / (ce_oi_sum if ce_oi_sum > 0 else 1.0), 2)
@@ -294,7 +267,7 @@ def run_harvest_pnl_engine():
             allowed_side = None
             if cur_spot > vwap and cur_spot > ema20 and pcr >= 0.95:
                 allowed_side = "CE"
-            elif cur_spot < vwap and cur_spot < ema20 and pcr <= 0.85:
+            elif cur_spot < vwap and cur_spot < ema20 and pcr <= 0.80:
                 allowed_side = "PE"
 
             if not allowed_side:
@@ -304,19 +277,18 @@ def run_harvest_pnl_engine():
             atm_candidates = snap[(snap["strike"] == atm_strike) & (snap["option_type"] == allowed_side)]
 
             for _, row in atm_candidates.iterrows():
-                if not (70.0 <= row["close"] <= 320.0):
+                if not (75.0 <= row["close"] <= 300.0):
                     continue
 
                 c_range = row["high"] - row["low"]
                 c_body = abs(row["close"] - row["open"])
                 b_ratio = c_body / (c_range if c_range > 0 else 1e-9)
 
-                has_vol = row["vol_ratio"] >= 1.15
-                is_range_exp = c_range >= (1.10 * row["atr14"])
+                has_vol = row["vol_ratio"] >= 1.20
                 is_solid = b_ratio >= 0.40
                 has_oi_buildup = row["change_oi"] >= 0
 
-                if (has_vol or is_range_exp) and is_solid and (row["close"] > row["open"]) and has_oi_buildup:
+                if has_vol and is_solid and (row["close"] > row["open"]) and has_oi_buildup:
                     entry_opt_price = float(row["close"])
                     opt_sl_pts = MIN_OPT_SL_PTS
                     opt_target_pts = opt_sl_pts * 2.0
@@ -333,11 +305,6 @@ def run_harvest_pnl_engine():
                         "oi": int(row["oi"]),
                         "change_oi": int(row["change_oi"]),
                     }
-
-                    if is_morning:
-                        morning_trades += 1
-                    else:
-                        afternoon_trades += 1
                     break
 
     df_all = pd.DataFrame(all_trades)
@@ -356,33 +323,15 @@ def run_harvest_pnl_engine():
         print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}\n", flush=True)
         print("📋 चार्ट लेव्हल्स, PCR व OI आकडेवारी:", flush=True)
 
-        tg_lines = [
-            f"📊 <b>NIFTY ALGO निकाल ({target_date}) [High-Accuracy Mode]</b>\n",
-            f"🔹 एकूण ट्रेड्स: <b>{total_trades}</b> (जिंकले: {wins}, तोटा: {losses}) | Win Rate: <b>{win_rate:.1f}%</b>",
-            f"💰 निव्वळ नफा (Net PnL): <b>₹ {net_total:+,.2f}</b>\n",
-            "📋 <b>ट्रेड तपशील:</b>\n",
-        ]
-
         for idx, tr in df_all.iterrows():
             print(f"{idx + 1}. {tr['side']} | {tr['symbol']}", flush=True)
             print(f"   🎯 NIFTY Spot: {tr['spot_px']} | वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
             print(f"   📈 PCR: {tr['pcr']:.2f} | OI: {tr['oi']:,} | ΔOI: {tr['change_oi']:+,}", flush=True)
             print(f"   💵 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
             print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:+,.2f} ({tr['exit_reason']})\n", flush=True)
-
-            tg_lines.append(
-                f"{idx + 1}. <b>{tr['side']}</b> | <code>{tr['symbol']}</code>\n"
-                f"   📍 Spot: <code>{tr['spot_px']}</code> | ⏱️ <code>{tr['entry_time']} ➡️ {tr['exit_time']}</code>\n"
-                f"   📈 PCR: <b>{tr['pcr']:.2f}</b> | OI: <b>{tr['oi']:,}</b> (ΔOI: <b>{tr['change_oi']:+,}</b>)\n"
-                f"   🎯 Buy: <code>₹{tr['entry_px']:.2f}</code> | 🛑 SL: <code>₹{tr['sl_px']:.2f}</code> | 🏁 TRG: <code>₹{tr['trg_px']:.2f}</code>\n"
-                f"   📊 पॉईंट्स: <b>{tr['pts_captured']:+.2f}</b> | PnL: <b>₹ {tr['net_pnl']:+,.2f}</b> ({tr['exit_reason']})\n"
-            )
-
         print("=" * 80, flush=True)
-        send_telegram("\n".join(tg_lines))
     else:
         print("ℹ️ उच्च अचूकता नियमांनुसार आज कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
-
 
 if __name__ == "__main__":
     run_harvest_pnl_engine()
