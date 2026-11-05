@@ -15,6 +15,7 @@ TOTP_KEY = os.environ.get("UPSTOX_TOTP_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+
 def send_telegram_msg(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -27,7 +28,8 @@ def send_telegram_msg(msg: str):
         }
         requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Telegram alert fail: {e}")
+        print(f"Telegram alert fail: {e}", flush=True)
+
 
 def get_auth_code_via_headless():
     auth_dialog_url = (
@@ -68,36 +70,52 @@ def get_auth_code_via_headless():
         except Exception:
             pass
 
-        # 2. OTP
+        # 2. OTP Input
         totp = pyotp.TOTP(TOTP_KEY)
         otp = totp.now()
         otp_selector = '#otpNum, input[name="otp"], input[type="number"], input[inputmode="numeric"]'
         page.wait_for_selector(otp_selector, timeout=30000)
-        page.locator(otp_selector).first.fill(otp)
+        
+        # काही वेळेस 6 स्वतंत्र इनपुट बॉक्स असतात तर काही वेळेस 1 बॉक्स
+        otp_inputs = page.locator(otp_selector)
+        if otp_inputs.count() == 6:
+            for idx, digit in enumerate(otp):
+                otp_inputs.nth(idx).fill(digit)
+        else:
+            otp_inputs.first.fill(otp)
+
         page.keyboard.press("Enter")
         try:
             page.locator('button:has-text("Continue"), button:has-text("Verify"), #verifyOtp').first.click(timeout=5000)
         except Exception:
             pass
 
-        # 3. PIN
+        # 3. 6-digit PIN Input
         pin_selector = '#pinCode, input[type="password"], input[name="pin"]'
         page.wait_for_selector(pin_selector, timeout=30000)
-        page.locator(pin_selector).first.fill(PIN)
+        
+        pin_inputs = page.locator(pin_selector)
+        if pin_inputs.count() == 6:
+            for idx, digit in enumerate(PIN):
+                pin_inputs.nth(idx).fill(digit)
+        else:
+            pin_inputs.first.fill(PIN)
+
         page.keyboard.press("Enter")
         try:
             page.locator('button:has-text("Continue"), button:has-text("Login"), #pinContinueBtn').first.click(timeout=5000)
         except Exception:
             pass
 
-        # 4. Wait for code
-        for _ in range(30):
+        # 4. Wait for redirect code
+        for _ in range(40):
             if captured_code:
                 break
             page.wait_for_timeout(500)
 
         browser.close()
         return captured_code
+
 
 def fetch_access_token(auth_code):
     token_url = "https://api.upstox.com/v2/login/authorization/token"
@@ -119,6 +137,7 @@ def fetch_access_token(auth_code):
         print(f"[-] Token Exchange Failed: {res.text}", flush=True)
         return None
 
+
 if __name__ == "__main__":
     try:
         code = get_auth_code_via_headless()
@@ -129,8 +148,20 @@ if __name__ == "__main__":
         token = fetch_access_token(code)
         if token:
             print("✅ Navin Upstox Access Token milala!", flush=True)
-            with open("token.txt", "w") as f:
-                f.write(token)
+
+            # दोन्ही फाईल्समध्ये सेव्ह करणे जेणेकरून कोणतीही स्क्रिप्ट फेल होणार नाही
+            with open("ACCESS_TOKEN.txt", "w", encoding="utf-8") as f:
+                f.write(token.strip())
+            with open("token.txt", "w", encoding="utf-8") as f:
+                f.write(token.strip())
+
+            # GitHub Actions Environment मध्ये एक्सपोर्ट करणे
+            github_env = os.environ.get("GITHUB_ENV")
+            if github_env and os.path.exists(github_env):
+                with open(github_env, "a", encoding="utf-8") as env_file:
+                    env_file.write(f"\nUPSTOX_ACCESS_TOKEN={token.strip()}\n")
+                print("[+] Token injected into GITHUB_ENV", flush=True)
+
             send_telegram_msg("🚀 *Upstox Alert:* Navin Access Token sakali यशस्वीरीत्या generate zala aahe! Bot ready aahe.")
         else:
             send_telegram_msg("❌ *Upstox Alert:* Token Exchange fail zale!")
