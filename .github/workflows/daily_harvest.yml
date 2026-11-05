@@ -2,7 +2,7 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '15 3 * * 1-5'
+    - cron: '15 3 * * 1-5'  # Somvar te Shukravar 03:15 UTC (8:45 AM IST)
   workflow_dispatch:
 
 jobs:
@@ -30,18 +30,26 @@ jobs:
           UPSTOX_MOBILE: ${{ secrets.UPSTOX_MOBILE }}
           UPSTOX_PIN: ${{ secrets.UPSTOX_PIN }}
           UPSTOX_TOTP_KEY: ${{ secrets.UPSTOX_TOTP_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python -u get_token_auto.py
-          if [ -f ACCESS_TOKEN.txt ]; then
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             TOKEN_VAL=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
-            echo "✅ Token successfully written to GITHUB_ENV"
+            echo "✅ Auto-generated Token written to GITHUB_ENV"
           else
-            echo "[-] ACCESS_TOKEN.txt not found after generation step"
+            echo "[-] ACCESS_TOKEN.txt empty or missing, fallback to Secrets"
           fi
 
       - name: Run Harvester
-        run: python -u harvester.py
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        run: |
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
+            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          fi
+          python -u harvester.py
 
       - name: Inspect Vault Data
         run: |
@@ -59,11 +67,16 @@ jobs:
           conn.close()
           "
 
-      - name: Run Signal Test
+      - name: Run Signal Test (Yesterday Report)
         env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -u test_yesterday_signals.py
+        run: |
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
+            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          fi
+          python -u test_yesterday_signals.py
 
       - name: Upload Harvested DB Artifact
         if: always()
@@ -74,13 +87,24 @@ jobs:
 
       - name: Run Live Paper Trader Engine
         env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ -z "$UPSTOX_ACCESS_TOKEN" ] && [ -f ACCESS_TOKEN.txt ]; then
-            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
+            FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+            if [ -n "$FILE_TOKEN" ]; then
+              export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
+            fi
           fi
+
           echo "Token ready for Live Engine. Length: ${#UPSTOX_ACCESS_TOKEN}"
+
+          if [ -z "$UPSTOX_ACCESS_TOKEN" ]; then
+            echo "❌ Error: Token sapadla nahi!"
+            exit 1
+          fi
+
           python -u live_engine.py
 
       - name: Upload Live Trade Journal Artifact
