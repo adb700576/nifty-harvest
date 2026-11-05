@@ -14,11 +14,28 @@ import numpy as np
 BASE_URL = "https://api.upstox.com"
 
 def fetch_token() -> str:
+    """टोकन एन्व्हायर्नमेंट किंवा सर्व संभाव्य फाईल पाथवरून शोधणे"""
     token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
-    if not token and os.path.exists("ACCESS_TOKEN.txt"):
-        with open("ACCESS_TOKEN.txt", "r", encoding="utf-8") as f:
-            token = f.read().strip()
-    return token
+    if token:
+        return token
+
+    possible_paths = [
+        "ACCESS_TOKEN.txt",
+        Path(__file__).resolve().parent / "ACCESS_TOKEN.txt",
+        Path.cwd() / "ACCESS_TOKEN.txt"
+    ]
+
+    for p in possible_paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    print(f"[+] Token successfully loaded from file: {p}", flush=True)
+                    return content
+            except Exception as e:
+                print(f"[-] Could not read {p}: {e}", flush=True)
+    return ""
 
 TOKEN = fetch_token()
 
@@ -27,7 +44,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
 MIN_OPT_SL_PTS = 12.0
-TARGET_RRR = 2.0  # 1:2 RRR (२४ पॉईंट्स टार्गेट)
+TARGET_RRR = 2.0  # 1:2 RRR (२४ पॉईंट्स)
 POLL_INTERVAL = 1.0  # १ सेकंद टिक ट्रॅकिंग
 STRATEGY_INTERVAL = 30.0  # ३० सेकंद सेटअप स्कॅनिंग
 
@@ -242,7 +259,7 @@ class LivePaperTrader:
             send_telegram(f"🔒 <b>दैनिक टार्गेट पूर्ण!</b>\nलक्ष्यांक (₹{self.cumulative_pnl:,.2f}) पूर्ण झाला. आजचे नवीन ट्रेड्स थांबवले आहेत.")
         elif self.cumulative_pnl <= DAILY_MAX_LOSS:
             self.daily_locked = True
-            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{self.cumulative_pnl:,.2f}) छू झाली. सिस्टीम बंद केली आहे.")
+            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{self.cumulative_pnl:,.2f}) आली आहे. सिस्टीम बंद केली आहे.")
 
         self.active_position = None
         self.cooldown_until = time.monotonic() + 900
