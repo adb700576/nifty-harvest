@@ -7,7 +7,7 @@ DB_PATH = "nifty_vault.db"
 BASE_URL = "https://api.upstox.com"
 ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN") or ""
 if not ACCESS_TOKEN and os.path.exists("ACCESS_TOKEN.txt"):
-    with open("ACCESS_TOKEN.txt", "r") as f:
+    with open("ACCESS_TOKEN.txt", "r", encoding="utf-8") as f:
         ACCESS_TOKEN = f.read().strip()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -18,7 +18,9 @@ MIN_OPT_SL_PTS = 12.0
 DAILY_PROFIT_GOAL = 450.0  # ₹450+ नफा झाला की दिवस ग्रीनमध्ये लॉक (Capital Protection)
 
 def send_telegram(text: str):
+    """टेलिग्रामवर थेट निकाल पाठवणे आणि एरर तपासणे"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[-] Telegram Credentials गहाळ आहेत (TELEGRAM_BOT_TOKEN किंवा TELEGRAM_CHAT_ID नाही).", flush=True)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -27,9 +29,13 @@ def send_telegram(text: str):
         "parse_mode": "HTML"
     }
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            print("[+] टेलिग्रामवर निकाल यशस्वीरीत्या पाठवला!", flush=True)
+        else:
+            print(f"[-] Telegram API Error ({r.status_code}): {r.text}", flush=True)
+    except Exception as e:
+        print(f"[-] Telegram Request Exception: {e}", flush=True)
 
 def get_upstox_charges(instrument_token: str, quantity: int, buy_price: float, sell_price: float) -> dict:
     url = f"{BASE_URL}/v2/charges/brokerage"
@@ -169,7 +175,6 @@ def run_harvest_pnl_engine():
         hhmm = ts_pd.strftime("%H:%M")
         snap = df_data[df_data["dt"] == ts_pd]
 
-        # चालू पोझिशन व्यवस्थापन
         if active_trade:
             curr_match = snap[snap["symbol"] == active_trade["symbol"]]
             if not curr_match.empty:
@@ -177,11 +182,9 @@ def run_harvest_pnl_engine():
                 exit_p, exit_reason = None, ""
                 max_gain = bar["high"] - active_trade["entry_price"]
 
-                # डी-रिस्किंग: +8 पॉईंट्सवर स्टॉपलॉस कॉस्टवर
                 if max_gain >= 8.0:
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], active_trade["entry_price"])
 
-                # ट्रेलिंग
                 if max_gain >= 14.0:
                     trailing_level = bar["close"] - 6.0
                     active_trade["opt_sl"] = max(active_trade["opt_sl"], trailing_level)
@@ -227,7 +230,6 @@ def run_harvest_pnl_engine():
                         "exit_reason": exit_reason,
                     })
 
-                    # कॅपिटल प्रोटेक्शन नियम: नफा मिळताच दिवस लॉक करणे
                     if realized_net_pnl >= DAILY_PROFIT_GOAL:
                         daily_locked = True
                         print(f"🔒 [PROFIT LOCK] दिवस नफ्यात लॉक केला (₹{realized_net_pnl:+,.2f})! पुढील ट्रेड्स थांबवले.", flush=True)
@@ -242,7 +244,6 @@ def run_harvest_pnl_engine():
         if cooldown_until and ts_pd < cooldown_until:
             continue
 
-        # केवळ हाय-प्रोबॅबिलिटी टाईम विंडो (सकाळी 10:15 ते 11:30 आणि दुपारी 13:30 नंतर)
         is_morning = ("10:15" <= hhmm <= "11:30")
         is_afternoon = ("13:15" <= hhmm <= "14:45")
 
@@ -256,7 +257,6 @@ def run_harvest_pnl_engine():
             ema20 = spot_info["ema20"]
             dist_vwap = spot_info["dist_vwap"]
 
-            # ओव्हर-एक्सटेंशन फिल्टर (VWAP पासून > 65 पॉईंट्स दूर असताना नवीन ट्रेड नाही)
             if abs(dist_vwap) > 65.0:
                 continue
 
@@ -319,16 +319,39 @@ def run_harvest_pnl_engine():
         net_total = df_all["net_pnl"].sum()
         win_rate = (wins / total_trades) * 100
 
+        # कन्सोल प्रिंट
         print(f"🔹 एकूण ट्रेड्स: {total_trades} (जिंकले: {wins}, तोटा: {losses}) | Win Rate: {win_rate:.1f}%", flush=True)
         print(f"💰 निव्वळ नफा (Net PnL): ₹ {net_total:+,.2f}\n", flush=True)
-        print("📋 चार्ट लेव्हल्स, PCR व OI आकडेवारी:", flush=True)
+
+        # टेलिग्रामसाठी HTML मेसेज तयार करणे
+        tg_msg = (
+            f"📊 <b>NIFTY ALGO बॅकटेस्ट निकाल ({target_date})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔹 <b>एकूण ट्रेड्स:</b> {total_trades} (जिंकले: {wins}, तोटा: {losses})\n"
+            f"🎯 <b>Win Rate:</b> {win_rate:.1f}%\n"
+            f"💰 <b>निव्वळ नफा (Net PnL):</b> <b>₹ {net_total:+,.2f}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+        )
 
         for idx, tr in df_all.iterrows():
+            trade_row = (
+                f"{idx + 1}. <b>{tr['side']}</b> | <code>{tr['symbol']}</code>\n"
+                f"   🎯 Spot: {tr['spot_px']} | वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}\n"
+                f"   📈 PCR: {tr['pcr']:.2f} | ΔOI: {tr['change_oi']:+,}\n"
+                f"   💵 Entry: ₹{tr['entry_px']:.2f} ➡️ Exit: ₹{tr['exit_px']:.2f}\n"
+                f"   📊 पॉईंट्स: <b>{tr['pts_captured']:+.2f}</b> | PnL: <b>₹{tr['net_pnl']:+,.2f}</b> ({tr['exit_reason']})\n\n"
+            )
+            tg_msg += trade_row
             print(f"{idx + 1}. {tr['side']} | {tr['symbol']}", flush=True)
             print(f"   🎯 NIFTY Spot: {tr['spot_px']} | वेळ: {tr['entry_time']} ➡️ {tr['exit_time']}", flush=True)
             print(f"   📈 PCR: {tr['pcr']:.2f} | OI: {tr['oi']:,} | ΔOI: {tr['change_oi']:+,}", flush=True)
             print(f"   💵 Entry: ₹{tr['entry_px']:.2f} | 🛑 SL: ₹{tr['sl_px']:.2f} | 🏁 TRG: ₹{tr['trg_px']:.2f} | Exit: ₹{tr['exit_px']:.2f}", flush=True)
             print(f"   📊 पॉईंट्स: {tr['pts_captured']:+.2f} | Net PnL: ₹{tr['net_pnl']:+,.2f} ({tr['exit_reason']})\n", flush=True)
+
+        tg_msg += "🔒 <i>कॅपिटल प्रोटेक्शन: दैनिक उद्दिष्ट पूर्ण झाल्याने दिवस नफ्यात लॉक केला.</i>"
+        
+        # थेट टेलिग्रामवर पाठवणे
+        send_telegram(tg_msg)
         print("=" * 80, flush=True)
     else:
         print("ℹ️ उच्च अचूकता नियमांनुसार आज कोणताही ट्रेड ट्रिगर झाला नाही.", flush=True)
