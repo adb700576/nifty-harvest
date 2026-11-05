@@ -19,7 +19,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests pandas numpy pytz urllib3 pyotp playwright
+          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl
           playwright install --with-deps chromium
 
       - name: Auto-Generate Fresh Upstox Token
@@ -33,25 +33,22 @@ jobs:
         run: python -u get_token_auto.py
 
       - name: Run Harvester
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -u harvester.py
+        run: |
+          if [ -f ACCESS_TOKEN.txt ]; then
+            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          fi
+          python -u harvester.py
 
       - name: Inspect Vault Data
         run: |
           python -u -c "
-          import os, sqlite3, pandas as pd
-          if not os.path.exists('nifty_vault.db'):
-              print('[-] nifty_vault.db फाईल सापडली नाही.')
-              exit(1)
-
+          import sqlite3, pandas as pd
           conn = sqlite3.connect('nifty_vault.db')
-          cursor = conn.cursor()
-          cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='nifty_options_1m'\")
-          if cursor.fetchone():
-              print('\n========== स्ट्राइकनिहाय सारांश ==========\n')
-              df_sum = pd.read_sql_query('SELECT symbol, option_type, strike, COUNT(*) as candles, MIN(open) as min_p, MAX(high) as max_p, AVG(iv) as avg_iv, AVG(delta) as avg_delta FROM nifty_options_1m GROUP BY symbol ORDER BY strike, option_type', conn)
+          cur = conn.cursor()
+          cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='nifty_options_1m'\")
+          if cur.fetchone():
+              print('\n========== स्ट्राइकनिहाय सारांश ==========')
+              df_sum = pd.read_sql_query('SELECT symbol, option_type, strike, COUNT(*) as candles, MIN(open) as min_p, MAX(close) as max_p, AVG(iv) as avg_iv, AVG(delta) as avg_delta FROM nifty_options_1m GROUP BY symbol', conn)
               print(df_sum.to_string(index=False))
           else:
               print('[!] टेबल nifty_options_1m अद्याप तयार झालेले नाही.')
@@ -62,7 +59,11 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -u test_yesterday_signals.py
+        run: |
+          if [ -f ACCESS_TOKEN.txt ]; then
+            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          fi
+          python -u test_yesterday_signals.py
 
       - name: Upload Harvested DB Artifact
         if: always()
@@ -70,12 +71,16 @@ jobs:
         with:
           name: harvested-nifty-vault
           path: nifty_vault.db
+
       - name: Run Live Paper Trader Engine
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -u live_engine.py
+        run: |
+          if [ -f ACCESS_TOKEN.txt ]; then
+            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+          fi
+          python -u live_engine.py
 
       - name: Upload Live Trade Journal Artifact
         if: always()
