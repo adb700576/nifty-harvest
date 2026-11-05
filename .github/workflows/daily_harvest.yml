@@ -30,14 +30,18 @@ jobs:
           UPSTOX_MOBILE: ${{ secrets.UPSTOX_MOBILE }}
           UPSTOX_PIN: ${{ secrets.UPSTOX_PIN }}
           UPSTOX_TOTP_KEY: ${{ secrets.UPSTOX_TOTP_KEY }}
-        run: python -u get_token_auto.py
+        run: |
+          python -u get_token_auto.py
+          if [ -f ACCESS_TOKEN.txt ]; then
+            TOKEN_VAL=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+            echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
+            echo "✅ Token successfully written to GITHUB_ENV"
+          else
+            echo "[-] ACCESS_TOKEN.txt not found after generation step"
+          fi
 
       - name: Run Harvester
-        run: |
-          if [ -f ACCESS_TOKEN.txt ]; then
-            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-          fi
-          python -u harvester.py
+        run: python -u harvester.py
 
       - name: Inspect Vault Data
         run: |
@@ -59,11 +63,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -f ACCESS_TOKEN.txt ]; then
-            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-          fi
-          python -u test_yesterday_signals.py
+        run: python -u test_yesterday_signals.py
 
       - name: Upload Harvested DB Artifact
         if: always()
@@ -77,9 +77,10 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          if [ -f ACCESS_TOKEN.txt ]; then
+          if [ -z "$UPSTOX_ACCESS_TOKEN" ] && [ -f ACCESS_TOKEN.txt ]; then
             export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
           fi
+          echo "Token ready for Live Engine. Length: ${#UPSTOX_ACCESS_TOKEN}"
           python -u live_engine.py
 
       - name: Upload Live Trade Journal Artifact
