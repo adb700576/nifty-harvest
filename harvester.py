@@ -55,10 +55,7 @@ def init_db():
 def get_nifty_spot_history(target_date: str):
     print(f"🌾 [Vault Harvester] {target_date} चा डेटा गोळा करण्याचे काम सुरू होत आहे...", flush=True)
 
-    # NIFTY 50 चे अधिकृत Upstox की एन्कोडिंग (NSE_INDEX|Nifty 50 -> NSE_INDEX%7CNifty%2050)
     instrument_key = urllib.parse.quote("NSE_INDEX|Nifty 50")
-    
-    # Upstox V2 API मध्ये पाथ: /1minute/{to_date}/{from_date} असा असतो
     url = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{target_date}/{target_date}"
     headers = {"Accept": "application/json"}
     if ACCESS_TOKEN:
@@ -70,7 +67,6 @@ def get_nifty_spot_history(target_date: str):
     if res.status_code == 200:
         candles = res.json().get("data", {}).get("candles", [])
 
-    # जर एकाच दिवसाचा पाथ रिकामा आला तर सिंगल डेट पाथ ट्राय करणे
     if not candles:
         url_alt = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{target_date}"
         res_alt = requests.get(url_alt, headers=headers, timeout=15)
@@ -86,7 +82,6 @@ def get_nifty_spot_history(target_date: str):
     spot_close_latest = float(candles[0][4])
 
     for c in candles:
-        # Upstox: [timestamp, open, high, low, close, volume, oi]
         cur.execute("""
             INSERT OR REPLACE INTO nifty_index_1m (timestamp, open, high, low, close, volume)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -102,10 +97,16 @@ def harvest_options_for_date(target_date: str, spot_price: float):
     contracts_url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
     print("[+] Options Instruments मास्टर डाऊनलोड होत आहे...", flush=True)
     try:
-        df_inst = pd.read_csv(contracts_url)
+        df_inst = pd.read_csv(contracts_url, compression="gzip", low_memory=False)
     except Exception as e:
         print(f"[-] Instruments लोड करता आले नाहीत: {e}", flush=True)
         return
+
+    # कॉलम नावे सुरक्षितरीत्या लहान अक्षरांमध्ये करणे
+    df_inst.columns = [str(c).strip().lower() for c in df_inst.columns]
+    
+    # KeyError 'trading_symbol' फिक्स:
+    sym_col = "tradingsymbol" if "tradingsymbol" in df_inst.columns else "trading_symbol"
 
     df_opt = df_inst[
         (df_inst["exchange"] == "NSE_FO") & 
@@ -120,8 +121,7 @@ def harvest_options_for_date(target_date: str, spot_price: float):
     df_opt["expiry"] = pd.to_datetime(df_opt["expiry"]).dt.strftime("%Y-%m-%d")
     valid_expiries = sorted([x for x in df_opt["expiry"].unique() if x >= target_date])
     if not valid_expiries:
-        print("[-] वैध आगामी एक्सपायरी सापडली नाही.", flush=True)
-        return
+        valid_expiries = sorted(df_opt["expiry"].unique(), reverse=True)
 
     active_expiry = valid_expiries[0]
     print(f"[+] [Expiry Selector] निवडलेली वैध आगामी एक्सपायरी: {active_expiry}", flush=True)
@@ -146,7 +146,9 @@ def harvest_options_for_date(target_date: str, spot_price: float):
     for _, row in df_target.iterrows():
         raw_key = row["instrument_key"]
         inst_key = urllib.parse.quote(str(raw_key))
-        sym = row["trading_symbol"]
+        
+        # सुरक्षितरीत्या सिम्बॉल वाचणे (KeyError टाळण्यासाठी)
+        sym = row.get(sym_col, row.get("symbol", str(raw_key)))
         strike = float(row["strike"])
         opt_type = row["option_type"]
 
