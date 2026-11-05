@@ -10,22 +10,21 @@ import requests
 import pandas as pd
 import numpy as np
 
-# ========================= कॉन्फिगरेशन व टोकन लोडर =========================
+# ========================= CONFIGURATION =========================
 BASE_URL = "https://api.upstox.com"
 
 def fetch_token() -> str:
-    """टोकन एन्व्हायर्नमेंट किंवा सर्व संभाव्य फाईल पाथवरून शोधणे"""
     token = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
     if token:
         return token
 
-    possible_paths = [
+    search_files = [
         "ACCESS_TOKEN.txt",
         Path(__file__).resolve().parent / "ACCESS_TOKEN.txt",
         Path.cwd() / "ACCESS_TOKEN.txt"
     ]
 
-    for p in possible_paths:
+    for p in search_files:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
@@ -44,16 +43,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 LOT_SIZE = 65
 MIN_OPT_SL_PTS = 12.0
-TARGET_RRR = 2.0  # 1:2 RRR (२४ पॉईंट्स)
-POLL_INTERVAL = 1.0  # १ सेकंद टिक ट्रॅकिंग
-STRATEGY_INTERVAL = 30.0  # ३० सेकंद सेटअप स्कॅनिंग
+TARGET_RRR = 2.0  # 1:2 RRR (24 points)
+POLL_INTERVAL = 1.0  # 1 second tick tracking
+STRATEGY_INTERVAL = 30.0  # 30 second setup scan
 
-DAILY_PROFIT_GOAL = 600.0   # दैनिक नफा लॉक मर्यादा (₹)
-DAILY_MAX_LOSS = -1500.0    # कमाल दैनिक तोटा मर्यादा (₹)
+DAILY_PROFIT_GOAL = 600.0   # Daily profit lock goal (Rs)
+DAILY_MAX_LOSS = -1500.0    # Daily max loss limit (Rs)
 
 SESSION_START = "09:20"
 ENTRY_END = "15:00"
 FORCE_EXIT = "15:20"
+MARKET_END = "15:30"
 
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
@@ -61,7 +61,7 @@ TODAY_STR = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strfti
 JOURNAL_CSV = JOURNAL_DIR / f"trades_journal_{TODAY_STR}.csv"
 
 
-# ========================= टेलिग्राम मेसेजिंग =========================
+# ========================= TELEGRAM MESSAGING =========================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[Telegram Disconnected] {text[:100]}...", flush=True)
@@ -86,7 +86,7 @@ def ts_now() -> str:
     return now_ist().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ========================= UPSTOX क्लायंट =========================
+# ========================= UPSTOX CLIENT =========================
 class UpstoxClient:
     def __init__(self, token: str):
         self.session = requests.Session()
@@ -141,7 +141,7 @@ class UpstoxClient:
             return []
 
 
-# ========================= लाईव्ह ट्रेडिंग इंजिन =========================
+# ========================= LIVE ENGINE =========================
 class LivePaperTrader:
     def __init__(self, api: UpstoxClient):
         self.api = api
@@ -163,9 +163,9 @@ class LivePaperTrader:
             nifty_opts["expiry"] = pd.to_datetime(nifty_opts["expiry"]).dt.strftime("%Y-%m-%d")
             valid = sorted([x for x in nifty_opts["expiry"].unique() if x >= TODAY_STR])
             self.expiry = valid[0]
-            print(f"[+] निवडलेली चालू एक्सपायरी: {self.expiry}", flush=True)
+            print(f"[+] Nivadleli chalu expiry: {self.expiry}", flush=True)
         except Exception as e:
-            print(f"[-] एक्सपायरी लोड एरर: {e}", flush=True)
+            print(f"[-] Expiry load error: {e}", flush=True)
             self.expiry = TODAY_STR
 
     def log_journal_csv(self, row: dict):
@@ -360,7 +360,7 @@ class LivePaperTrader:
                     break
 
 
-# ========================= मुख्य लूप =========================
+# ========================= MAIN LOOP =========================
 def main():
     global TOKEN
     if not TOKEN:
@@ -378,8 +378,17 @@ def main():
     last_strat = 0.0
     try:
         while True:
+            # 1. 03:30 PM la market close hotach safe exit
+            hhmm = now_ist().strftime("%H:%M")
+            if hhmm >= MARKET_END:
+                print(f"[*] {hhmm}: Market session sampla. Live Engine safe stop karat ahe...", flush=True)
+                send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे लाईव्ह ट्रेडिंग इंजिन पूर्ण झाले. ट्रेड जर्नल जतन केले आहे.")
+                break
+
+            # 2. Position Management (Every 1s)
             trader.check_position_management()
 
+            # 3. Setup Scan (Every 30s)
             if time.monotonic() - last_strat >= STRATEGY_INTERVAL:
                 trader.run_strategy_scan()
                 last_strat = time.monotonic()
@@ -387,7 +396,7 @@ def main():
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\n[!] मॅन्युअली थांबवले.", flush=True)
+        print("\n[!] Manually thambavle.", flush=True)
         send_telegram("⚠️ <b>NIFTY ALGO इंजिन: मॅन्युअली थांबवले</b>")
 
 
