@@ -46,10 +46,11 @@ MIN_OPT_SL_PTS = 12.0
 TARGET_RRR = 2.0  # 1:2 RRR (२४ पॉईंट्स)
 POLL_INTERVAL = 1.0  # १ सेकंद टिक ट्रॅकिंग
 STRATEGY_INTERVAL = 30.0  # ३० सेकंद सेटअप स्कॅन
-POSITION_UPDATE_INTERVAL = 180.0  # दर ३ मिनिटांनी (१८० सेकंद) लाईव्ह PnL अपडेट
+POSITION_UPDATE_INTERVAL = 180.0  # दर ३ मिनिटांनी लाईव्ह PnL अपडेट
 
 DAILY_PROFIT_GOAL = 1200.0   # दैनिक नफा लॉक मर्यादा (₹)
 DAILY_MAX_LOSS = -1500.0    # कमाल दैनिक तोटा मर्यादा (₹)
+MAX_CONSECUTIVE_LOSSES = 2   # सलग २ तोट्यांनंतर सर्किट ब्रेक
 
 SESSION_START = "09:20"
 ENTRY_END = "15:00"
@@ -131,11 +132,12 @@ class UpstoxClient:
         except Exception:
             return pd.DataFrame()
 
-    def get_official_pcr(self) -> float:
+    def get_official_pcr(self, expiry: str) -> Optional[float]:
+        """Upstox Official PCR API (सर्व Required Parameters सह)"""
         try:
             params = {
                 "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry": "current_week",
+                "expiry": expiry,
                 "date": TODAY_STR,
                 "bucket_interval": 15
             }
@@ -143,32 +145,39 @@ class UpstoxClient:
             data = res.get("data", {})
             insights = data.get("insights", [])
             if insights:
-                return round(float(insights[-1].get("pcr", data.get("pcr", 1.0))), 2)
-            return round(float(data.get("pcr", 1.0)), 2)
-        except Exception:
-            return 1.0
+                return round(float(insights[-1].get("pcr", data.get("pcr", 0.0))), 2)
+            val = data.get("pcr")
+            return round(float(val), 2) if val is not None else None
+        except Exception as e:
+            print(f"[-] PCR fetch fail: {e}", flush=True)
+            return None
 
-    def get_official_max_pain(self) -> Optional[float]:
+    def get_official_max_pain(self, expiry: str) -> Optional[float]:
+        """Upstox Official Max Pain API (सर्व Required Parameters सह)"""
         try:
             params = {
                 "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry": "current_week",
+                "expiry": expiry,
                 "date": TODAY_STR,
                 "bucket_interval": 15
             }
             res = self.get("/v2/market/max-pain", params=params)
             data = res.get("data", {})
-            return float(data.get("max_pain", 0.0))
-        except Exception:
+            val = data.get("max_pain")
+            return float(val) if val is not None else None
+        except Exception as e:
+            print(f"[-] Max Pain fetch fail: {e}", flush=True)
             return None
 
-    def get_strike_oi_and_change(self, target_strike: float) -> tuple[int, int, int, int]:
-        call_oi, put_oi = 0, 0
-        call_chg, put_chg = 0, 0
+    def get_strike_oi_and_change(self, expiry: str, target_strike: float) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+        """Upstox Official OI & Change in OI API (स्ट्राइक पातळीवर)"""
+        call_oi, put_oi = None, None
+        call_chg, put_chg = None, None
         try:
+            # 1. Total OI
             res_oi = self.get("/v2/market/oi", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry": "current_week",
+                "expiry": expiry,
                 "date": TODAY_STR
             })
             for item in res_oi.get("data", {}).get("call_put_oi_data_list", []):
@@ -177,9 +186,10 @@ class UpstoxClient:
                     put_oi = int(item.get("put_oi", 0))
                     break
 
+            # 2. Change in OI (Required interval=1)
             res_chg = self.get("/v2/market/change-oi", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry": "current_week",
+                "expiry": expiry,
                 "date": TODAY_STR,
                 "interval": 1
             })
@@ -188,20 +198,10 @@ class UpstoxClient:
                     call_chg = int(item.get("call_change_oi", 0))
                     put_chg = int(item.get("put_change_oi", 0))
                     break
-        except Exception:
-            pass
-        return call_oi, put_oi, call_chg, put_chg
+        except Exception as e:
+            print(f"[-] OI / Change in OI fetch fail: {e}", flush=True)
 
-    def get_option_chain(self, expiry: str) -> list[dict]:
-        try:
-            # प्रथम थेट चालू वीकली कीवर्ड ट्राय करणे
-            data = self.get("/v2/option/chain", {
-                "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry_date": expiry
-            })
-            return data.get("data", [])
-        except Exception:
-            return []
+        return call_oi, put_oi, call_chg, put_chg
 
 
 # ========================= लाईव्ह ट्रेडिंग इंजिन =========================
@@ -211,14 +211,15 @@ class LivePaperTrader:
         self.active_position = None
         self.trade_counter = 0
         self.cumulative_pnl = 0.0
+        self.consecutive_losses = 0
         self.cooldown_until = None
         self.daily_locked = False
         self.expiry = None
         self.contracts_cache = {}
+        self.failed_strikes = {}  # {strike: unblock_timestamp}
         self.load_expiry_and_contracts()
 
     def load_expiry_and_contracts(self):
-        """चालू एक्सपायरी आणि संपूर्ण ऑप्शन कॉन्ट्रॅक्ट्स अचूक मॅप करणे"""
         try:
             url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
             df = pd.read_csv(url, compression="gzip", low_memory=False)
@@ -266,12 +267,12 @@ class LivePaperTrader:
             f"🛑 <b>स्टॉपलॉस (SL):</b> <code>₹{pos['sl_px']:.2f}</code> (-{MIN_OPT_SL_PTS:.1f} pts)\n"
             f"🏁 <b>टार्गेट (TRG 1:2):</b> <code>₹{pos['trg_px']:.2f}</code> (+{MIN_OPT_SL_PTS*TARGET_RRR:.1f} pts)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 <b>एन्ट्री तपशील व कारणे:</b>\n"
+            f"📋 <b>संस्थात्मक कन्फर्मेशन:</b>\n"
             f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (VWAP: {pos['vwap']:.1f} | EMA: {pos['ema20']:.1f})\n"
-            f"📊 <b>PCR:</b> <code>{pos['pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
+            f"📊 <b>Official PCR:</b> <code>{pos['pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
             f"📈 <b>स्ट्राइक OI:</b> <code>{pos['strike_oi']:,}</code> | <b>ΔOI:</b> <code>{pos['change_oi']:+,}</code>\n"
             f"⏱️ <b>वेळ:</b> <code>{pos['entry_time']}</code>\n"
-            f"💡 <i>कन्फर्मेशन: VWAP + PCR + MaxPain + ΔOI Confluence</i>"
+            f"💡 <i>कन्फर्मेशन: Strict Multi-Pillar Confluence Validated</i>"
         )
         send_telegram(msg)
 
@@ -360,12 +361,25 @@ class LivePaperTrader:
         self.send_exit_alert(pos)
         self.log_journal_csv(pos)
 
+        # १. सलग तोटा व स्ट्राइक ब्लॅकलिस्ट लॉजिक
+        if net_pnl < 0:
+            self.consecutive_losses += 1
+            # ज्या स्ट्राइकवर तोटा झाला ती ४५ मिनिटे ब्लॉक करा
+            self.failed_strikes[pos["strike"]] = time.monotonic() + 2700
+            print(f"[!] स्ट्राइक {pos['strike']} ४५ मिनिटांसाठी ब्लॅकलिस्ट केली.", flush=True)
+        else:
+            self.consecutive_losses = 0
+
+        # २. सुरक्षा सर्किट ब्रेकर
         if self.cumulative_pnl >= DAILY_PROFIT_GOAL:
             self.daily_locked = True
             send_telegram(f"🔒 <b>दैनिक टार्गेट पूर्ण!</b>\nलक्ष्यांक (₹{self.cumulative_pnl:,.2f}) पूर्ण झाला. आजचे नवीन ट्रेड्स थांबवले आहेत.")
         elif self.cumulative_pnl <= DAILY_MAX_LOSS:
             self.daily_locked = True
             send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{self.cumulative_pnl:,.2f}) आली आहे. सिस्टीम बंद केली आहे.")
+        elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            self.daily_locked = True
+            send_telegram(f"🔒 <b>कॅपिटल प्रोटेक्शन लॉक:</b>\nसलग २ स्टॉपलॉस हिट झाल्याने आजचे उर्वरित ट्रेडिंग पूर्णपणे थांबवले आहे.")
 
         self.active_position = None
         self.cooldown_until = time.monotonic() + 900
@@ -382,7 +396,7 @@ class LivePaperTrader:
         pos["peak_price"] = max(pos["peak_price"], ltp)
         gain = ltp - pos["entry_px"]
 
-        # डी-रिस्किंग: +१२ पॉईंट्सवर स्टॉपलॉस खरेदी किमतीवर (Cost-to-Cost)
+        # डी-रिस्किंग: +१२ पॉईंट्सवर स्टॉपलॉस थेट खरेदी भावावर आणणे
         if gain >= 12.0 and pos["sl_px"] < pos["entry_px"]:
             pos["sl_px"] = pos["entry_px"]
             send_telegram(f"🛡️ <b>SL कॉस्टवर आणला (₹{pos['entry_px']:.2f})</b> | ट्रेड #{pos['trade_id']} ({pos['clean_name']})")
@@ -398,7 +412,7 @@ class LivePaperTrader:
             self.send_periodic_update(pos, ltp)
             pos["last_periodic_update"] = time.monotonic()
 
-        # इन्स्टंट एक्झिट (SL / Target / Force EOD)
+        # प्रत्यक्ष एक्झिट
         hhmm = now_ist().strftime("%H:%M")
         if ltp <= pos["sl_px"]:
             reason = "TRAILED_EXIT ✅" if pos["sl_px"] >= pos["entry_px"] else "SL_HIT ❌"
@@ -432,33 +446,51 @@ class LivePaperTrader:
         vwap = float(last_bar["vwap"])
         ema20 = float(last_bar["ema20"])
 
-        # ओव्हर-एक्सटेंशन टाळणे
+        # ओव्हर-एक्सटेंशन फिल्टर (FOMO टाळणे)
         if abs(spot_px - vwap) > 75.0:
             return
 
-        pcr = self.api.get_official_pcr()
-        max_pain = self.api.get_official_max_pain()
+        # Upstox Official Derivative APIs कडून थेट डेटा
+        pcr = self.api.get_official_pcr(self.expiry)
+        max_pain = self.api.get_official_max_pain(self.expiry)
+
+        # डेटा व्हॅलिडेशन: जर API फेल असेल तर ट्रेड ब्लॉक
+        if pcr is None or max_pain is None:
+            return
 
         signal_side = None
         if spot_px > vwap and spot_px > ema20 and pcr >= 0.95:
-            if max_pain is None or spot_px >= (max_pain - 100.0):
+            if spot_px >= (max_pain - 100.0):
                 signal_side = "CE"
         elif spot_px < vwap and spot_px < ema20 and pcr <= 0.85:
-            if max_pain is None or spot_px <= (max_pain + 100.0):
+            if spot_px <= (max_pain + 100.0):
                 signal_side = "PE"
 
         if not signal_side:
             return
 
         atm_strike = round(spot_px / 50.0) * 50.0
-        call_oi, put_oi, call_chg, put_chg = self.api.get_strike_oi_and_change(atm_strike)
+
+        # स्ट्राइक ब्लॅकलिस्ट तपासणे (४५ मिनिटांचा कूलडाउन)
+        if atm_strike in self.failed_strikes:
+            if time.monotonic() < self.failed_strikes[atm_strike]:
+                return
+            else:
+                del self.failed_strikes[atm_strike]
+
+        call_oi, put_oi, call_chg, put_chg = self.api.get_strike_oi_and_change(self.expiry, atm_strike)
+        
+        # डेटा व्हॅलिडेशन: जर OI डेटा मिळाला नाही तर ट्रेड ब्लॉक
+        if call_oi is None or call_chg is None:
+            return
+
         target_chg_oi = call_chg if signal_side == "CE" else put_chg
         target_strike_oi = call_oi if signal_side == "CE" else put_oi
 
-        if target_chg_oi < 0:
+        # अनवाइंडिंग असताना ट्रेड टाळणे आणि किमान लिक्विडिटी असणे
+        if target_chg_oi < 0 or target_strike_oi == 0:
             return
 
-        # कॅशमधून अचूक सिम्बॉल आणि इन्स्ट्रुमेंट की मिळवणे
         contract_info = self.contracts_cache.get((atm_strike, signal_side))
         if not contract_info:
             return
@@ -499,10 +531,10 @@ def main():
     send_telegram(
         f"🟢 <b>NIFTY ALGO इंजिन: सुरू झाले</b>\n"
         f"तारीख: <code>{TODAY_STR}</code>\n"
-        f"मोड: <b>Live Realtime Tracker (3-Min Ping Enabled)</b>\n"
-        f"अल्गो: <b>VWAP + PCR + MaxPain + Derivative APIs</b>"
+        f"मोड: <b>Live Institutional Tracker (Strict Validation)</b>\n"
+        f"सुरक्षा: <b>Max Loss Guard + 2-Loss Lock + Strike Cooldown</b>"
     )
-    print(f"[*] Engine Started with Complete Option Contract API for {TODAY_STR}...", flush=True)
+    print(f"[*] Engine Started with Strict Derivative Confluence for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
