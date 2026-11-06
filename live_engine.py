@@ -192,16 +192,15 @@ class UpstoxClient:
             pass
         return call_oi, put_oi, call_chg, put_chg
 
-    def get_option_contracts_metadata(self) -> list[dict]:
-        """Upstox अधिकृत /v2/option/contract एंडपॉइंटवरून अचूक नावे व की मिळवणे"""
+    def get_option_chain(self, expiry: str) -> list[dict]:
         try:
-            res = self.get("/v2/option/contract", {
+            # प्रथम थेट चालू वीकली कीवर्ड ट्राय करणे
+            data = self.get("/v2/option/chain", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry_date": "current_week"
+                "expiry_date": expiry
             })
-            return res.get("data", [])
-        except Exception as e:
-            print(f"[-] Contract metadata fetch fail: {e}", flush=True)
+            return data.get("data", [])
+        except Exception:
             return []
 
 
@@ -214,23 +213,39 @@ class LivePaperTrader:
         self.cumulative_pnl = 0.0
         self.cooldown_until = None
         self.daily_locked = False
+        self.expiry = None
         self.contracts_cache = {}
-        self.refresh_contracts()
+        self.load_expiry_and_contracts()
 
-    def refresh_contracts(self):
-        """स्ट्राइक आणि टाईपनुसार अचूक ट्रेडिंग सिम्बॉल्स लोड करणे"""
-        data = self.api.get_option_contracts_metadata()
-        for item in data:
-            strike = float(item.get("strike_price", 0))
-            itype = str(item.get("instrument_type", "")).upper()
-            sym = item.get("trading_symbol", "")
-            ikey = item.get("instrument_key", "")
-            if strike and itype and ikey:
-                self.contracts_cache[(strike, itype)] = {
-                    "trading_symbol": sym,
-                    "instrument_key": ikey
-                }
-        print(f"[+] {len(self.contracts_cache)} चालू आठवड्याचे ऑप्शन कॉन्ट्रॅक्ट्स अचूक मॅप झाले.", flush=True)
+    def load_expiry_and_contracts(self):
+        """चालू एक्सपायरी आणि संपूर्ण ऑप्शन कॉन्ट्रॅक्ट्स अचूक मॅप करणे"""
+        try:
+            url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+            df = pd.read_csv(url, compression="gzip", low_memory=False)
+            df.columns = [c.strip().lower() for c in df.columns]
+            sym_col = "tradingsymbol" if "tradingsymbol" in df.columns else "trading_symbol"
+
+            nifty_opts = df[(df["exchange"] == "NSE_FO") & (df["name"] == "NIFTY") & (df["instrument_type"] == "OPTIDX")].copy()
+            nifty_opts["expiry"] = pd.to_datetime(nifty_opts["expiry"]).dt.strftime("%Y-%m-%d")
+            valid = sorted([x for x in nifty_opts["expiry"].unique() if x >= TODAY_STR])
+            self.expiry = valid[0]
+            print(f"[+] निवडलेली चालू एक्सपायरी: {self.expiry}", flush=True)
+
+            active_df = nifty_opts[nifty_opts["expiry"] == self.expiry].copy()
+            for _, r in active_df.iterrows():
+                strike = float(r.get("strike", 0))
+                opt_type = str(r.get("option_type", "")).strip().upper()
+                ikey = str(r.get("instrument_key", "")).strip()
+                sym = str(r.get(sym_col, "")).strip()
+                if strike and opt_type and ikey:
+                    self.contracts_cache[(strike, opt_type)] = {
+                        "trading_symbol": sym,
+                        "instrument_key": ikey
+                    }
+            print(f"[+] {len(self.contracts_cache)} चालू आठवड्याचे ऑप्शन कॉन्ट्रॅक्ट्स अचूक मॅप झाले.", flush=True)
+        except Exception as e:
+            print(f"[-] Contracts loading error: {e}", flush=True)
+            self.expiry = TODAY_STR
 
     def log_journal_csv(self, row: dict):
         exists = JOURNAL_CSV.exists()
@@ -443,12 +458,8 @@ class LivePaperTrader:
         if target_chg_oi < 0:
             return
 
-        # कॅशेमधून अचूक सिम्बॉल आणि इन्स्ट्रुमेंट की मिळवणे
+        # कॅशमधून अचूक सिम्बॉल आणि इन्स्ट्रुमेंट की मिळवणे
         contract_info = self.contracts_cache.get((atm_strike, signal_side))
-        if not contract_info:
-            self.refresh_contracts()
-            contract_info = self.contracts_cache.get((atm_strike, signal_side))
-
         if not contract_info:
             return
 
@@ -489,7 +500,7 @@ def main():
         f"🟢 <b>NIFTY ALGO इंजिन: सुरू झाले</b>\n"
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"मोड: <b>Live Realtime Tracker (3-Min Ping Enabled)</b>\n"
-        f"अल्गो: <b>VWAP + PCR + MaxPain + Option Contract API</b>"
+        f"अल्गो: <b>VWAP + PCR + MaxPain + Derivative APIs</b>"
     )
     print(f"[*] Engine Started with Complete Option Contract API for {TODAY_STR}...", flush=True)
 
