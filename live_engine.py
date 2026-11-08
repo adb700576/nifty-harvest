@@ -10,7 +10,7 @@ import requests
 import pandas as pd
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use("Agg")  # हेडलेस बॅकएंड
 import matplotlib.pyplot as plt
 
 # ========================= CONFIGURATION & TOKEN =========================
@@ -57,14 +57,7 @@ DAILY_PROFIT_GOAL = 1500.0
 DAILY_MAX_LOSS = -1500.0
 MAX_CONSECUTIVE_LOSSES = 2
 
-# सेशन वेळा (मुहूर्त ट्रेडिंगसाठी ENV द्वारे बदलता येतील)
-# मुहूर्त ट्रेडिंगसाठी MUHURAT_MODE=1 दिल्यास दुपारी १४:०० ते १५:३० चालवता येईल
-IS_MUHURAT = os.getenv("MUHURAT_MODE", "0").strip() == "1"
-SESSION_START = "14:15" if IS_MUHURAT else "09:20"
-ENTRY_END = "15:15" if IS_MUHURAT else "15:00"
-FORCE_EXIT = "15:25" if IS_MUHURAT else "15:20"
-MARKET_END = "15:35" if IS_MUHURAT else "15:30"
-
+# अँटी-चॉपी थ्रेशोल्ड्स
 MIN_ADX_TREND = 18.0
 MIN_VOLUME_RATIO = 1.15
 MIN_BODY_RATIO = 0.45
@@ -324,6 +317,57 @@ class UpstoxClient:
         return call_oi, put_oi, call_chg, put_chg
 
 
+# ========================= DYNAMIC TIMINGS & STATUS =========================
+def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict:
+    """Upstox API वरून अधिकृत ट्रेडिंग तास मिळवणे"""
+    try:
+        res = api.get(f"/v2/market/timings/{target_date}")
+        exchanges = res.get("data", [])
+        nfo_nse = next((item for item in exchanges if item.get("exchange") in ["NFO", "NSE"]), None)
+        
+        if nfo_nse:
+            start_ms = nfo_nse["start_time"]
+            end_ms = nfo_nse["end_time"]
+            
+            start_dt = datetime.fromtimestamp(start_ms / 1000.0, timezone.utc) + timedelta(hours=5, minutes=30)
+            end_dt = datetime.fromtimestamp(end_ms / 1000.0, timezone.utc) + timedelta(hours=5, minutes=30)
+            
+            session_start = (start_dt + timedelta(minutes=5)).strftime("%H:%M")
+            entry_end     = (end_dt - timedelta(minutes=15)).strftime("%H:%M")
+            force_exit    = (end_dt - timedelta(minutes=4)).strftime("%H:%M")
+            market_end    = end_dt.strftime("%H:%M")
+            
+            print(f"[+] [Market Timings API] अधिकृत सत्र: {start_dt.strftime('%H:%M')} ते {market_end} IST", flush=True)
+            return {
+                "session_start": session_start,
+                "entry_end": entry_end,
+                "force_exit": force_exit,
+                "market_end": market_end,
+                "raw_start": start_dt.strftime("%H:%M"),
+                "raw_end": market_end
+            }
+    except Exception as e:
+        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक वेळा वापरत आहे...", flush=True)
+
+    # मुहूर्त ट्रेडिंग फॉलबॅक
+    return {
+        "session_start": "14:25",
+        "entry_end": "15:15",
+        "force_exit": "15:26",
+        "market_end": "15:30",
+        "raw_start": "14:20",
+        "raw_end": "15:30"
+    }
+
+def is_exchange_open(api: UpstoxClient) -> bool:
+    try:
+        res = api.get("/v2/market/status/NSE")
+        status = res.get("data", {}).get("status", "")
+        return status == "NORMAL_OPEN"
+    except Exception:
+        return True
+
+
 # ========================= TECHNICAL INDICATORS & ANTI-CHOP =========================
 def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     x = df_5m.copy()
@@ -383,8 +427,9 @@ def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
 
 # ========================= LIVE TRADING ENGINE =========================
 class LivePaperTrader:
-    def __init__(self, api: UpstoxClient):
+    def __init__(self, api: UpstoxClient, timings: dict):
         self.api = api
+        self.timings = timings
         self.active_position = None
         self.trade_counter = 0
         self.cumulative_pnl = 0.0
@@ -619,7 +664,7 @@ class LivePaperTrader:
             self.execute_exit(pos["sl_px"], reason)
         elif ltp >= pos["trg_px"]:
             self.execute_exit(pos["trg_px"], "TARGET_HIT 🎯")
-        elif hhmm >= FORCE_EXIT:
+        elif hhmm >= self.timings["force_exit"]:
             self.execute_exit(ltp, "FORCE_EXIT_SESSION ⏱️")
 
     def run_strategy_scan(self):
@@ -629,7 +674,7 @@ class LivePaperTrader:
             return
 
         hhmm = now_ist().strftime("%H:%M")
-        if not (SESSION_START <= hhmm <= ENTRY_END):
+        if not (self.timings["session_start"] <= hhmm <= self.timings["entry_end"]):
             return
 
         df_5m = self.api.get_spot_candles_5m()
@@ -689,9 +734,7 @@ class LivePaperTrader:
         if not self.pending_gann_setup:
             # 1. BUY CE: खालच्या लेव्हलवर बाऊन्स/स्विप किंवा तुटलेल्या लेव्हलचा रिटेस्ट
             if bullish_sentiment and is_green:
-                # A. Bottom Level Bounce / Sweep (गॅप-डाऊन नंतर खालच्या लेव्हलवरून उसळी)
                 bottom_sweep_ce = (spot_low <= sup_level + 15.0) and (spot_close >= sup_level - 10.0)
-                # B. Breakout + Retest (वर जाऊन परत लेव्हलवर सपोर्ट)
                 retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 15.0 <= spot_low <= sup_level + 35.0)
 
                 if bottom_sweep_ce or retest_ce:
@@ -709,9 +752,7 @@ class LivePaperTrader:
 
             # 2. BUY PE: वरच्या लेव्हलवरून रिजेक्शन किंवा स्विप
             elif bearish_sentiment and is_red:
-                # A. Top Level Sweep / Rejection
                 top_sweep_pe = (spot_high >= res_level - 15.0) and (spot_close <= res_level + 10.0)
-                # B. Breakdown + Retest
                 retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 35.0 <= spot_high <= res_level + 15.0)
 
                 if top_sweep_pe or retest_pe:
@@ -802,31 +843,39 @@ def main():
         raise RuntimeError("UPSTOX_ACCESS_TOKEN उपलब्ध नाही. कृपया ACCESS_TOKEN.txt तपासा.")
 
     api = UpstoxClient(TOKEN)
-    trader = LivePaperTrader(api)
+    
+    # थेट Upstox API वरून आजचे मार्केट टायमिंग्स मिळवणे
+    timings = get_live_market_session_timings(api, TODAY_STR)
+    
+    trader = LivePaperTrader(api, timings)
 
-    mode_label = "मुहूर्त ट्रेडिंग सत्र (Special Session)" if IS_MUHURAT else "नियमित सत्र"
     send_telegram(
         f"🟢 <b>NIFTY 5M GANN ALGO: सुरू झाले</b>\n"
-        f"तारीख: <code>{TODAY_STR}</code> ({mode_label})\n"
-        f"टाइमफ्रेम: <b>5-Minute Candles</b>\n"
-        f"नियम: <b>Gann 9 + 0.025% Buffer + Anti-Chop + Bottom/Retest Bounce</b>"
+        f"तारीख: <code>{TODAY_STR}</code>\n"
+        f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
+        f"ट्रेडिंग विंडो: <code>{timings['session_start']} ➡️ {timings['entry_end']}</code>\n"
+        f"पद्धत: <b>Gann 9 + 0.025% Buffer + Anti-Chop Guard</b>"
     )
-    print(f"[*] 5M Gann Engine Active ({mode_label}) for {TODAY_STR}...", flush=True)
+    print(f"[*] 5M Gann Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
         while True:
             hhmm = now_ist().strftime("%H:%M")
-            if hhmm >= MARKET_END:
-                print(f"[*] {hhmm}: Market session sampla. Live Engine safe stop karat ahe...", flush=True)
-                send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे लाईव्ह इंजिन थांबवले आहे. ट्रेड जर्नल जतन केले आहे.")
+            
+            # सेशन संपताच सुरक्षित बंद
+            if hhmm >= timings["market_end"]:
+                print(f"[*] {hhmm}: Market session संपले. Live Engine सुरक्षित थांबवत आहे...", flush=True)
+                send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे इंजिन सुरक्षित बंद केले आहे.")
                 break
 
             trader.check_position_management()
 
-            if time.monotonic() - last_strat >= STRATEGY_INTERVAL:
-                trader.run_strategy_scan()
-                last_strat = time.monotonic()
+            # स्कॅनर फक्त अधिकृत वेळेतच चालेल
+            if timings["session_start"] <= hhmm <= timings["entry_end"]:
+                if time.monotonic() - last_strat >= STRATEGY_INTERVAL:
+                    trader.run_strategy_scan()
+                    last_strat = time.monotonic()
 
             time.sleep(POLL_INTERVAL)
 
