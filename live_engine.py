@@ -9,9 +9,16 @@ from typing import Optional, Any, Tuple
 import requests
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")  # हेडलेस बॅकएंड
-import matplotlib.pyplot as plt
+
+# ========================= OPTIONAL MATPLOTLIB IMPORT =========================
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # हेडलेस बॅकएंड
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+    print("[-] Matplotlib सापडले नाही. व्हिज्युअल चार्ट ऐवजी साधा टेक्स्ट अलर्ट वापरला जाईल.", flush=True)
 
 # ========================= CONFIGURATION & TOKEN =========================
 BASE_URL = "https://api.upstox.com"
@@ -82,8 +89,11 @@ def send_telegram(text: str):
         print(f"[-] Telegram Error: {e}", flush=True)
 
 def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: float, trg_price: float, caption_text: str = ""):
-    if df_5m.empty or len(df_5m) < 5:
+    # जर matplotlib नसेल किंवा कॅन्डल डेटा कमी असेल तर थेट साधा टेक्स्ट मेसेज पाठवणे
+    if not HAS_MATPLOTLIB or df_5m.empty or len(df_5m) < 5:
+        send_telegram(caption_text)
         return
+
     try:
         recent = df_5m.tail(25)
         plt.figure(figsize=(10, 5))
@@ -112,7 +122,8 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
                     timeout=10
                 )
     except Exception as e:
-        print(f"[-] Chart Alert Error: {e}", flush=True)
+        print(f"[-] Chart Alert Error: {e}. साधा मेसेज पाठवत आहे...", flush=True)
+        send_telegram(caption_text)
 
 def now_ist() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -319,7 +330,6 @@ class UpstoxClient:
 
 # ========================= DYNAMIC TIMINGS & STATUS =========================
 def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict:
-    """Upstox API वरून अधिकृत ट्रेडिंग तास मिळवणे"""
     try:
         res = api.get(f"/v2/market/timings/{target_date}")
         exchanges = res.get("data", [])
@@ -347,7 +357,7 @@ def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict
                 "raw_end": market_end
             }
     except Exception as e:
-        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक वेळा वापरत आहे...", flush=True)
+        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक मुहूर्त वेळा वापरत आहे...", flush=True)
 
     # मुहूर्त ट्रेडिंग फॉलबॅक
     return {
@@ -712,7 +722,7 @@ class LivePaperTrader:
         # मध्यभागी नो-ट्रेड झोन (दोन लेव्हल्सच्या मधोमध ३५% अंतरावर असल्यास एन्ट्री ब्लॉक)
         gap = res_level - sup_level
         if (spot_close - sup_level > 0.35 * gap) and (res_level - spot_close > 0.35 * gap):
-            return  # Mid-Zone Avoidance
+            return
 
         c_range = max(spot_high - spot_low, 1e-9)
         c_body = abs(spot_close - spot_open)
@@ -728,11 +738,8 @@ class LivePaperTrader:
         bullish_sentiment = (pcr >= 0.95) and (spot_close > vwap_5m) and (vol_ratio >= MIN_VOLUME_RATIO)
         bearish_sentiment = (pcr <= 0.85) and (spot_close < vwap_5m) and (vol_ratio >= MIN_VOLUME_RATIO)
 
-        # ----------------------------------------------------
         # ५-मिनिट कॅन्डलवर गॅन पॅटर्न ट्रिगर तयार करणे
-        # ----------------------------------------------------
         if not self.pending_gann_setup:
-            # 1. BUY CE: खालच्या लेव्हलवर बाऊन्स/स्विप किंवा तुटलेल्या लेव्हलचा रिटेस्ट
             if bullish_sentiment and is_green:
                 bottom_sweep_ce = (spot_low <= sup_level + 15.0) and (spot_close >= sup_level - 10.0)
                 retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 15.0 <= spot_low <= sup_level + 35.0)
@@ -750,7 +757,6 @@ class LivePaperTrader:
                     }
                     print(f"[!] 5M CE Armed: Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
 
-            # 2. BUY PE: वरच्या लेव्हलवरून रिजेक्शन किंवा स्विप
             elif bearish_sentiment and is_red:
                 top_sweep_pe = (spot_high >= res_level - 15.0) and (spot_close <= res_level + 10.0)
                 retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 35.0 <= spot_high <= res_level + 15.0)
@@ -768,9 +774,7 @@ class LivePaperTrader:
                     }
                     print(f"[!] 5M PE Armed: Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
 
-        # ----------------------------------------------------
-        # चालू लाईव्ह टिकवर ट्रिगर ओलांडला का ते पाहणे
-        # ----------------------------------------------------
+        # चालू टिकवर ०.०२५% बफर पार झाला का ते पाहणे
         if self.pending_gann_setup:
             setup = self.pending_gann_setup
             if time.monotonic() - setup["armed_time"] > 900:
