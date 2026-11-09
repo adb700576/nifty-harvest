@@ -56,7 +56,7 @@ MIN_OPT_SL_PTS = 10.0
 TARGET_RRR = 1.80
 
 POLL_INTERVAL = 1.0               # १-सेकंद फास्ट टिक मॉनिटर
-STRATEGY_INTERVAL = 15.0           # ५-मिनिट स्कॅनर
+STRATEGY_INTERVAL = 10.0           # स्कॅनर पोलिंग
 POSITION_UPDATE_INTERVAL = 180.0   # ३-मिनिट PnL अपडेट
 
 # कॅपिटल प्रोटेक्शन
@@ -64,10 +64,10 @@ DAILY_PROFIT_GOAL = 1500.0
 DAILY_MAX_LOSS = -1500.0
 MAX_CONSECUTIVE_LOSSES = 2
 
-# अँटी-चॉपी थ्रेशोल्ड्स
+# थ्रेशोल्ड्स
 MIN_ADX_TREND = 18.0
-MIN_VOLUME_RATIO = 1.15
-MIN_BODY_RATIO = 0.45
+MIN_VOLUME_RATIO = 1.10
+MIN_BODY_RATIO = 0.40
 ENTRY_BUFFER_PCT = 0.00025         # ०.०२५% बफर (~६.२५ पॉईंट्स @ २५,०००)
 
 JOURNAL_DIR = Path("live_journal")
@@ -89,7 +89,6 @@ def send_telegram(text: str):
         print(f"[-] Telegram Error: {e}", flush=True)
 
 def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: float, trg_price: float, caption_text: str = ""):
-    # जर matplotlib नसेल किंवा कॅन्डल डेटा कमी असेल तर थेट साधा टेक्स्ट मेसेज पाठवणे
     if not HAS_MATPLOTLIB or df_5m.empty or len(df_5m) < 5:
         send_telegram(caption_text)
         return
@@ -357,25 +356,16 @@ def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict
                 "raw_end": market_end
             }
     except Exception as e:
-        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक मुहूर्त वेळा वापरत आहे...", flush=True)
+        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक वेळा वापरत आहे...", flush=True)
 
-    # मुहूर्त ट्रेडिंग फॉलबॅक
     return {
-        "session_start": "14:25",
-        "entry_end": "15:15",
-        "force_exit": "15:26",
+        "session_start": "09:20",
+        "entry_end": "15:00",
+        "force_exit": "15:20",
         "market_end": "15:30",
-        "raw_start": "14:20",
+        "raw_start": "09:15",
         "raw_end": "15:30"
     }
-
-def is_exchange_open(api: UpstoxClient) -> bool:
-    try:
-        res = api.get("/v2/market/status/NSE")
-        status = res.get("data", {}).get("status", "")
-        return status == "NORMAL_OPEN"
-    except Exception:
-        return True
 
 
 # ========================= TECHNICAL INDICATORS & ANTI-CHOP =========================
@@ -387,50 +377,65 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     c = x["close"]
     prev_close = c.shift(1)
     
+    # VWAP
     tp = (x["high"] + x["low"] + c) / 3.0
     v = x["volume"].replace(0, 1.0)
     x["vwap"] = (tp * v).cumsum() / v.cumsum()
     
-    vol_mean = x["volume"].rolling(20).mean().replace(0, 1.0)
+    # Volume Ratio
+    vol_mean = x["volume"].rolling(20, min_periods=5).mean().replace(0, 1.0)
     x["volume_ratio"] = x["volume"] / vol_mean
     
+    # ATR 14
     tr = pd.concat([
         x["high"] - x["low"],
         (x["high"] - prev_close).abs(),
         (x["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
-    x["atr14"] = tr.rolling(14).mean()
+    x["atr14"] = tr.rolling(14, min_periods=5).mean()
     
+    # ADX 14
     up = x["high"].diff()
     dn = -x["low"].diff()
-    plus = up.where((up > dn) & (up > 0), 0.0).rolling(14).mean()
-    minus = dn.where((dn > up) & (dn > 0), 0.0).rolling(14).mean()
+    plus = up.where((up > dn) & (up > 0), 0.0).rolling(14, min_periods=5).mean()
+    minus = dn.where((dn > up) & (dn > 0), 0.0).rolling(14, min_periods=5).mean()
     dx = ((plus - minus).abs() / (plus + minus).replace(0, np.nan)) * 100.0
-    x["adx14"] = dx.rolling(14).mean()
+    x["adx14"] = dx.rolling(14, min_periods=5).mean()
     
-    x["ema20"] = c.ewm(span=20, adjust=False).mean()
-    x["ema50"] = c.ewm(span=50, adjust=False).mean()
+    # RSI 14
+    delta = c.diff()
+    gain = (delta.where(delta > 0, 0.0)).rolling(14, min_periods=5).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14, min_periods=5).mean()
+    rs = gain / loss.replace(0, np.nan)
+    x["rsi14"] = 100 - (100 / (1 + rs))
     
     return x
 
 def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
-    if len(df_5m) < 15:
+    if len(df_5m) < 10:
         return True, "INSUFFICIENT_DATA"
 
     last_bar = df_5m.iloc[-1]
     adx = safe_float(last_bar.get("adx14"))
     
-    if adx is not None and adx < MIN_ADX_TREND:
+    # जर मोमेंटम कॅन्डल ब्रेकआउट देत असेल तर ADX चॉप तात्पुरता बायपास होतो
+    c_range = max(last_bar["high"] - last_bar["low"], 1e-9)
+    c_body = abs(last_bar["close"] - last_bar["open"])
+    is_strong_bar = (c_body / c_range) >= 0.60
+
+    if adx is not None and adx < MIN_ADX_TREND and not is_strong_bar:
         return True, f"CHOPPY_REGIME_ADX_LOW ({adx:.1f} < {MIN_ADX_TREND})"
 
-    if 0.86 <= pcr <= 0.94:
+    if 0.87 <= pcr <= 0.93 and not is_strong_bar:
         return True, f"NEUTRAL_DEAD_ZONE_PCR ({pcr:.2f})"
 
     recent_6 = df_5m.tail(6)
     rng_30m = recent_6["high"].max() - recent_6["low"].min()
     atr = safe_float(last_bar.get("atr14")) or 15.0
-    if rng_30m < (1.3 * atr):
-        return True, f"RANGE_COMPRESSION_CHOP ({rng_30m:.1f} pts < {1.3*atr:.1f})"
+    
+    # जर ३० मिनिटांची रेंज अत्यंत लहान असेल आणि चालू बारने ती मोडली नसेल
+    if rng_30m < (1.1 * atr) and not is_strong_bar:
+        return True, f"RANGE_COMPRESSION_CHOP ({rng_30m:.1f} pts < {1.1*atr:.1f})"
 
     return False, "TRENDING_CLEAR"
 
@@ -450,6 +455,7 @@ class LivePaperTrader:
         self.contracts_cache = {}
         self.failed_strikes = {}
         self.pending_gann_setup = None
+        self.last_sent_5m_bar_time = None
         self.load_expiry_and_contracts()
 
     def load_expiry_and_contracts(self):
@@ -489,6 +495,85 @@ class LivePaperTrader:
                 writer.writeheader()
             writer.writerow(row)
 
+    def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, pcr: float, max_pain: float):
+        """दर ५ मिनिटांनी कॅन्डल क्लोज झाल्यावर टेलिग्रामवर सेन्टिमेंट पल्स पाठवणे"""
+        if df_5m.empty:
+            return
+
+        last_bar = df_5m.iloc[-1]
+        bar_time_str = last_bar["dt"].strftime("%H:%M")
+        
+        # एकाच कॅन्डलचा मेसेज पुन्हा पाठवू नये
+        if self.last_sent_5m_bar_time == bar_time_str:
+            return
+        self.last_sent_5m_bar_time = bar_time_str
+
+        spot = float(last_bar["close"])
+        vwap = float(last_bar.get("vwap", spot))
+        rsi = float(last_bar.get("rsi14", 50.0))
+        adx = float(last_bar.get("adx14", 0.0))
+        atr = float(last_bar.get("atr14", 0.0))
+
+        atm_strike = round(spot / 50.0) * 50.0
+        c_oi, p_oi, c_chg, p_chg = self.api.get_strike_oi_and_change(self.expiry, atm_strike)
+        ce_chg_val = c_chg if c_chg is not None else 0
+        pe_chg_val = p_chg if p_chg is not None else 0
+
+        # सेंटिमेंट स्कोअरिंग
+        bullish_score = 0
+        bearish_score = 0
+
+        if pcr >= 0.95: bullish_score += 1
+        elif pcr <= 0.85: bearish_score += 1
+
+        if pe_chg_val > ce_chg_val: bullish_score += 1
+        elif ce_chg_val > pe_chg_val: bearish_score += 1
+
+        if spot > vwap: bullish_score += 1
+        elif spot < vwap: bearish_score += 1
+
+        if rsi >= 55: bullish_score += 1
+        elif rsi <= 45: bearish_score += 1
+
+        gann = get_gann_levels(spot, count=3)
+        sup = gann["immediate_support"]
+        res = gann["immediate_resistance"]
+
+        if adx < 18.0 and (0.87 <= pcr <= 0.93):
+            total_sentiment = "⚪ CHOPPY / RANGEBOUND 💤"
+            focus_action = "🚫 NO TRADE (Wait for Breakout / Capital Guard)"
+        elif bullish_score >= 3:
+            total_sentiment = "🟢 VERY BULLISH (+VE) 🚀"
+            focus_action = "🟢 FOCUS ON CE SIDE (Gann Bounce / Retest Buy)"
+        elif bearish_score >= 3:
+            total_sentiment = "🔴 VERY BEARISH (-VE) 🔻"
+            focus_action = "🔴 FOCUS ON PE SIDE (Gann Breakdown / Rejection)"
+        else:
+            total_sentiment = "🟡 MIXED BIAS ⏳"
+            focus_action = "⏳ WAIT & WATCH (Selective Levels Only)"
+
+        vwap_status = "Above VWAP 🟢" if spot >= vwap else "Below VWAP 🔴"
+
+        msg = (
+            f"📊 <b>NIFTY 5-MIN SENTIMENT PULSE ({bar_time_str} IST)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 <b>Spot Close:</b> <code>{spot:.2f}</code> | <b>VWAP:</b> <code>{vwap:.2f}</code> ({vwap_status})\n"
+            f"📐 <b>Gann Corridor:</b> <code>{sup:.1f}</code> ⬅️ <b>{spot:.1f}</b> ➡️ <code>{res:.1f}</code>\n\n"
+            f"🔹 <b>DERIVATIVE DATA (ATM {int(atm_strike)}):</b>\n"
+            f"• <b>PCR:</b> <code>{pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain}</code>\n"
+            f"• <b>ΔOI Put (PE):</b> <code>{pe_chg_val:+,}</code>\n"
+            f"• <b>ΔOI Call (CE):</b> <code>{ce_chg_val:+,}</code>\n\n"
+            f"🔹 <b>MOMENTUM & VOLATILITY:</b>\n"
+            f"• <b>RSI (14):</b> <code>{rsi:.1f}</code>\n"
+            f"• <b>ADX (14):</b> <code>{adx:.1f}</code> {'⚡ (Trending)' if adx >= 18 else '💤 (Chop)'}\n"
+            f"• <b>ATR (14):</b> <code>{atr:.1f} pts</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏁 <b>TOTAL SENTIMENT:</b> <b>{total_sentiment}</b>\n"
+            f"🎯 <b>STRATEGY FOCUS:</b> <b>{focus_action}</b>"
+        )
+        send_telegram(msg)
+        print(f"[{bar_time_str}] 5M Sentiment Sent: {total_sentiment}", flush=True)
+
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
             f"🚀 <b>NIFTY 5M GANN ALGO: नवीन ट्रेड एन्ट्री (#{pos['trade_id']})</b>\n"
@@ -497,12 +582,12 @@ class LivePaperTrader:
             f"🏷️ <b>सिम्बॉल:</b> <code>{pos['symbol']}</code>\n"
             f"📦 <b>लॉट:</b> <code>1 Lot</code> (Qty: <code>{LOT_SIZE}</code>)\n"
             f"💵 <b>खरेदी किंमत:</b> <code>₹{pos['entry_px']:.2f}</code>\n"
-            f"🛑 <b>स्टॉपलॉस (5M Low):</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts)\n"
+            f"🛑 <b>स्टॉपलॉस:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts)\n"
             f"🏁 <b>टार्गेट:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📋 <b>5-Min Setup Details:</b>\n"
-            f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (Gann Pivot: {pos['gann_level']:.1f})\n"
-            f"🎯 <b>Trigger (0.025% Buffer):</b> <code>₹{pos['trigger_level']:.2f}</code>\n"
+            f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (Gann Level: {pos['gann_level']:.1f})\n"
+            f"🎯 <b>Trigger Level (0.025% Buffer):</b> <code>₹{pos['trigger_level']:.2f}</code>\n"
             f"📊 <b>PCR:</b> <code>{pos['pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
             f"📈 <b>स्ट्राइक OI:</b> <code>{pos['strike_oi']:,}</code> | <b>ΔOI:</b> <code>{pos['change_oi']:+,}</code>\n"
             f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
@@ -541,10 +626,10 @@ class LivePaperTrader:
             f"💵 <b>एन्ट्री:</b> <code>₹{pos['entry_px']:.2f}</code> ➡️ <b>एक्झिट:</b> <code>₹{pos['exit_px']:.2f}</code>\n"
             f"📊 <b>पॉईंट्स:</b> <code>{pos['pts']:+.2f} pts</code>\n"
             f"🛑 <b>कारण:</b> <code>{pos['exit_reason']}</code>\n"
-            f"💳 <b>Upstox Charges (Brokerage+Taxes):</b> <code>₹{pos['charges']:.2f}</code>\n"
+            f"💳 <b>Upstox Charges:</b> <code>₹{pos['charges']:.2f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 <b>या ट्रेडचा निव्वळ निकाल:</b> <b>₹ {pos['net_pnl']:+,.2f}</b>\n"
-            f"📈 <b>एकूण संचित नफा (Cumulative PnL):</b> <b>₹ {self.cumulative_pnl:+,.2f}</b>\n"
+            f"📈 <b>एकूण संचित नफा:</b> <b>₹ {self.cumulative_pnl:+,.2f}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📝 <i>दैनिक ट्रेड जर्नलमध्ये जतन केले आहे.</i>"
         )
@@ -688,7 +773,7 @@ class LivePaperTrader:
             return
 
         df_5m = self.api.get_spot_candles_5m()
-        if len(df_5m) < 15:
+        if len(df_5m) < 10:
             return
 
         df_5m = add_indicators_5m(df_5m)
@@ -708,7 +793,10 @@ class LivePaperTrader:
         if pcr is None or max_pain is None:
             return
 
-        # चॉपी मार्केट फिल्टर
+        # १. दर ५ मिनिटांनी नियमित टेलिग्राम पल्स पाठवणे
+        self.send_5m_sentiment_pulse(df_5m, pcr, max_pain)
+
+        # २. चॉपी मार्केट फिल्टर
         choppy, chop_reason = is_market_choppy(df_5m, pcr)
         if choppy:
             if self.pending_gann_setup:
@@ -719,65 +807,72 @@ class LivePaperTrader:
         sup_level = gann["immediate_support"]
         res_level = gann["immediate_resistance"]
 
-        # मध्यभागी नो-ट्रेड झोन (दोन लेव्हल्सच्या मधोमध ३५% अंतरावर असल्यास एन्ट्री ब्लॉक)
-        gap = res_level - sup_level
-        if (spot_close - sup_level > 0.35 * gap) and (res_level - spot_close > 0.35 * gap):
-            return
-
         c_range = max(spot_high - spot_low, 1e-9)
         c_body = abs(spot_close - spot_open)
         body_ratio = c_body / c_range
-
-        if body_ratio < MIN_BODY_RATIO:
-            return
 
         buffer_pts = round(spot_close * ENTRY_BUFFER_PCT, 2)
         is_green = spot_close > spot_open
         is_red = spot_close < spot_open
 
-        bullish_sentiment = (pcr >= 0.95) and (spot_close > vwap_5m) and (vol_ratio >= MIN_VOLUME_RATIO)
-        bearish_sentiment = (pcr <= 0.85) and (spot_close < vwap_5m) and (vol_ratio >= MIN_VOLUME_RATIO)
+        # मागील ६ बार्सचा कन्सोलिडेशन हाय आणि लो
+        recent_6 = df_5m.tail(6)
+        consolidation_high = float(recent_6["high"].max())
+        consolidation_low = float(recent_6["low"].min())
 
+        bullish_sentiment = (pcr >= 0.95) and (spot_close > vwap_5m)
+        bearish_sentiment = (pcr <= 0.85) and (spot_close < vwap_5m)
+
+        # ----------------------------------------------------
         # ५-मिनिट कॅन्डलवर गॅन पॅटर्न ट्रिगर तयार करणे
+        # ----------------------------------------------------
         if not self.pending_gann_setup:
-            if bullish_sentiment and is_green:
-                bottom_sweep_ce = (spot_low <= sup_level + 15.0) and (spot_close >= sup_level - 10.0)
-                retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 15.0 <= spot_low <= sup_level + 35.0)
+            # 🟢 CE SETUP
+            if bullish_sentiment and is_green and (body_ratio >= MIN_BODY_RATIO):
+                bottom_sweep_ce = (spot_low <= sup_level + 20.0) and (spot_close >= sup_level - 10.0)
+                retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 20.0 <= spot_low <= sup_level + 40.0)
+                breakout_ce = (spot_close > consolidation_high) and (spot_close > vwap_5m)
 
-                if bottom_sweep_ce or retest_ce:
+                if bottom_sweep_ce or retest_ce or breakout_ce:
                     trigger_px = round(spot_high + buffer_pts, 2)
+                    setup_name = "CONSOLIDATION_BREAKOUT_CE" if breakout_ce else ("BOTTOM_BOUNCE_CE" if bottom_sweep_ce else "5M_RETEST_CE")
                     self.pending_gann_setup = {
                         "side": "CE",
-                        "setup_type": "BOTTOM_BOUNCE_CE" if bottom_sweep_ce else "5M_RETEST_CE",
+                        "setup_type": setup_name,
                         "gann_level": sup_level,
                         "trigger_level": trigger_px,
                         "spot_sl": round(spot_low - 5.0, 2),
                         "spot_target": res_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M CE Armed: Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
+                    print(f"[!] 5M CE Armed: {setup_name} | Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
 
-            elif bearish_sentiment and is_red:
-                top_sweep_pe = (spot_high >= res_level - 15.0) and (spot_close <= res_level + 10.0)
-                retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 35.0 <= spot_high <= res_level + 15.0)
+            # 🔴 PE SETUP
+            elif bearish_sentiment and is_red and (body_ratio >= MIN_BODY_RATIO):
+                top_sweep_pe = (spot_high >= res_level - 20.0) and (spot_close <= res_level + 10.0)
+                retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 40.0 <= spot_high <= res_level + 20.0)
+                breakdown_pe = (spot_close < consolidation_low) and (spot_close < vwap_5m)
 
-                if top_sweep_pe or retest_pe:
+                if top_sweep_pe or retest_pe or breakdown_pe:
                     trigger_px = round(spot_low - buffer_pts, 2)
+                    setup_name = "CONSOLIDATION_BREAKDOWN_PE" if breakdown_pe else ("TOP_REJECT_PE" if top_sweep_pe else "5M_RETEST_PE")
                     self.pending_gann_setup = {
                         "side": "PE",
-                        "setup_type": "TOP_REJECT_PE" if top_sweep_pe else "5M_RETEST_PE",
+                        "setup_type": setup_name,
                         "gann_level": res_level,
                         "trigger_level": trigger_px,
                         "spot_sl": round(spot_high + 5.0, 2),
                         "spot_target": sup_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M PE Armed: Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
+                    print(f"[!] 5M PE Armed: {setup_name} | Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
 
-        # चालू टिकवर ०.०२५% बफर पार झाला का ते पाहणे
+        # ----------------------------------------------------
+        # चालू लाईव्ह टिकवर ०.०२५% बफर पार झाला का ते पाहणे
+        # ----------------------------------------------------
         if self.pending_gann_setup:
             setup = self.pending_gann_setup
-            if time.monotonic() - setup["armed_time"] > 900:
+            if time.monotonic() - setup["armed_time"] > 900:  # १५ मिनिटांनंतर एक्सपायर
                 self.pending_gann_setup = None
                 return
 
@@ -803,7 +898,9 @@ class LivePaperTrader:
                 target_chg_oi = call_chg if setup["side"] == "CE" else put_chg
                 target_strike_oi = call_oi if setup["side"] == "CE" else put_oi
 
+                # अनवाइंडिंग असल्यास ट्रेड नको
                 if target_chg_oi is not None and target_chg_oi < 0:
+                    print(f"[-] Unwinding detected on {atm_strike} ({target_chg_oi}). Trade Blocked.", flush=True)
                     self.pending_gann_setup = None
                     return
 
@@ -815,7 +912,7 @@ class LivePaperTrader:
                 trad_sym = contract_info["trading_symbol"]
                 ltp = self.api.get_ltp(inst_key)
 
-                if ltp and 80.0 <= ltp <= 350.0:
+                if ltp and 50.0 <= ltp <= 450.0:
                     self.execute_entry(
                         side=setup["side"],
                         strike=atm_strike,
@@ -847,10 +944,7 @@ def main():
         raise RuntimeError("UPSTOX_ACCESS_TOKEN उपलब्ध नाही. कृपया ACCESS_TOKEN.txt तपासा.")
 
     api = UpstoxClient(TOKEN)
-    
-    # थेट Upstox API वरून आजचे मार्केट टायमिंग्स मिळवणे
     timings = get_live_market_session_timings(api, TODAY_STR)
-    
     trader = LivePaperTrader(api, timings)
 
     send_telegram(
@@ -858,7 +952,7 @@ def main():
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
         f"ट्रेडिंग विंडो: <code>{timings['session_start']} ➡️ {timings['entry_end']}</code>\n"
-        f"पद्धत: <b>Gann 9 + 0.025% Buffer + Anti-Chop Guard</b>"
+        f"सिस्टीम: <b>5M Sentiment Pulse + Consolidation Breakout/Breakdown + 0.025% Buffer</b>"
     )
     print(f"[*] 5M Gann Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
 
@@ -867,7 +961,6 @@ def main():
         while True:
             hhmm = now_ist().strftime("%H:%M")
             
-            # सेशन संपताच सुरक्षित बंद
             if hhmm >= timings["market_end"]:
                 print(f"[*] {hhmm}: Market session संपले. Live Engine सुरक्षित थांबवत आहे...", flush=True)
                 send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे इंजिन सुरक्षित बंद केले आहे.")
@@ -875,7 +968,6 @@ def main():
 
             trader.check_position_management()
 
-            # स्कॅनर फक्त अधिकृत वेळेतच चालेल
             if timings["session_start"] <= hhmm <= timings["entry_end"]:
                 if time.monotonic() - last_strat >= STRATEGY_INTERVAL:
                     trader.run_strategy_scan()
