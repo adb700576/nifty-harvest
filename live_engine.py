@@ -13,12 +13,11 @@ import numpy as np
 # ========================= OPTIONAL MATPLOTLIB IMPORT =========================
 try:
     import matplotlib
-    matplotlib.use("Agg")  # हेडलेस बॅकएंड
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
-    print("[-] Matplotlib सापडले नाही. व्हिज्युअल चार्ट ऐवजी साधा टेक्स्ट अलर्ट वापरला जाईल.", flush=True)
 
 # ========================= CONFIGURATION & TOKEN =========================
 BASE_URL = "https://api.upstox.com"
@@ -55,20 +54,18 @@ LOT_SIZE = 65
 MIN_OPT_SL_PTS = 10.0
 TARGET_RRR = 1.80
 
-POLL_INTERVAL = 1.0               # १-सेकंद फास्ट टिक मॉनिटर
-STRATEGY_INTERVAL = 10.0           # स्कॅनर पोलिंग
-POSITION_UPDATE_INTERVAL = 180.0   # ३-मिनिट PnL अपडेट
+POLL_INTERVAL = 1.0
+STRATEGY_INTERVAL = 10.0
+POSITION_UPDATE_INTERVAL = 180.0
 
 # कॅपिटल प्रोटेक्शन
 DAILY_PROFIT_GOAL = 1500.0
 DAILY_MAX_LOSS = -1500.0
 MAX_CONSECUTIVE_LOSSES = 2
 
-# थ्रेशोल्ड्स
 MIN_ADX_TREND = 18.0
-MIN_VOLUME_RATIO = 1.10
 MIN_BODY_RATIO = 0.40
-ENTRY_BUFFER_PCT = 0.00025         # ०.०२५% बफर (~६.२५ पॉईंट्स @ २५,०००)
+ENTRY_BUFFER_PCT = 0.00025
 
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
@@ -76,7 +73,7 @@ TODAY_STR = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strfti
 JOURNAL_CSV = JOURNAL_DIR / f"trades_journal_{TODAY_STR}.csv"
 
 
-# ========================= TELEGRAM & VISUAL ALERTS =========================
+# ========================= TELEGRAM & ALERTS =========================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[Telegram Disconnected] {text[:90]}...", flush=True)
@@ -97,11 +94,9 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
         recent = df_5m.tail(25)
         plt.figure(figsize=(10, 5))
         plt.plot(recent['dt'], recent['close'], label='NIFTY 5M Spot', color='black', linewidth=1.5)
-        
         plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Gann Pivot: {gann_level:.1f}')
         plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Swing SL: {sl_price:.1f}')
         plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Target: {trg_price:.1f}')
-        
         plt.title("NIFTY 5M Gann Setup Alert", fontsize=12, fontweight='bold')
         plt.legend(loc='upper left', fontsize=9)
         plt.grid(True, linestyle=":", alpha=0.5)
@@ -121,7 +116,6 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
                     timeout=10
                 )
     except Exception as e:
-        print(f"[-] Chart Alert Error: {e}. साधा मेसेज पाठवत आहे...", flush=True)
         send_telegram(caption_text)
 
 def now_ist() -> datetime:
@@ -140,14 +134,12 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
-# ========================= GANN SQUARE OF 9 LEVELS =========================
+# ========================= GANN LEVELS =========================
 def get_gann_levels(current_price: float, count: int = 5) -> dict:
     base_root = int(math.floor(math.sqrt(current_price)))
-    
     lower_levels = [((base_root - i) ** 2) for i in range(count, 0, -1)]
     base_level = [base_root ** 2]
     upper_levels = [((base_root + i) ** 2) for i in range(1, count + 1)]
-    
     all_levels = sorted(lower_levels + base_level + upper_levels)
     
     supports = [lvl for lvl in all_levels if lvl <= current_price]
@@ -155,7 +147,6 @@ def get_gann_levels(current_price: float, count: int = 5) -> dict:
     
     immediate_sup = max(supports) if supports else current_price - 100.0
     immediate_res = min(resistances) if resistances else current_price + 100.0
-    
     next_res = [lvl for lvl in resistances if lvl > immediate_res]
     next_sup = [lvl for lvl in supports if lvl < immediate_sup]
     
@@ -226,42 +217,6 @@ class UpstoxClient:
         return df_5m
 
     def get_official_charges(self, instrument_key: str, qty: int, buy_price: float, sell_price: float) -> dict:
-        url = "/v2/charges/brokerage"
-        total_brokerage = 0.0
-        total_stt = 0.0
-        total_other = 0.0
-
-        try:
-            b_res = self.get(url, {
-                "instrument_token": instrument_key,
-                "quantity": str(qty),
-                "product": "I",
-                "transaction_type": "BUY",
-                "price": str(buy_price)
-            })
-            b_chg = b_res.get("data", {}).get("charges", {})
-            total_brokerage += float(b_chg.get("brokerage", 20.0))
-            total_stt += float(b_chg.get("stt", 0.0))
-            total_other += float(b_chg.get("gst", 0.0)) + float(b_chg.get("stamp_duty", 0.0)) + float(b_chg.get("other_charges", 0.0))
-
-            s_res = self.get(url, {
-                "instrument_token": instrument_key,
-                "quantity": str(qty),
-                "product": "I",
-                "transaction_type": "SELL",
-                "price": str(sell_price)
-            })
-            s_chg = s_res.get("data", {}).get("charges", {})
-            total_brokerage += float(s_chg.get("brokerage", 20.0))
-            total_stt += float(s_chg.get("stt", 0.0))
-            total_other += float(s_chg.get("gst", 0.0)) + float(s_chg.get("other_charges", 0.0))
-
-            tot = round(total_brokerage + total_stt + total_other, 2)
-            if tot > 0:
-                return {"total_charges": tot, "brokerage": round(total_brokerage, 2), "stt": round(total_stt, 2)}
-        except Exception:
-            pass
-
         return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
 
     def get_official_pcr(self, expiry: str) -> Optional[float]:
@@ -296,9 +251,8 @@ class UpstoxClient:
         except Exception:
             return None
 
-    def get_strike_oi_and_change(self, expiry: str, target_strike: float) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
-        call_oi, put_oi = None, None
-        call_chg, put_chg = None, None
+    def get_strike_oi_and_change(self, expiry: str, target_strike: float):
+        call_oi, put_oi, call_chg, put_chg = None, None, None, None
         try:
             res_oi = self.get("/v2/market/oi", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
@@ -327,37 +281,7 @@ class UpstoxClient:
         return call_oi, put_oi, call_chg, put_chg
 
 
-# ========================= DYNAMIC TIMINGS & STATUS =========================
 def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict:
-    try:
-        res = api.get(f"/v2/market/timings/{target_date}")
-        exchanges = res.get("data", [])
-        nfo_nse = next((item for item in exchanges if item.get("exchange") in ["NFO", "NSE"]), None)
-        
-        if nfo_nse:
-            start_ms = nfo_nse["start_time"]
-            end_ms = nfo_nse["end_time"]
-            
-            start_dt = datetime.fromtimestamp(start_ms / 1000.0, timezone.utc) + timedelta(hours=5, minutes=30)
-            end_dt = datetime.fromtimestamp(end_ms / 1000.0, timezone.utc) + timedelta(hours=5, minutes=30)
-            
-            session_start = (start_dt + timedelta(minutes=5)).strftime("%H:%M")
-            entry_end     = (end_dt - timedelta(minutes=15)).strftime("%H:%M")
-            force_exit    = (end_dt - timedelta(minutes=4)).strftime("%H:%M")
-            market_end    = end_dt.strftime("%H:%M")
-            
-            print(f"[+] [Market Timings API] अधिकृत सत्र: {start_dt.strftime('%H:%M')} ते {market_end} IST", flush=True)
-            return {
-                "session_start": session_start,
-                "entry_end": entry_end,
-                "force_exit": force_exit,
-                "market_end": market_end,
-                "raw_start": start_dt.strftime("%H:%M"),
-                "raw_end": market_end
-            }
-    except Exception as e:
-        print(f"[-] Market Timings API त्रुटी: {e}. फॉलबॅक वेळा वापरत आहे...", flush=True)
-
     return {
         "session_start": "09:20",
         "entry_end": "15:00",
@@ -368,7 +292,6 @@ def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict
     }
 
 
-# ========================= TECHNICAL INDICATORS & ANTI-CHOP =========================
 def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     x = df_5m.copy()
     if x.empty:
@@ -377,16 +300,10 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     c = x["close"]
     prev_close = c.shift(1)
     
-    # VWAP
     tp = (x["high"] + x["low"] + c) / 3.0
     v = x["volume"].replace(0, 1.0)
     x["vwap"] = (tp * v).cumsum() / v.cumsum()
     
-    # Volume Ratio
-    vol_mean = x["volume"].rolling(20, min_periods=5).mean().replace(0, 1.0)
-    x["volume_ratio"] = x["volume"] / vol_mean
-    
-    # ATR 14
     tr = pd.concat([
         x["high"] - x["low"],
         (x["high"] - prev_close).abs(),
@@ -394,7 +311,6 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     x["atr14"] = tr.rolling(14, min_periods=5).mean()
     
-    # ADX 14
     up = x["high"].diff()
     dn = -x["low"].diff()
     plus = up.where((up > dn) & (up > 0), 0.0).rolling(14, min_periods=5).mean()
@@ -402,13 +318,11 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     dx = ((plus - minus).abs() / (plus + minus).replace(0, np.nan)) * 100.0
     x["adx14"] = dx.rolling(14, min_periods=5).mean()
     
-    # RSI 14
     delta = c.diff()
     gain = (delta.where(delta > 0, 0.0)).rolling(14, min_periods=5).mean()
     loss = (-delta.where(delta < 0, 0.0)).rolling(14, min_periods=5).mean()
     rs = gain / loss.replace(0, np.nan)
     x["rsi14"] = 100 - (100 / (1 + rs))
-    
     return x
 
 def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
@@ -417,25 +331,15 @@ def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
 
     last_bar = df_5m.iloc[-1]
     adx = safe_float(last_bar.get("adx14"))
-    
-    # जर मोमेंटम कॅन्डल ब्रेकआउट देत असेल तर ADX चॉप तात्पुरता बायपास होतो
     c_range = max(last_bar["high"] - last_bar["low"], 1e-9)
     c_body = abs(last_bar["close"] - last_bar["open"])
-    is_strong_bar = (c_body / c_range) >= 0.60
+    is_strong_bar = (c_body / c_range) >= 0.50
 
     if adx is not None and adx < MIN_ADX_TREND and not is_strong_bar:
         return True, f"CHOPPY_REGIME_ADX_LOW ({adx:.1f} < {MIN_ADX_TREND})"
 
-    if 0.87 <= pcr <= 0.93 and not is_strong_bar:
+    if 0.88 <= pcr <= 0.92 and not is_strong_bar:
         return True, f"NEUTRAL_DEAD_ZONE_PCR ({pcr:.2f})"
-
-    recent_6 = df_5m.tail(6)
-    rng_30m = recent_6["high"].max() - recent_6["low"].min()
-    atr = safe_float(last_bar.get("atr14")) or 15.0
-    
-    # जर ३० मिनिटांची रेंज अत्यंत लहान असेल आणि चालू बारने ती मोडली नसेल
-    if rng_30m < (1.1 * atr) and not is_strong_bar:
-        return True, f"RANGE_COMPRESSION_CHOP ({rng_30m:.1f} pts < {1.1*atr:.1f})"
 
     return False, "TRENDING_CLEAR"
 
@@ -447,16 +351,20 @@ class LivePaperTrader:
         self.timings = timings
         self.active_position = None
         self.trade_counter = 0
+
+        # नवीन दिवसासाठी नेहमी 0 आणि False नेच सुरुवात
         self.cumulative_pnl = 0.0
+        self.daily_locked = False
         self.consecutive_losses = 0
         self.cooldown_until = None
-        self.daily_locked = False
+        self.pending_gann_setup = None
+        self.last_sent_5m_bar_time = None
+
         self.expiry = None
         self.contracts_cache = {}
         self.failed_strikes = {}
-        self.pending_gann_setup = None
-        self.last_sent_5m_bar_time = None
         self.load_expiry_and_contracts()
+        print(f"[*] Engine Initialized Fresh: Daily Locked = {self.daily_locked}, Cumulative PnL = ₹{self.cumulative_pnl}", flush=True)
 
     def load_expiry_and_contracts(self):
         try:
@@ -469,7 +377,6 @@ class LivePaperTrader:
             nifty_opts["expiry"] = pd.to_datetime(nifty_opts["expiry"]).dt.strftime("%Y-%m-%d")
             valid = sorted([x for x in nifty_opts["expiry"].unique() if x >= TODAY_STR])
             self.expiry = valid[0]
-            print(f"[+] निवडलेली चालू एक्सपायरी: {self.expiry}", flush=True)
 
             active_df = nifty_opts[nifty_opts["expiry"] == self.expiry].copy()
             for _, r in active_df.iterrows():
@@ -482,7 +389,7 @@ class LivePaperTrader:
                         "trading_symbol": sym,
                         "instrument_key": ikey
                     }
-            print(f"[+] {len(self.contracts_cache)} चालू आठवड्याचे ऑप्शन कॉन्ट्रॅक्ट्स मॅप झाले.", flush=True)
+            print(f"[+] {len(self.contracts_cache)} चालू आठवड्याचे ऑप्शन कॉन्ट्रॅक्ट्स मॅप झाले (Expiry: {self.expiry}).", flush=True)
         except Exception as e:
             print(f"[-] Contracts loading error: {e}", flush=True)
             self.expiry = TODAY_STR
@@ -496,14 +403,12 @@ class LivePaperTrader:
             writer.writerow(row)
 
     def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, pcr: float, max_pain: float):
-        """दर ५ मिनिटांनी कॅन्डल क्लोज झाल्यावर टेलिग्रामवर सेन्टिमेंट पल्स पाठवणे"""
         if df_5m.empty:
             return
 
         last_bar = df_5m.iloc[-1]
         bar_time_str = last_bar["dt"].strftime("%H:%M")
         
-        # एकाच कॅन्डलचा मेसेज पुन्हा पाठवू नये
         if self.last_sent_5m_bar_time == bar_time_str:
             return
         self.last_sent_5m_bar_time = bar_time_str
@@ -519,7 +424,6 @@ class LivePaperTrader:
         ce_chg_val = c_chg if c_chg is not None else 0
         pe_chg_val = p_chg if p_chg is not None else 0
 
-        # सेंटिमेंट स्कोअरिंग
         bullish_score = 0
         bearish_score = 0
 
@@ -532,14 +436,14 @@ class LivePaperTrader:
         if spot > vwap: bullish_score += 1
         elif spot < vwap: bearish_score += 1
 
-        if rsi >= 55: bullish_score += 1
-        elif rsi <= 45: bearish_score += 1
+        if rsi >= 52: bullish_score += 1
+        elif rsi <= 48: bearish_score += 1
 
         gann = get_gann_levels(spot, count=3)
         sup = gann["immediate_support"]
         res = gann["immediate_resistance"]
 
-        if adx < 18.0 and (0.87 <= pcr <= 0.93):
+        if adx < 18.0 and (0.88 <= pcr <= 0.92):
             total_sentiment = "⚪ CHOPPY / RANGEBOUND 💤"
             focus_action = "🚫 NO TRADE (Wait for Breakout / Capital Guard)"
         elif bullish_score >= 3:
@@ -587,19 +491,12 @@ class LivePaperTrader:
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📋 <b>5-Min Setup Details:</b>\n"
             f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (Gann Level: {pos['gann_level']:.1f})\n"
-            f"🎯 <b>Trigger Level (0.025% Buffer):</b> <code>₹{pos['trigger_level']:.2f}</code>\n"
+            f"🎯 <b>Trigger Level:</b> <code>₹{pos['trigger_level']:.2f}</code>\n"
             f"📊 <b>PCR:</b> <code>{pos['pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
-            f"📈 <b>स्ट्राइक OI:</b> <code>{pos['strike_oi']:,}</code> | <b>ΔOI:</b> <code>{pos['change_oi']:+,}</code>\n"
             f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
             f"⏱️ <b>वेळ:</b> <code>{pos['entry_time']}</code>"
         )
-        send_telegram_chart_alert(
-            df_5m, 
-            gann_level=pos["gann_level"], 
-            sl_price=pos["spot_sl"], 
-            trg_price=pos["spot_target"], 
-            caption_text=caption
-        )
+        send_telegram_chart_alert(df_5m, pos["gann_level"], pos["spot_sl"], pos["spot_target"], caption)
 
     def send_periodic_update(self, pos: dict, current_ltp: float):
         cur_pts = round(current_ltp - pos["entry_px"], 2)
@@ -626,12 +523,9 @@ class LivePaperTrader:
             f"💵 <b>एन्ट्री:</b> <code>₹{pos['entry_px']:.2f}</code> ➡️ <b>एक्झिट:</b> <code>₹{pos['exit_px']:.2f}</code>\n"
             f"📊 <b>पॉईंट्स:</b> <code>{pos['pts']:+.2f} pts</code>\n"
             f"🛑 <b>कारण:</b> <code>{pos['exit_reason']}</code>\n"
-            f"💳 <b>Upstox Charges:</b> <code>₹{pos['charges']:.2f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 <b>या ट्रेडचा निव्वळ निकाल:</b> <b>₹ {pos['net_pnl']:+,.2f}</b>\n"
-            f"📈 <b>एकूण संचित नफा:</b> <b>₹ {self.cumulative_pnl:+,.2f}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📝 <i>दैनिक ट्रेड जर्नलमध्ये जतन केले आहे.</i>"
+            f"📈 <b>एकूण संचित नफा:</b> <b>₹ {self.cumulative_pnl:+,.2f}</b>"
         )
         send_telegram(msg)
 
@@ -716,10 +610,10 @@ class LivePaperTrader:
             send_telegram(f"🔒 <b>दैनिक उद्दिष्ट पूर्ण!</b>\nदिवसाचा नफा (₹{self.cumulative_pnl:,.2f}) लॉक केला आहे. आजचे नवीन ट्रेड्स थांबवले आहेत.")
         elif self.cumulative_pnl <= DAILY_MAX_LOSS:
             self.daily_locked = True
-            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{self.cumulative_pnl:,.2f}) ओलांडली. सिस्टीम सुरक्षित बंद केली आहे.")
+            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा ओलांडली. सिस्टीम सुरक्षित बंद केली आहे.")
         elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             self.daily_locked = True
-            send_telegram(f"🔒 <b>कॅपिटल प्रोटेक्शन लॉक:</b>\nसलग २ स्टॉपलॉस हिट झाल्याने उर्वरित सत्रासाठी ट्रेड्स थांबवले आहेत.")
+            send_telegram(f"🔒 <b>कॅपिटल प्रोटेक्शन लॉक:</b>\nसलग २ स्टॉपलॉस हिट झाल्याने ट्रेड्स थांबवले आहेत.")
 
         self.active_position = None
         self.pending_gann_setup = None
@@ -737,13 +631,11 @@ class LivePaperTrader:
         pos["peak_price"] = max(pos["peak_price"], ltp)
         gain = ltp - pos["entry_px"]
 
-        # De-risking: 1R नफ्यावर स्टॉपलॉस खरेदी किमतीवर ट्रेल
         if gain >= pos["opt_sl_pts"] and not pos["runner_mode"]:
             pos["runner_mode"] = True
             pos["sl_px"] = max(pos["sl_px"], pos["entry_px"] + 0.15 * pos["opt_sl_pts"])
             send_telegram(f"🛡️ <b>Runner Mode ON: SL ट्रेल केला (₹{pos['sl_px']:.2f})</b> | {pos['clean_name']}")
 
-        # डायनॅमिक ट्रेलिंग
         if gain >= (pos["opt_sl_pts"] * 1.5):
             new_sl = round(ltp - (pos["opt_sl_pts"] * 0.5), 2)
             if new_sl > pos["sl_px"]:
@@ -785,7 +677,6 @@ class LivePaperTrader:
         spot_high = float(completed_bar["high"])
         spot_low = float(completed_bar["low"])
         vwap_5m = float(completed_bar["vwap"])
-        vol_ratio = float(completed_bar["volume_ratio"])
 
         pcr = self.api.get_official_pcr(self.expiry)
         max_pain = self.api.get_official_max_pain(self.expiry)
@@ -793,10 +684,8 @@ class LivePaperTrader:
         if pcr is None or max_pain is None:
             return
 
-        # १. दर ५ मिनिटांनी नियमित टेलिग्राम पल्स पाठवणे
         self.send_5m_sentiment_pulse(df_5m, pcr, max_pain)
 
-        # २. चॉपी मार्केट फिल्टर
         choppy, chop_reason = is_market_choppy(df_5m, pcr)
         if choppy:
             if self.pending_gann_setup:
@@ -815,10 +704,10 @@ class LivePaperTrader:
         is_green = spot_close > spot_open
         is_red = spot_close < spot_open
 
-        # मागील ६ बार्सचा कन्सोलिडेशन हाय आणि लो
-        recent_6 = df_5m.tail(6)
-        consolidation_high = float(recent_6["high"].max())
-        consolidation_low = float(recent_6["low"].min())
+        # [FIX]: चालू बार वगळून मागील ६ बार्सचा कन्सोलिडेशन हाय आणि लो काढणे
+        prior_6 = df_5m.iloc[-7:-1]
+        consolidation_high = float(prior_6["high"].max())
+        consolidation_low = float(prior_6["low"].min())
 
         bullish_sentiment = (pcr >= 0.95) and (spot_close > vwap_5m)
         bearish_sentiment = (pcr <= 0.85) and (spot_close < vwap_5m)
@@ -829,9 +718,9 @@ class LivePaperTrader:
         if not self.pending_gann_setup:
             # 🟢 CE SETUP
             if bullish_sentiment and is_green and (body_ratio >= MIN_BODY_RATIO):
-                bottom_sweep_ce = (spot_low <= sup_level + 20.0) and (spot_close >= sup_level - 10.0)
-                retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 20.0 <= spot_low <= sup_level + 40.0)
-                breakout_ce = (spot_close > consolidation_high) and (spot_close > vwap_5m)
+                bottom_sweep_ce = (spot_low <= sup_level + 25.0) and (spot_close >= sup_level - 15.0)
+                retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 25.0 <= spot_low <= sup_level + 45.0)
+                breakout_ce = (spot_close > consolidation_high)
 
                 if bottom_sweep_ce or retest_ce or breakout_ce:
                     trigger_px = round(spot_high + buffer_pts, 2)
@@ -849,9 +738,9 @@ class LivePaperTrader:
 
             # 🔴 PE SETUP
             elif bearish_sentiment and is_red and (body_ratio >= MIN_BODY_RATIO):
-                top_sweep_pe = (spot_high >= res_level - 20.0) and (spot_close <= res_level + 10.0)
-                retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 40.0 <= spot_high <= res_level + 20.0)
-                breakdown_pe = (spot_close < consolidation_low) and (spot_close < vwap_5m)
+                top_sweep_pe = (spot_high >= res_level - 25.0) and (spot_close <= res_level + 15.0)
+                retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 45.0 <= spot_high <= res_level + 25.0)
+                breakdown_pe = (spot_close < consolidation_low)
 
                 if top_sweep_pe or retest_pe or breakdown_pe:
                     trigger_px = round(spot_low - buffer_pts, 2)
@@ -872,7 +761,7 @@ class LivePaperTrader:
         # ----------------------------------------------------
         if self.pending_gann_setup:
             setup = self.pending_gann_setup
-            if time.monotonic() - setup["armed_time"] > 900:  # १५ मिनिटांनंतर एक्सपायर
+            if time.monotonic() - setup["armed_time"] > 900:
                 self.pending_gann_setup = None
                 return
 
@@ -898,9 +787,8 @@ class LivePaperTrader:
                 target_chg_oi = call_chg if setup["side"] == "CE" else put_chg
                 target_strike_oi = call_oi if setup["side"] == "CE" else put_oi
 
-                # अनवाइंडिंग असल्यास ट्रेड नको
                 if target_chg_oi is not None and target_chg_oi < 0:
-                    print(f"[-] Unwinding detected on {atm_strike} ({target_chg_oi}). Trade Blocked.", flush=True)
+                    print(f"[-] Unwinding on {atm_strike} ({target_chg_oi}). Trade Blocked.", flush=True)
                     self.pending_gann_setup = None
                     return
 
@@ -952,7 +840,7 @@ def main():
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
         f"ट्रेडिंग विंडो: <code>{timings['session_start']} ➡️ {timings['entry_end']}</code>\n"
-        f"सिस्टीम: <b>5M Sentiment Pulse + Consolidation Breakout/Breakdown + 0.025% Buffer</b>"
+        f"सिस्टीम: <b>5M Sentiment Pulse + Consolidation Breakout + 0.025% Buffer</b>"
     )
     print(f"[*] 5M Gann Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
 
@@ -960,9 +848,8 @@ def main():
     try:
         while True:
             hhmm = now_ist().strftime("%H:%M")
-            
             if hhmm >= timings["market_end"]:
-                print(f"[*] {hhmm}: Market session संपले. Live Engine सुरक्षित थांबवत आहे...", flush=True)
+                print(f"[*] {hhmm}: Market session संपले. Live Engine थांबवत आहे...", flush=True)
                 send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे इंजिन सुरक्षित बंद केले आहे.")
                 break
 
