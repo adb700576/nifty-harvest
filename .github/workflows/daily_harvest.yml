@@ -19,7 +19,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl
+          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl matplotlib
           playwright install --with-deps chromium
 
       - name: Auto-Generate Fresh Upstox Token
@@ -67,17 +67,6 @@ jobs:
           conn.close()
           "
 
-      - name: Run Signal Test (Yesterday Report)
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
-            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-          fi
-          python -u test_yesterday_signals.py
-
       - name: Upload Harvested DB Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -116,6 +105,9 @@ jobs:
 
       - name: Generate Master Journal & Analytics
         if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python generate_journal_analytics.py
 
       - name: Commit & Push Journal Updates
@@ -123,5 +115,5 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add live_journal/*.csv
+          git add live_journal/*.csv || true
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs [skip ci]" && git push)
