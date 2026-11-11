@@ -1,21 +1,69 @@
 import os
+import math
 import sqlite3
 import datetime
 import urllib.parse
 import pytz
 import requests
 import pandas as pd
+import numpy as np
 
 DB_PATH = "nifty_vault.db"
 BASE_URL = "https://api.upstox.com"
 
-# टोकन फाईल किंवा एन्व्हायर्नमेंट व्हेरिएबलमधून घेणे
 ACCESS_TOKEN = ""
 if os.path.exists("ACCESS_TOKEN.txt"):
     with open("ACCESS_TOKEN.txt", "r") as f:
         ACCESS_TOKEN = f.read().strip()
 if not ACCESS_TOKEN:
     ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+
+
+# ========================= BLACK-SCHOLES FORMULA =========================
+def norm_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def norm_pdf(x):
+    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
+
+def calculate_greeks(spot, strike, t_years, opt_price, opt_type="CE", r=0.07):
+    """Black-Scholes IV आणि Delta काढणे"""
+    if spot <= 0 or strike <= 0 or t_years <= 0 or opt_price <= 0.05:
+        return 0.0, 0.0
+
+    # IV शोधण्यासाठी Bisection पद्धत
+    low_vol, high_vol = 0.01, 3.0
+    iv = 0.20  # फॉलबॅक
+
+    for _ in range(25):
+        mid_vol = (low_vol + high_vol) / 2.0
+        d1 = (math.log(spot / strike) + (r + 0.5 * mid_vol ** 2) * t_years) / (mid_vol * math.sqrt(t_years))
+        d2 = d1 - mid_vol * math.sqrt(t_years)
+
+        if opt_type == "CE":
+            theo_p = spot * norm_cdf(d1) - strike * math.exp(-r * t_years) * norm_cdf(d2)
+        else:
+            theo_p = strike * math.exp(-r * t_years) * norm_cdf(-d2) - spot * norm_cdf(-d1)
+
+        diff = theo_p - opt_price
+        if abs(diff) < 0.05:
+            iv = mid_vol
+            break
+        if diff > 0:
+            high_vol = mid_vol
+        else:
+            low_vol = mid_vol
+    else:
+        iv = (low_vol + high_vol) / 2.0
+
+    # अंतिम डेल्टा
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
+    if opt_type == "CE":
+        delta = norm_cdf(d1)
+    else:
+        delta = norm_cdf(d1) - 1.0
+
+    return round(float(iv), 4), round(float(delta), 4)
 
 
 def init_db():
@@ -63,7 +111,7 @@ def get_nifty_spot_history(target_date: str):
 
     res = requests.get(url, headers=headers, timeout=15)
     candles = []
-    
+
     if res.status_code == 200:
         candles = res.json().get("data", {}).get("candles", [])
 
@@ -75,25 +123,29 @@ def get_nifty_spot_history(target_date: str):
 
     if not candles:
         print(f"[-] NIFTY 50 स्पॉट कॅन्डल्स मिळाल्या नाहीत. API Status: {res.status_code}", flush=True)
-        return None
+        return None, {}
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     spot_close_latest = float(candles[0][4])
+    spot_map = {}
 
     for c in candles:
+        ts = str(c[0])
+        cp = float(c[4])
+        spot_map[ts] = cp
         cur.execute("""
             INSERT OR REPLACE INTO nifty_index_1m (timestamp, open, high, low, close, volume)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (c[0], float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])))
+        """, (ts, float(c[1]), float(c[2]), float(c[3]), cp, float(c[5])))
 
     conn.commit()
     conn.close()
     print(f"[+] [Harvester] चालू NIFTY 50 स्पॉट: {spot_close_latest}", flush=True)
-    return spot_close_latest
+    return spot_close_latest, spot_map
 
 
-def harvest_options_for_date(target_date: str, spot_price: float):
+def harvest_options_for_date(target_date: str, spot_price: float, spot_map: dict):
     contracts_url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
     print("[+] Options Instruments मास्टर डाऊनलोड होत आहे...", flush=True)
     try:
@@ -102,10 +154,7 @@ def harvest_options_for_date(target_date: str, spot_price: float):
         print(f"[-] Instruments लोड करता आले नाहीत: {e}", flush=True)
         return
 
-    # कॉलम नावे सुरक्षितरीत्या लहान अक्षरांमध्ये करणे
     df_inst.columns = [str(c).strip().lower() for c in df_inst.columns]
-    
-    # KeyError 'trading_symbol' फिक्स:
     sym_col = "tradingsymbol" if "tradingsymbol" in df_inst.columns else "trading_symbol"
 
     df_opt = df_inst[
@@ -125,6 +174,12 @@ def harvest_options_for_date(target_date: str, spot_price: float):
 
     active_expiry = valid_expiries[0]
     print(f"[+] [Expiry Selector] निवडलेली वैध आगामी एक्सपायरी: {active_expiry}", flush=True)
+
+    # एक्सपायरीसाठी शिल्लक दिवस
+    exp_dt = datetime.datetime.strptime(active_expiry, "%Y-%m-%d")
+    cur_dt = datetime.datetime.strptime(target_date, "%Y-%m-%d")
+    days_to_exp = max((exp_dt - cur_dt).days, 0.5)
+    t_years = days_to_exp / 365.0
 
     atm_strike = round(spot_price / 50.0) * 50.0
     strikes_to_track = [atm_strike + (i * 50) for i in range(-8, 9)]
@@ -146,11 +201,9 @@ def harvest_options_for_date(target_date: str, spot_price: float):
     for _, row in df_target.iterrows():
         raw_key = row["instrument_key"]
         inst_key = urllib.parse.quote(str(raw_key))
-        
-        # सुरक्षितरीत्या सिम्बॉल वाचणे (KeyError टाळण्यासाठी)
         sym = row.get(sym_col, row.get("symbol", str(raw_key)))
         strike = float(row["strike"])
-        opt_type = row["option_type"]
+        opt_type = str(row["option_type"]).upper()
 
         url = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{target_date}/{target_date}"
         res = requests.get(url, headers=headers, timeout=10)
@@ -165,15 +218,21 @@ def harvest_options_for_date(target_date: str, spot_price: float):
                 c_list = res_alt.json().get("data", {}).get("candles", [])
 
         for c in c_list:
+            ts = str(c[0])
+            opt_close = float(c[4])
+            spot_at_ts = spot_map.get(ts, spot_price)
+
+            # ग्रीक्स कॅल्क्युलेट करणे
+            iv, delta = calculate_greeks(spot_at_ts, strike, t_years, opt_close, opt_type)
+
             cur.execute("""
                 INSERT OR REPLACE INTO nifty_options_1m 
                 (timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, iv, delta)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (c[0], sym, strike, opt_type, float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5]), float(c[6]) if len(c) > 6 else 0.0, 0.0, 0.0))
+            """, (ts, sym, strike, opt_type, float(c[1]), float(c[2]), float(c[3]), opt_close, float(c[5]), float(c[6]) if len(c) > 6 else 0.0, iv, delta))
             total_opt_candles += 1
 
     conn.commit()
-
     cur.execute("SELECT COUNT(*) FROM nifty_index_1m")
     spot_count = cur.fetchone()[0]
     conn.close()
@@ -183,18 +242,15 @@ def harvest_options_for_date(target_date: str, spot_price: float):
 
 if __name__ == "__main__":
     init_db()
-
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.datetime.now(ist)
 
-    # वीकेंड असल्यास शुक्रवारची तारीख
     if now_ist.weekday() == 5:
         now_ist -= datetime.timedelta(days=1)
     elif now_ist.weekday() == 6:
         now_ist -= datetime.timedelta(days=2)
 
     t_date = now_ist.strftime("%Y-%m-%d")
-
-    spot = get_nifty_spot_history(t_date)
+    spot, spot_map = get_nifty_spot_history(t_date)
     if spot:
-        harvest_options_for_date(t_date, spot)
+        harvest_options_for_date(t_date, spot, spot_map)
