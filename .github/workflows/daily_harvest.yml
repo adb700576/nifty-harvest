@@ -115,5 +115,10 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add live_journal/*.csv || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs [skip ci]" && git push)
+          if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/*.csv 2>/dev/null)" ]; then
+            git add live_journal/*.csv
+            git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs [skip ci]" && git push)
+            echo "✅ Trade journal successfully committed to repository."
+          else
+            echo "[-] No trade journal files found to commit today."
+          fi
