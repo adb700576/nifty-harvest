@@ -58,7 +58,7 @@ POLL_INTERVAL = 1.0
 STRATEGY_INTERVAL = 10.0
 POSITION_UPDATE_INTERVAL = 180.0
 
-# कॅपिटल प्रोटेक्शन आणि ग्रीक्स फिल्टर्स
+# कॅपिटल प्रोटेक्शन आणि ग्रीक्स/OI फिल्टर्स
 DAILY_PROFIT_GOAL = 1500.0
 DAILY_MAX_LOSS = -1500.0
 MAX_CONSECUTIVE_LOSSES = 2
@@ -66,8 +66,9 @@ MAX_CONSECUTIVE_LOSSES = 2
 MIN_ADX_TREND = 18.0
 MIN_BODY_RATIO = 0.40
 ENTRY_BUFFER_PCT = 0.00025
-MAX_ALLOWED_IV = 28.0       # अत्यंत अस्थिर प्रीमियम टाळण्यासाठी
-MIN_ABS_DELTA = 0.35        # खूप दूरचे OTM टाळण्यासाठी
+MAX_ALLOWED_IV = 28.0          # अत्यंत अस्थिर प्रीमियम टाळण्यासाठी
+MIN_ABS_DELTA = 0.35           # खूप दूरचे OTM टाळण्यासाठी
+MIN_5M_OI_SHIFT = 50000        # ५ मिनिटांत किमान ५०,००० OI बदल (Short Covering / Writing ओळखण्यासाठी)
 
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
@@ -99,7 +100,7 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
         plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Gann Pivot: {gann_level:.1f}')
         plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Swing SL: {sl_price:.1f}')
         plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Target: {trg_price:.1f}')
-        plt.title("NIFTY 5M Gann + Live Greeks Setup Alert", fontsize=12, fontweight='bold')
+        plt.title("NIFTY 5M Gann + 5M OI Shift + Greeks Setup", fontsize=12, fontweight='bold')
         plt.legend(loc='upper left', fontsize=9)
         plt.grid(True, linestyle=":", alpha=0.5)
         plt.tight_layout()
@@ -239,13 +240,15 @@ class UpstoxClient:
         """
         PLC M-Bit Memory Block:
         एकाच वेळी Upstox Live Option Chain (/v2/option/chain) आणि Change-OI (/v2/market/change-oi) मधून:
-        1. चालू ATM च्या ±10 स्ट्राइक्स (±500 पॉईंट्स) मधील SMC Intraday ΔOI PCR
+        1. चालू ATM च्या ±10 स्ट्राइक्स (±500 पॉईंट्स) मधील SMC Intraday ΔOI PCR आणि Total OI
         2. ATM CE आणि PE चे प्रत्यक्ष Live Greeks (Delta, IV, Theta, Gamma) आणि LTP
         एका मेमरी डिक्शनरीमध्ये गोळा करणे.
         """
         memory = {
             "atm_strike": target_strike,
             "strike_range": f"{int(target_strike - 500)}-{int(target_strike + 500)}",
+            "total_call_oi": 0,
+            "total_put_oi": 0,
             "total_call_chg": 0,
             "total_put_chg": 0,
             "delta_oi_pcr": None,
@@ -253,13 +256,14 @@ class UpstoxClient:
             "pe": {"ltp": None, "delta": -0.52, "iv": 0.0, "theta": 0.0, "gamma": 0.0, "oi": 0, "chg_oi": 0}
         }
         try:
-            # 1. Live Option Chain मधून प्रत्यक्ष Greeks आणि OI काढणे
             res_chain = self.get("/v2/option/chain", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
                 "expiry_date": expiry
             })
             chain_list = res_chain.get("data", [])
             
+            tot_c_oi = 0
+            tot_p_oi = 0
             tot_c_chg = 0
             tot_p_chg = 0
             found_chain_chg = False
@@ -274,19 +278,20 @@ class UpstoxClient:
                 c_grk = c_opt.get("option_greeks", {})
                 p_grk = p_opt.get("option_greeks", {})
 
-                # ±10 स्ट्राइक्स (±500 पॉईंट्स) मधील इंट्राडे OI बदल (oi - prev_oi)
                 if abs(s_price - target_strike) <= 500:
                     c_oi = int(c_mkt.get("oi", 0) or 0)
                     c_prev = int(c_mkt.get("prev_oi", 0) or 0)
                     p_oi = int(p_mkt.get("oi", 0) or 0)
                     p_prev = int(p_mkt.get("prev_oi", 0) or 0)
 
+                    tot_c_oi += c_oi
+                    tot_p_oi += p_oi
+
                     if c_prev > 0 or p_prev > 0:
                         found_chain_chg = True
                         tot_c_chg += (c_oi - c_prev)
                         tot_p_chg += (p_oi - p_prev)
 
-                # ATM स्ट्राइकचे प्रत्यक्ष ग्रीक्स सेव्ह करणे
                 if s_price == target_strike:
                     memory["ce"] = {
                         "ltp": safe_float(c_mkt.get("ltp")),
@@ -307,7 +312,6 @@ class UpstoxClient:
                         "chg_oi": int((p_mkt.get("oi", 0) or 0) - (p_mkt.get("prev_oi", 0) or 0))
                     }
 
-            # 2. जर Option Chain मध्ये prev_oi नसेल, तर अधिकृत /v2/market/change-oi मधून ±10 स्ट्राइक्स घेणे
             if not found_chain_chg or (tot_c_chg == 0 and tot_p_chg == 0):
                 tot_c_chg = 0
                 tot_p_chg = 0
@@ -328,6 +332,8 @@ class UpstoxClient:
                         memory["ce"]["chg_oi"] = int(item.get("call_change_oi", 0))
                         memory["pe"]["chg_oi"] = int(item.get("put_change_oi", 0))
 
+            memory["total_call_oi"] = tot_c_oi
+            memory["total_put_oi"] = tot_p_oi
             memory["total_call_chg"] = tot_c_chg
             memory["total_put_chg"] = tot_p_chg
 
@@ -386,7 +392,35 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     x["rsi14"] = 100 - (100 / (1 + rs))
     return x
 
-def is_market_choppy(df_5m: pd.DataFrame, delta_pcr: float) -> Tuple[bool, str]:
+def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shift_call_oi: int) -> Tuple[str, str]:
+    """
+    ५-मिनिट कॅन्डल प्राईस ॲक्शन + ५-मिनिट OI बदल (5M-to-5M Shift) याचा सहसंबंध:
+    - Price ↑ + Call OI ↓ (<= -50k) => SHORT COVERING SQUEEZE (अत्यंत वेगवान तेजी)
+    - Price ↑ + Put OI ↑ (>= +50k)  => FRESH PUT WRITING (शाश्वत तेजी)
+    - Price ↓ + Put OI ↓ (<= -50k)  => PUT/LONG UNWINDING SQUEEZE (अत्यंत वेगवान मंदी)
+    - Price ↓ + Call OI ↑ (>= +50k) => FRESH CALL WRITING (शाश्वत मंदी)
+    - Price ↑ + Call OI ↑ (आणि Put OI ↓) => BULL TRAP (खोटा ब्रेकआऊट)
+    - Price ↓ + Put OI ↑ (आणि Call OI ↓) => BEAR TRAP (खोटा ब्रेकडाऊन)
+    """
+    if is_green:
+        if shift_call_oi <= -MIN_5M_OI_SHIFT:
+            return "SHORT_COVERING_SQUEEZE", "🚀 SHORT COVERING SQUEEZE (Call Writers Exit)"
+        if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= MIN_5M_OI_SHIFT:
+            return "FRESH_PUT_WRITING", "🟢 FRESH PUT WRITING (Bullish Support)"
+        if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= -MIN_5M_OI_SHIFT:
+            return "BULL_TRAP", "⚠️ BULL TRAP (Call Writing on Rise)"
+    elif is_red:
+        if shift_put_oi <= -MIN_5M_OI_SHIFT:
+            return "PUT_UNWINDING_SQUEEZE", "🔻 PUT/LONG UNWINDING (Put Writers Exit)"
+        if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= MIN_5M_OI_SHIFT:
+            return "FRESH_CALL_WRITING", "🔴 FRESH CALL WRITING (Bearish Resistance)"
+        if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= -MIN_5M_OI_SHIFT:
+            return "BEAR_TRAP", "⚠️ BEAR TRAP (Put Writing on Fall)"
+
+    return "NEUTRAL_OI_SHIFT", "⚪ NEUTRAL 5M OI SHIFT"
+
+
+def is_market_choppy(df_5m: pd.DataFrame, delta_pcr: float, buildup_code: str) -> Tuple[bool, str]:
     if len(df_5m) < 10:
         return True, "INSUFFICIENT_DATA"
 
@@ -396,10 +430,15 @@ def is_market_choppy(df_5m: pd.DataFrame, delta_pcr: float) -> Tuple[bool, str]:
     c_body = abs(last_bar["close"] - last_bar["open"])
     is_strong_bar = (c_body / c_range) >= 0.50
 
+    if buildup_code in ("BULL_TRAP", "BEAR_TRAP"):
+        return True, f"OI_TRAP_DETECTED ({buildup_code})"
+
     if adx is not None and adx < MIN_ADX_TREND and not is_strong_bar:
         return True, f"CHOPPY_REGIME_ADX_LOW ({adx:.1f} < {MIN_ADX_TREND})"
 
-    if 0.85 <= delta_pcr <= 1.15 and not is_strong_bar:
+    # जर Short Covering किंवा Put Unwinding सुरू असेल तर Neutral PCR झोनमध्येही मोमेंटम ट्रेडला परवानगी
+    is_squeeze = buildup_code in ("SHORT_COVERING_SQUEEZE", "PUT_UNWINDING_SQUEEZE")
+    if 0.85 <= delta_pcr <= 1.15 and not is_strong_bar and not is_squeeze:
         return True, f"NEUTRAL_DEAD_ZONE_DELTA_PCR (±10 ΔOI:{delta_pcr:.2f})"
 
     return False, "TRENDING_CLEAR"
@@ -415,6 +454,13 @@ class LivePaperTrader:
 
         # PLC M-Bit State Memory Registers
         self.live_memory_register = {}
+        self.prev_5m_oi_snapshot = None   # मागील ५-मिनिट कॅन्डलचा OI रजिस्टर
+        self.last_evaluated_5m_bar = None
+        self.current_5m_buildup_code = "NEUTRAL_OI_SHIFT"
+        self.current_5m_buildup_label = "⚪ NEUTRAL 5M OI SHIFT"
+        self.shift_5m_put_oi = 0
+        self.shift_5m_call_oi = 0
+
         self.cumulative_pnl = 0.0
         self.daily_locked = False
         self.consecutive_losses = 0
@@ -426,7 +472,7 @@ class LivePaperTrader:
         self.contracts_cache = {}
         self.failed_strikes = {}
         self.load_expiry_and_contracts()
-        print(f"[*] Live Memory Engine Ready: Daily Locked = {self.daily_locked}, PnL = ₹{self.cumulative_pnl}", flush=True)
+        print(f"[*] Live Memory + 5M OI Shift Engine Ready: Daily Locked = {self.daily_locked}, PnL = ₹{self.cumulative_pnl}", flush=True)
 
     def load_expiry_and_contracts(self):
         try:
@@ -455,6 +501,37 @@ class LivePaperTrader:
         except Exception as e:
             print(f"[-] Contracts loading error: {e}", flush=True)
             self.expiry = TODAY_STR
+
+    def update_5m_oi_shift_register(self, bar_time_str: str, is_green: bool, is_red: bool, mem: dict):
+        """
+        PLC 5M Shift Register:
+        दर नवीन ५-मिनिट कॅन्डल बंद झाल्यावर मागील ५-मिनिट कॅन्डलच्या OI सोबत तुलना करणे.
+        """
+        if self.last_evaluated_5m_bar == bar_time_str:
+            return
+
+        cur_put_chg = int(mem.get("total_put_chg", 0))
+        cur_call_chg = int(mem.get("total_call_chg", 0))
+
+        if self.prev_5m_oi_snapshot is not None:
+            self.shift_5m_put_oi = cur_put_chg - self.prev_5m_oi_snapshot["put_chg"]
+            self.shift_5m_call_oi = cur_call_chg - self.prev_5m_oi_snapshot["call_chg"]
+            self.current_5m_buildup_code, self.current_5m_buildup_label = classify_5m_oi_buildup(
+                is_green, is_red, self.shift_5m_put_oi, self.shift_5m_call_oi
+            )
+        else:
+            self.shift_5m_put_oi = 0
+            self.shift_5m_call_oi = 0
+            self.current_5m_buildup_code = "INITIAL_5M_SYNC"
+            self.current_5m_buildup_label = "⏳ INITIAL 5M SNAPSHOT SYNCED"
+
+        # आत्ताचा स्नॅपशॉट पुढच्या ५-मिनिट कॅन्डलच्या तुलनेसाठी सेव्ह करणे
+        self.prev_5m_oi_snapshot = {
+            "bar_time": bar_time_str,
+            "put_chg": cur_put_chg,
+            "call_chg": cur_call_chg
+        }
+        self.last_evaluated_5m_bar = bar_time_str
 
     def log_journal_csv(self, row: dict):
         exists = JOURNAL_CSV.exists()
@@ -488,22 +565,25 @@ class LivePaperTrader:
         ce_g = mem.get("ce", {})
         pe_g = mem.get("pe", {})
 
-        is_bullish = (delta_pcr > 1.15) and (spot > vwap)
-        is_bearish = (delta_pcr < 0.85) and (spot < vwap)
+        is_bullish = ((delta_pcr > 1.15) or (self.current_5m_buildup_code == "SHORT_COVERING_SQUEEZE")) and (spot > vwap)
+        is_bearish = ((delta_pcr < 0.85) or (self.current_5m_buildup_code == "PUT_UNWINDING_SQUEEZE")) and (spot < vwap)
 
         gann = get_gann_levels(spot, count=3)
         sup = gann["immediate_support"]
         res = gann["immediate_resistance"]
 
-        if adx < 18.0 and (0.85 <= delta_pcr <= 1.15):
+        if self.current_5m_buildup_code in ("BULL_TRAP", "BEAR_TRAP"):
+            total_sentiment = f"{self.current_5m_buildup_label}"
+            focus_action = "🚫 TRAP BLOCKED (Wait for Clean Confirmation)"
+        elif adx < 18.0 and (0.85 <= delta_pcr <= 1.15) and self.current_5m_buildup_code not in ("SHORT_COVERING_SQUEEZE", "PUT_UNWINDING_SQUEEZE"):
             total_sentiment = "⚪ CHOPPY / RANGEBOUND 💤"
             focus_action = "🚫 NO TRADE (Wait for Breakout / Capital Guard)"
         elif is_bullish:
             total_sentiment = "🟢 VERY BULLISH (+VE) 🚀"
-            focus_action = "🟢 FOCUS ON CE SIDE (±10 ΔOI + Live Greeks)"
+            focus_action = "🟢 FOCUS ON CE SIDE (5M OI Sync + Live Greeks)"
         elif is_bearish:
             total_sentiment = "🔴 VERY BEARISH (-VE) 🔻"
-            focus_action = "🔴 FOCUS ON PE SIDE (±10 ΔOI + Live Greeks)"
+            focus_action = "🔴 FOCUS ON PE SIDE (5M OI Sync + Live Greeks)"
         else:
             total_sentiment = "🟡 MIXED BIAS ⏳"
             focus_action = "⏳ WAIT & WATCH (Selective Levels Only)"
@@ -515,9 +595,11 @@ class LivePaperTrader:
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>Spot Close:</b> <code>{spot:.2f}</code> | <b>VWAP:</b> <code>{vwap:.2f}</code> ({vwap_status})\n"
             f"📐 <b>Gann Corridor:</b> <code>{sup:.1f}</code> ⬅️ <b>{spot:.1f}</b> ➡️ <code>{res:.1f}</code>\n\n"
-            f"🔹 <b>SMC ±10 STRIKES INTRADAY ΔOI ({s_range}):</b>\n"
+            f"🔹 <b>SMC ±10 STRIKES ΔOI & 5M SHIFT ({s_range}):</b>\n"
             f"• <b>Intraday ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain}</code>\n"
-            f"• <b>±10 ΔOI Put (PE):</b> <code>{tot_pe_chg:+,}</code> | <b>Call (CE):</b> <code>{tot_ce_chg:+,}</code>\n\n"
+            f"• <b>Day ΔOI PE:</b> <code>{tot_pe_chg:+,}</code> | <b>CE:</b> <code>{tot_ce_chg:+,}</code>\n"
+            f"• <b>Last 5M Shift:</b> <code>PE {self.shift_5m_put_oi:+,}</code> | <code>CE {self.shift_5m_call_oi:+,}</code>\n"
+            f"• <b>5M Build-up:</b> <b>{self.current_5m_buildup_label}</b>\n\n"
             f"🔹 <b>LIVE ATM GREEKS ({int(mem.get('atm_strike', 0))}):</b>\n"
             f"• <b>CE:</b> Δ <code>{ce_g.get('delta', 0):.2f}</code> | IV <code>{ce_g.get('iv', 0):.1f}%</code> | θ <code>{ce_g.get('theta', 0):.1f}</code>\n"
             f"• <b>PE:</b> Δ <code>{pe_g.get('delta', 0):.2f}</code> | IV <code>{pe_g.get('iv', 0):.1f}%</code> | θ <code>{pe_g.get('theta', 0):.1f}</code>\n\n"
@@ -528,11 +610,11 @@ class LivePaperTrader:
             f"🎯 <b>STRATEGY FOCUS:</b> <b>{focus_action}</b>"
         )
         send_telegram(msg)
-        print(f"[{bar_time_str}] Pulse Sent: {total_sentiment} (±10 ΔOI:{delta_pcr:.2f} | CE_IV:{ce_g.get('iv', 0):.1f}%)", flush=True)
+        print(f"[{bar_time_str}] Pulse: {self.current_5m_buildup_code} (±10 ΔOI:{delta_pcr:.2f} | 5M PE:{self.shift_5m_put_oi:+,} CE:{self.shift_5m_call_oi:+,})", flush=True)
 
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
-            f"🚀 <b>NIFTY 5M GANN + GREEKS ALGO: नवीन एन्ट्री (#{pos['trade_id']})</b>\n"
+            f"🚀 <b>NIFTY 5M GANN + OI SHIFT ALGO: नवीन एन्ट्री (#{pos['trade_id']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>ऑर्डर:</b> <b>BUY {pos['clean_name']}</b>\n"
             f"🏷️ <b>सिम्बॉल:</b> <code>{pos['symbol']}</code>\n"
@@ -541,8 +623,9 @@ class LivePaperTrader:
             f"🛑 <b>स्टॉपलॉस:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts)\n"
             f"🏁 <b>टार्गेट:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧬 <b>Live Option Greeks (Entry Snapshot):</b>\n"
+            f"🧬 <b>Live Option Greeks & 5M OI Sync:</b>\n"
             f"• <b>Delta (Δ):</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code> | <b>Theta:</b> <code>{pos['entry_theta']:.1f}</code>\n"
+            f"• <b>5M Build-up:</b> <code>{pos['oi_buildup']}</code>\n"
             f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (Gann Level: {pos['gann_level']:.1f})\n"
             f"📊 <b>±10 ΔOI PCR:</b> <code>{pos['delta_pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
             f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
@@ -583,10 +666,9 @@ class LivePaperTrader:
 
     def execute_entry(self, side: str, strike: float, ltp: float, instrument_key: str, symbol: str,
                       spot_px: float, gann_level: float, trigger_level: float, spot_sl: float, spot_target: float,
-                      delta_pcr: float, max_pain: float, greeks: dict, setup_type: str, df_5m: pd.DataFrame):
+                      delta_pcr: float, max_pain: float, greeks: dict, oi_buildup: str, setup_type: str, df_5m: pd.DataFrame):
         entry_price = ltp
         
-        # प्रत्यक्ष Live Delta वरून अचूक Option SL आणि Target मोजणे
         live_abs_delta = max(0.35, min(0.75, abs(float(greeks.get("delta", 0.52)))))
         
         spot_risk = abs(spot_px - spot_sl)
@@ -623,6 +705,7 @@ class LivePaperTrader:
             "entry_delta": round(float(greeks.get("delta", 0.52)), 3),
             "entry_iv": round(float(greeks.get("iv", 0.0)), 2),
             "entry_theta": round(float(greeks.get("theta", 0.0)), 2),
+            "oi_buildup": oi_buildup,
             "strike_oi": greeks.get("oi", 0),
             "change_oi": greeks.get("chg_oi", 0),
             "setup_type": setup_type,
@@ -631,7 +714,7 @@ class LivePaperTrader:
             "last_periodic_update": time.monotonic()
         }
 
-        print(f"\n[एन्ट्री ट्रिगर] {clean_name} @ ₹{entry_price} | Δ:{live_abs_delta:.2f} | IV:{greeks.get('iv',0):.1f}% | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
+        print(f"\n[एन्ट्री ट्रिगर] {clean_name} @ ₹{entry_price} | {oi_buildup} | Δ:{live_abs_delta:.2f} | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
         self.send_entry_alert(self.active_position, df_5m)
 
     def execute_exit(self, exit_price: float, reason: str):
@@ -729,6 +812,7 @@ class LivePaperTrader:
         df_5m = add_indicators_5m(df_5m)
         completed_bar = df_5m.iloc[-1]
         prev_bar = df_5m.iloc[-2]
+        bar_time_str = completed_bar["dt"].strftime("%H:%M")
 
         spot_close = float(completed_bar["close"])
         spot_open = float(completed_bar["open"])
@@ -736,6 +820,9 @@ class LivePaperTrader:
         spot_low = float(completed_bar["low"])
         vwap_5m = float(completed_bar["vwap"])
         adx_val = float(completed_bar.get("adx14", 0.0))
+
+        is_green = spot_close > spot_open
+        is_red = spot_close < spot_open
 
         max_pain = self.api.get_official_max_pain(self.expiry)
 
@@ -747,9 +834,12 @@ class LivePaperTrader:
         if max_pain is None or delta_pcr is None:
             return
 
+        # ५-मिनिट कॅन्डल + ५-मिनिट OI Shift सहसंबंध मोजणे
+        self.update_5m_oi_shift_register(bar_time_str, is_green, is_red, self.live_memory_register)
+
         self.send_5m_sentiment_pulse(df_5m, delta_pcr, max_pain, self.live_memory_register)
 
-        choppy, chop_reason = is_market_choppy(df_5m, delta_pcr)
+        choppy, chop_reason = is_market_choppy(df_5m, delta_pcr, self.current_5m_buildup_code)
         if choppy:
             if self.pending_gann_setup:
                 self.pending_gann_setup = None
@@ -764,15 +854,17 @@ class LivePaperTrader:
         body_ratio = c_body / c_range
 
         buffer_pts = round(spot_close * ENTRY_BUFFER_PCT, 2)
-        is_green = spot_close > spot_open
-        is_red = spot_close < spot_open
 
         prior_6 = df_5m.iloc[-7:-1]
         consolidation_high = float(prior_6["high"].max())
         consolidation_low = float(prior_6["low"].min())
 
-        bullish_sentiment = (delta_pcr > 1.15) and (spot_close > vwap_5m)
-        bearish_sentiment = (delta_pcr < 0.85) and (spot_close < vwap_5m)
+        # Bullish किंवा Bearish कन्फर्मेशन (PCR किंवा Short Covering Squeeze द्वारे)
+        is_short_covering = (self.current_5m_buildup_code == "SHORT_COVERING_SQUEEZE")
+        is_put_unwinding = (self.current_5m_buildup_code == "PUT_UNWINDING_SQUEEZE")
+
+        bullish_sentiment = ((delta_pcr > 1.15) or is_short_covering) and (spot_close > vwap_5m)
+        bearish_sentiment = ((delta_pcr < 0.85) or is_put_unwinding) and (spot_close < vwap_5m)
 
         # Sentiment Reversal Guard
         if self.pending_gann_setup:
@@ -784,7 +876,7 @@ class LivePaperTrader:
                 self.pending_gann_setup = None
 
         # ----------------------------------------------------
-        # ५-मिनिट कॅन्डलवर गॅन पॅटर्न ट्रिगर तयार करणे
+        # ५-मिनिट कॅन्डलवर गॅन + 5M OI Shift पॅटर्न ट्रिगर तयार करणे
         # ----------------------------------------------------
         if not self.pending_gann_setup:
             # 🟢 CE SETUP
@@ -793,19 +885,28 @@ class LivePaperTrader:
                 retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - 25.0 <= spot_low <= sup_level + 45.0)
                 breakout_ce = (spot_close > consolidation_high)
 
-                if bottom_sweep_ce or retest_ce or breakout_ce:
+                if bottom_sweep_ce or retest_ce or breakout_ce or is_short_covering:
                     trigger_px = round(spot_high + buffer_pts, 2)
-                    setup_name = "CONSOLIDATION_BREAKOUT_CE" if breakout_ce else ("BOTTOM_BOUNCE_CE" if bottom_sweep_ce else "5M_RETEST_CE")
+                    if is_short_covering:
+                        setup_name = "SHORT_COVERING_SQUEEZE_CE"
+                    elif breakout_ce:
+                        setup_name = "CONSOLIDATION_BREAKOUT_CE"
+                    elif bottom_sweep_ce:
+                        setup_name = "BOTTOM_BOUNCE_CE"
+                    else:
+                        setup_name = "5M_RETEST_CE"
+
                     self.pending_gann_setup = {
                         "side": "CE",
                         "setup_type": setup_name,
+                        "oi_buildup": self.current_5m_buildup_code,
                         "gann_level": sup_level,
                         "trigger_level": trigger_px,
                         "spot_sl": round(spot_low - 5.0, 2),
                         "spot_target": res_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M CE Armed: {setup_name} | Trigger @ {trigger_px} (±10 ΔOI:{delta_pcr})", flush=True)
+                    print(f"[!] 5M CE Armed: {setup_name} | {self.current_5m_buildup_code} | Trigger @ {trigger_px}", flush=True)
 
             # 🔴 PE SETUP
             elif bearish_sentiment and is_red and (body_ratio >= MIN_BODY_RATIO):
@@ -813,19 +914,28 @@ class LivePaperTrader:
                 retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - 45.0 <= spot_high <= res_level + 25.0)
                 breakdown_pe = (spot_close < consolidation_low)
 
-                if top_sweep_pe or retest_pe or breakdown_pe:
+                if top_sweep_pe or retest_pe or breakdown_pe or is_put_unwinding:
                     trigger_px = round(spot_low - buffer_pts, 2)
-                    setup_name = "CONSOLIDATION_BREAKDOWN_PE" if breakdown_pe else ("TOP_REJECT_PE" if top_sweep_pe else "5M_RETEST_PE")
+                    if is_put_unwinding:
+                        setup_name = "PUT_UNWINDING_SQUEEZE_PE"
+                    elif breakdown_pe:
+                        setup_name = "CONSOLIDATION_BREAKDOWN_PE"
+                    elif top_sweep_pe:
+                        setup_name = "TOP_REJECT_PE"
+                    else:
+                        setup_name = "5M_RETEST_PE"
+
                     self.pending_gann_setup = {
                         "side": "PE",
                         "setup_type": setup_name,
+                        "oi_buildup": self.current_5m_buildup_code,
                         "gann_level": res_level,
                         "trigger_level": trigger_px,
                         "spot_sl": round(spot_high + 5.0, 2),
                         "spot_target": sup_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M PE Armed: {setup_name} | Trigger @ {trigger_px} (±10 ΔOI:{delta_pcr})", flush=True)
+                    print(f"[!] 5M PE Armed: {setup_name} | {self.current_5m_buildup_code} | Trigger @ {trigger_px}", flush=True)
 
         # ----------------------------------------------------
         # चालू लाईव्ह टिकवर ०.०२५% बफर पार झाल्यावर Live Greeks तपासून एन्ट्री
@@ -854,7 +964,6 @@ class LivePaperTrader:
                     else:
                         del self.failed_strikes[atm_strike]
 
-                # एन्ट्रीच्या क्षणाचा ताजा Live Greeks मेमरी ब्लॉक घेणे
                 fresh_mem = self.api.get_live_option_chain_memory(self.expiry, atm_strike)
                 opt_greeks = fresh_mem["ce"] if setup["side"] == "CE" else fresh_mem["pe"]
 
@@ -863,25 +972,25 @@ class LivePaperTrader:
                 live_abs_delta = abs(float(opt_greeks.get("delta", 0.52)))
                 live_theta = float(opt_greeks.get("theta", 0.0))
 
-                # 1. OI Unwinding Check
-                if target_chg_oi < 0:
+                # 1. OI Unwinding Check (जर Short Covering Squeeze नसेल तरच आपल्या बाजूच्या OI घटला विरोध करा)
+                if target_chg_oi < 0 and setup["oi_buildup"] not in ("SHORT_COVERING_SQUEEZE", "PUT_UNWINDING_SQUEEZE"):
                     print(f"[-] Unwinding on {atm_strike} ({target_chg_oi}). Trade Blocked.", flush=True)
                     self.pending_gann_setup = None
                     return
 
-                # 2. IV Spike Protection (खूप महाग किंवा क्रॅश होणारा प्रीमियम टाळणे)
+                # 2. IV Spike Protection
                 if live_iv > MAX_ALLOWED_IV:
                     print(f"[-] High IV Spike ({live_iv:.1f}% > {MAX_ALLOWED_IV}%). Trade Blocked.", flush=True)
                     self.pending_gann_setup = None
                     return
 
-                # 3. Minimum Delta Check (कमकुवत प्रीमियम टाळणे)
+                # 3. Minimum Delta Check
                 if live_abs_delta < MIN_ABS_DELTA:
                     print(f"[-] Weak Option Delta ({live_abs_delta:.2f} < {MIN_ABS_DELTA}). Trade Blocked.", flush=True)
                     self.pending_gann_setup = None
                     return
 
-                # 4. Late-Session High Theta Decay Guard (दुपारी २ नंतर वेगवान मोमेंटम नसेल तर थांबा)
+                # 4. Late-Session High Theta Decay Guard
                 if hhmm >= "14:00" and abs(live_theta) > 15.0 and adx_val < 22.0:
                     print(f"[-] High Late Theta Decay ({live_theta:.1f}) with weak ADX ({adx_val:.1f}). Blocked.", flush=True)
                     self.pending_gann_setup = None
@@ -910,6 +1019,7 @@ class LivePaperTrader:
                         delta_pcr=delta_pcr,
                         max_pain=max_pain,
                         greeks=opt_greeks,
+                        oi_buildup=setup["oi_buildup"],
                         setup_type=setup["setup_type"],
                         df_5m=df_5m
                     )
@@ -930,13 +1040,13 @@ def main():
     trader = LivePaperTrader(api, timings)
 
     send_telegram(
-        f"🟢 <b>NIFTY 5M GANN + LIVE GREEKS ALGO: सुरू झाले</b>\n"
+        f"🟢 <b>NIFTY 5M GANN + 5M OI SHIFT + GREEKS ALGO: सुरू झाले</b>\n"
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
         f"ट्रेडिंग विंडो: <code>{timings['session_start']} ➡️ {timings['entry_end']}</code>\n"
-        f"सिस्टीम: <b>Live M-Bit Memory (Greeks Δ/IV/θ + ±10 ΔOI PCR + Gann)</b>"
+        f"सिस्टीम: <b>PLC 5M Shift Register + Live Greeks (Δ/IV/θ) + ±10 ΔOI PCR</b>"
     )
-    print(f"[*] Live Greeks + Gann Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
+    print(f"[*] Live 5M OI Shift + Greeks Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
