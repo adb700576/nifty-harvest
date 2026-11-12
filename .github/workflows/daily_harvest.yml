@@ -2,7 +2,7 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '10 4 * * 1-5'  # Somvar te Shukravar 04:10 UTC (9:40 AM IST) - 3:30 PM पर्यंत पूर्ण चालण्यासाठी
+    - cron: '10 4 * * 1-5'  # Somvar te Shukravar 04:10 UTC (9:40 AM IST)
   workflow_dispatch:
 
 permissions:
@@ -45,39 +45,7 @@ jobs:
             echo "[-] ACCESS_TOKEN.txt empty or missing, fallback to Secrets"
           fi
 
-      - name: Run Harvester
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        run: |
-          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
-            export UPSTOX_ACCESS_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-          fi
-          python -u harvester.py
-
-      - name: Inspect Vault Data
-        run: |
-          python -u -c "
-          import sqlite3, pandas as pd
-          conn = sqlite3.connect('nifty_vault.db')
-          cur = conn.cursor()
-          cur.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='nifty_options_1m'\")
-          if cur.fetchone():
-              print('\n========== स्ट्राइकनिहाय सारांश ==========')
-              df_sum = pd.read_sql_query('SELECT symbol, option_type, strike, COUNT(*) as candles, MIN(open) as min_p, MAX(close) as max_p, AVG(iv) as avg_iv, AVG(delta) as avg_delta FROM nifty_options_1m GROUP BY symbol', conn)
-              print(df_sum.to_string(index=False))
-          else:
-              print('[!] टेबल nifty_options_1m अद्याप तयार झालेले नाही.')
-          conn.close()
-          "
-
-      - name: Upload Harvested DB Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: harvested-nifty-vault
-          path: nifty_vault.db
-
-      - name: Run Live Paper Trader Engine
+      - name: Run Live Paper Trader Engine (Live Greeks + Memory)
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
