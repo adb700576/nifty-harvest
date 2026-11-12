@@ -115,7 +115,7 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
                     files={"photo": img},
                     timeout=10
                 )
-    except Exception as e:
+    except Exception:
         send_telegram(caption_text)
 
 def now_ist() -> datetime:
@@ -219,24 +219,6 @@ class UpstoxClient:
     def get_official_charges(self, instrument_key: str, qty: int, buy_price: float, sell_price: float) -> dict:
         return {"total_charges": 52.0, "brokerage": 40.0, "stt": 6.5}
 
-    def get_official_pcr(self, expiry: str) -> Optional[float]:
-        try:
-            params = {
-                "instrument_key": "NSE_INDEX|Nifty 50",
-                "expiry": expiry,
-                "date": TODAY_STR,
-                "bucket_interval": 15
-            }
-            res = self.get("/v2/market/pcr", params=params)
-            data = res.get("data", {})
-            insights = data.get("insights", [])
-            if insights:
-                return round(float(insights[-1].get("pcr", data.get("pcr", 0.0))), 2)
-            val = data.get("pcr")
-            return round(float(val), 2) if val is not None else None
-        except Exception:
-            return None
-
     def get_official_max_pain(self, expiry: str) -> Optional[float]:
         try:
             params = {
@@ -251,8 +233,21 @@ class UpstoxClient:
         except Exception:
             return None
 
-    def get_strike_oi_and_change(self, expiry: str, target_strike: float):
-        call_oi, put_oi, call_chg, put_chg = None, None, None, None
+    def get_oi_chain_analytics(self, expiry: str, target_strike: float) -> dict:
+        """
+        चालू ATM च्या ±10 स्ट्राइक्स (±500 पॉईंट्स) मधील खऱ्या इंट्राडे Change in OI वरून
+        SMC शैलीतील ΔOI PCR मोजणे (दूरचे हेजिंग OTM स्ट्राइक्स वगळून).
+        """
+        result = {
+            "atm_call_oi": None,
+            "atm_put_oi": None,
+            "atm_call_chg": None,
+            "atm_put_chg": None,
+            "total_call_chg": 0,
+            "total_put_chg": 0,
+            "delta_oi_pcr": None,
+            "strike_range": f"{int(target_strike - 500)}-{int(target_strike + 500)}"
+        }
         try:
             res_oi = self.get("/v2/market/oi", {
                 "instrument_key": "NSE_INDEX|Nifty 50",
@@ -261,8 +256,8 @@ class UpstoxClient:
             })
             for item in res_oi.get("data", {}).get("call_put_oi_data_list", []):
                 if float(item.get("strike_price", 0)) == target_strike:
-                    call_oi = int(item.get("call_oi", 0))
-                    put_oi = int(item.get("put_oi", 0))
+                    result["atm_call_oi"] = int(item.get("call_oi", 0))
+                    result["atm_put_oi"] = int(item.get("put_oi", 0))
                     break
 
             res_chg = self.get("/v2/market/change-oi", {
@@ -271,14 +266,34 @@ class UpstoxClient:
                 "date": TODAY_STR,
                 "interval": 1
             })
+            tot_c_chg = 0
+            tot_p_chg = 0
             for item in res_chg.get("data", {}).get("call_put_oi_data_list", []):
-                if float(item.get("strike_price", 0)) == target_strike:
-                    call_chg = int(item.get("call_change_oi", 0))
-                    put_chg = int(item.get("put_change_oi", 0))
-                    break
+                s_price = float(item.get("strike_price", 0))
+                
+                # फक्त चालू ATM च्या ±10 स्ट्राइक्स (±500 पॉईंट्स) मधील डेटा घेणे (हेजिंग OTM वगळणे)
+                if abs(s_price - target_strike) <= 500:
+                    c_chg = int(item.get("call_change_oi", 0))
+                    p_chg = int(item.get("put_change_oi", 0))
+                    tot_c_chg += c_chg
+                    tot_p_chg += p_chg
+
+                if s_price == target_strike:
+                    result["atm_call_chg"] = int(item.get("call_change_oi", 0))
+                    result["atm_put_chg"] = int(item.get("put_change_oi", 0))
+
+            result["total_call_chg"] = tot_c_chg
+            result["total_put_chg"] = tot_p_chg
+
+            if tot_c_chg > 0:
+                result["delta_oi_pcr"] = round(tot_p_chg / tot_c_chg, 2)
+            elif tot_p_chg > 0 and tot_c_chg <= 0:
+                result["delta_oi_pcr"] = 2.50  # तीव्र Put Writing / Call Unwinding
+            elif tot_p_chg <= 0 and tot_c_chg > 0:
+                result["delta_oi_pcr"] = 0.40  # तीव्र Call Writing / Put Unwinding
         except Exception:
             pass
-        return call_oi, put_oi, call_chg, put_chg
+        return result
 
 
 def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict:
@@ -325,7 +340,7 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     x["rsi14"] = 100 - (100 / (1 + rs))
     return x
 
-def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
+def is_market_choppy(df_5m: pd.DataFrame, delta_pcr: float) -> Tuple[bool, str]:
     if len(df_5m) < 10:
         return True, "INSUFFICIENT_DATA"
 
@@ -338,8 +353,8 @@ def is_market_choppy(df_5m: pd.DataFrame, pcr: float) -> Tuple[bool, str]:
     if adx is not None and adx < MIN_ADX_TREND and not is_strong_bar:
         return True, f"CHOPPY_REGIME_ADX_LOW ({adx:.1f} < {MIN_ADX_TREND})"
 
-    if 0.88 <= pcr <= 0.92 and not is_strong_bar:
-        return True, f"NEUTRAL_DEAD_ZONE_PCR ({pcr:.2f})"
+    if 0.85 <= delta_pcr <= 1.15 and not is_strong_bar:
+        return True, f"NEUTRAL_DEAD_ZONE_DELTA_PCR (±10 ΔOI:{delta_pcr:.2f})"
 
     return False, "TRENDING_CLEAR"
 
@@ -402,7 +417,7 @@ class LivePaperTrader:
                 writer.writeheader()
             writer.writerow(row)
 
-    def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, pcr: float, max_pain: float):
+    def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, delta_pcr: float, max_pain: float, oi_data: dict):
         if df_5m.empty:
             return
 
@@ -420,38 +435,27 @@ class LivePaperTrader:
         atr = float(last_bar.get("atr14", 0.0))
 
         atm_strike = round(spot / 50.0) * 50.0
-        c_oi, p_oi, c_chg, p_chg = self.api.get_strike_oi_and_change(self.expiry, atm_strike)
-        ce_chg_val = c_chg if c_chg is not None else 0
-        pe_chg_val = p_chg if p_chg is not None else 0
+        tot_pe_chg = oi_data.get("total_put_chg", 0)
+        tot_ce_chg = oi_data.get("total_call_chg", 0)
+        s_range = oi_data.get("strike_range", "")
 
-        bullish_score = 0
-        bearish_score = 0
-
-        if pcr >= 0.95: bullish_score += 1
-        elif pcr <= 0.85: bearish_score += 1
-
-        if pe_chg_val > ce_chg_val: bullish_score += 1
-        elif ce_chg_val > pe_chg_val: bearish_score += 1
-
-        if spot > vwap: bullish_score += 1
-        elif spot < vwap: bearish_score += 1
-
-        if rsi >= 52: bullish_score += 1
-        elif rsi <= 48: bearish_score += 1
+        # फक्त ±10 Strikes Intraday ΔOI PCR वर आधारित दिशा
+        is_bullish = (delta_pcr > 1.15) and (spot > vwap)
+        is_bearish = (delta_pcr < 0.85) and (spot < vwap)
 
         gann = get_gann_levels(spot, count=3)
         sup = gann["immediate_support"]
         res = gann["immediate_resistance"]
 
-        if adx < 18.0 and (0.88 <= pcr <= 0.92):
+        if adx < 18.0 and (0.85 <= delta_pcr <= 1.15):
             total_sentiment = "⚪ CHOPPY / RANGEBOUND 💤"
             focus_action = "🚫 NO TRADE (Wait for Breakout / Capital Guard)"
-        elif bullish_score >= 3:
+        elif is_bullish:
             total_sentiment = "🟢 VERY BULLISH (+VE) 🚀"
-            focus_action = "🟢 FOCUS ON CE SIDE (Gann Bounce / Retest Buy)"
-        elif bearish_score >= 3:
+            focus_action = "🟢 FOCUS ON CE SIDE (±10 ΔOI Bullish)"
+        elif is_bearish:
             total_sentiment = "🔴 VERY BEARISH (-VE) 🔻"
-            focus_action = "🔴 FOCUS ON PE SIDE (Gann Breakdown / Rejection)"
+            focus_action = "🔴 FOCUS ON PE SIDE (±10 ΔOI Bearish)"
         else:
             total_sentiment = "🟡 MIXED BIAS ⏳"
             focus_action = "⏳ WAIT & WATCH (Selective Levels Only)"
@@ -463,10 +467,10 @@ class LivePaperTrader:
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>Spot Close:</b> <code>{spot:.2f}</code> | <b>VWAP:</b> <code>{vwap:.2f}</code> ({vwap_status})\n"
             f"📐 <b>Gann Corridor:</b> <code>{sup:.1f}</code> ⬅️ <b>{spot:.1f}</b> ➡️ <code>{res:.1f}</code>\n\n"
-            f"🔹 <b>DERIVATIVE DATA (ATM {int(atm_strike)}):</b>\n"
-            f"• <b>PCR:</b> <code>{pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain}</code>\n"
-            f"• <b>ΔOI Put (PE):</b> <code>{pe_chg_val:+,}</code>\n"
-            f"• <b>ΔOI Call (CE):</b> <code>{ce_chg_val:+,}</code>\n\n"
+            f"🔹 <b>SMC ±10 STRIKES INTRADAY ΔOI ({s_range}):</b>\n"
+            f"• <b>Intraday ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain}</code>\n"
+            f"• <b>±10 ΔOI Put (PE):</b> <code>{tot_pe_chg:+,}</code>\n"
+            f"• <b>±10 ΔOI Call (CE):</b> <code>{tot_ce_chg:+,}</code>\n\n"
             f"🔹 <b>MOMENTUM & VOLATILITY:</b>\n"
             f"• <b>RSI (14):</b> <code>{rsi:.1f}</code>\n"
             f"• <b>ADX (14):</b> <code>{adx:.1f}</code> {'⚡ (Trending)' if adx >= 18 else '💤 (Chop)'}\n"
@@ -476,7 +480,7 @@ class LivePaperTrader:
             f"🎯 <b>STRATEGY FOCUS:</b> <b>{focus_action}</b>"
         )
         send_telegram(msg)
-        print(f"[{bar_time_str}] 5M Sentiment Sent: {total_sentiment}", flush=True)
+        print(f"[{bar_time_str}] 5M Sentiment Sent: {total_sentiment} (±10 ΔOI PCR:{delta_pcr:.2f})", flush=True)
 
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
@@ -492,7 +496,7 @@ class LivePaperTrader:
             f"📋 <b>5-Min Setup Details:</b>\n"
             f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> (Gann Level: {pos['gann_level']:.1f})\n"
             f"🎯 <b>Trigger Level:</b> <code>₹{pos['trigger_level']:.2f}</code>\n"
-            f"📊 <b>PCR:</b> <code>{pos['pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
+            f"📊 <b>±10 ΔOI PCR:</b> <code>{pos['delta_pcr']:.2f}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
             f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
             f"⏱️ <b>वेळ:</b> <code>{pos['entry_time']}</code>"
         )
@@ -531,7 +535,7 @@ class LivePaperTrader:
 
     def execute_entry(self, side: str, strike: float, ltp: float, instrument_key: str, symbol: str,
                       spot_px: float, gann_level: float, trigger_level: float, spot_sl: float, spot_target: float,
-                      pcr: float, max_pain: float, strike_oi: int, chg_oi: int, setup_type: str, df_5m: pd.DataFrame):
+                      delta_pcr: float, max_pain: float, strike_oi: int, chg_oi: int, setup_type: str, df_5m: pd.DataFrame):
         entry_price = ltp
         delta = 0.52
         
@@ -563,7 +567,8 @@ class LivePaperTrader:
             "trigger_level": trigger_level,
             "spot_sl": spot_sl,
             "spot_target": spot_target,
-            "pcr": pcr,
+            "pcr": delta_pcr,
+            "delta_pcr": delta_pcr,
             "max_pain": max_pain if max_pain else "N/A",
             "strike_oi": strike_oi,
             "change_oi": chg_oi,
@@ -678,15 +683,19 @@ class LivePaperTrader:
         spot_low = float(completed_bar["low"])
         vwap_5m = float(completed_bar["vwap"])
 
-        pcr = self.api.get_official_pcr(self.expiry)
         max_pain = self.api.get_official_max_pain(self.expiry)
 
-        if pcr is None or max_pain is None:
+        # चालू स्पॉटनुसार डायनॅमिक ATM आणि ±10 स्ट्राइक्सचा Intraday ΔOI डेटा काढणे
+        atm_strike = round(spot_close / 50.0) * 50.0
+        oi_data = self.api.get_oi_chain_analytics(self.expiry, atm_strike)
+        delta_pcr = oi_data.get("delta_oi_pcr")
+
+        if max_pain is None or delta_pcr is None:
             return
 
-        self.send_5m_sentiment_pulse(df_5m, pcr, max_pain)
+        self.send_5m_sentiment_pulse(df_5m, delta_pcr, max_pain, oi_data)
 
-        choppy, chop_reason = is_market_choppy(df_5m, pcr)
+        choppy, chop_reason = is_market_choppy(df_5m, delta_pcr)
         if choppy:
             if self.pending_gann_setup:
                 self.pending_gann_setup = None
@@ -704,13 +713,26 @@ class LivePaperTrader:
         is_green = spot_close > spot_open
         is_red = spot_close < spot_open
 
-        # [FIX]: चालू बार वगळून मागील ६ बार्सचा कन्सोलिडेशन हाय आणि लो काढणे
         prior_6 = df_5m.iloc[-7:-1]
         consolidation_high = float(prior_6["high"].max())
         consolidation_low = float(prior_6["low"].min())
 
-        bullish_sentiment = (pcr >= 0.95) and (spot_close > vwap_5m)
-        bearish_sentiment = (pcr <= 0.85) and (spot_close < vwap_5m)
+        # ==============================================================================
+        # फक्त ±10 Strikes SMC Intraday ΔOI PCR नियम (Whole PCR कन्फर्मेशन काढले आहे)
+        # 🟢 Bullish: ±10 Intraday ΔOI PCR > 1.15 आणि Spot > VWAP
+        # 🔴 Bearish: ±10 Intraday ΔOI PCR < 0.85 आणि Spot < VWAP
+        # ==============================================================================
+        bullish_sentiment = (delta_pcr > 1.15) and (spot_close > vwap_5m)
+        bearish_sentiment = (delta_pcr < 0.85) and (spot_close < vwap_5m)
+
+        # Sentiment Reversal Guard: आर्म केलेला सेटअप असताना सेन्टिमेंट कमकुवत झाल्यास रद्द करा
+        if self.pending_gann_setup:
+            if self.pending_gann_setup["side"] == "CE" and not bullish_sentiment:
+                print(f"[-] Sentiment weakened (±10 ΔOI:{delta_pcr}). Cancelling CE setup.", flush=True)
+                self.pending_gann_setup = None
+            elif self.pending_gann_setup["side"] == "PE" and not bearish_sentiment:
+                print(f"[-] Sentiment weakened (±10 ΔOI:{delta_pcr}). Cancelling PE setup.", flush=True)
+                self.pending_gann_setup = None
 
         # ----------------------------------------------------
         # ५-मिनिट कॅन्डलवर गॅन पॅटर्न ट्रिगर तयार करणे
@@ -734,7 +756,7 @@ class LivePaperTrader:
                         "spot_target": res_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M CE Armed: {setup_name} | Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
+                    print(f"[!] 5M CE Armed: {setup_name} | Trigger @ {trigger_px} (±10 ΔOI:{delta_pcr})", flush=True)
 
             # 🔴 PE SETUP
             elif bearish_sentiment and is_red and (body_ratio >= MIN_BODY_RATIO):
@@ -754,7 +776,7 @@ class LivePaperTrader:
                         "spot_target": sup_level,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] 5M PE Armed: {setup_name} | Trigger @ {trigger_px} (0.025% Buffer)", flush=True)
+                    print(f"[!] 5M PE Armed: {setup_name} | Trigger @ {trigger_px} (±10 ΔOI:{delta_pcr})", flush=True)
 
         # ----------------------------------------------------
         # चालू लाईव्ह टिकवर ०.०२५% बफर पार झाला का ते पाहणे
@@ -783,9 +805,9 @@ class LivePaperTrader:
                     else:
                         del self.failed_strikes[atm_strike]
 
-                call_oi, put_oi, call_chg, put_chg = self.api.get_strike_oi_and_change(self.expiry, atm_strike)
-                target_chg_oi = call_chg if setup["side"] == "CE" else put_chg
-                target_strike_oi = call_oi if setup["side"] == "CE" else put_oi
+                latest_oi = self.api.get_oi_chain_analytics(self.expiry, atm_strike)
+                target_chg_oi = latest_oi.get("atm_call_chg") if setup["side"] == "CE" else latest_oi.get("atm_put_chg")
+                target_strike_oi = latest_oi.get("atm_call_oi") if setup["side"] == "CE" else latest_oi.get("atm_put_oi")
 
                 if target_chg_oi is not None and target_chg_oi < 0:
                     print(f"[-] Unwinding on {atm_strike} ({target_chg_oi}). Trade Blocked.", flush=True)
@@ -812,7 +834,7 @@ class LivePaperTrader:
                         trigger_level=setup["trigger_level"],
                         spot_sl=setup["spot_sl"],
                         spot_target=setup["spot_target"],
-                        pcr=pcr,
+                        delta_pcr=delta_pcr,
                         max_pain=max_pain,
                         strike_oi=target_strike_oi or 0,
                         chg_oi=target_chg_oi or 0,
@@ -840,7 +862,7 @@ def main():
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
         f"ट्रेडिंग विंडो: <code>{timings['session_start']} ➡️ {timings['entry_end']}</code>\n"
-        f"सिस्टीम: <b>5M Sentiment Pulse + Consolidation Breakout + 0.025% Buffer</b>"
+        f"सिस्टीम: <b>SMC ±10 Strikes Intraday ΔOI PCR + Gann Breakout + Sentiment Guard</b>"
     )
     print(f"[*] 5M Gann Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
 
