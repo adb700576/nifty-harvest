@@ -101,19 +101,26 @@ ACTIVE_INDICES: List[str] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SE
 POLL_INTERVAL = 1.0
 STRATEGY_INTERVAL = 12.0
 POSITION_UPDATE_INTERVAL = 180.0
-MAX_SIMULTANEOUS_POSITIONS = 2     # एकाच वेळी जास्तीत जास्त २ वेगवेगळ्या इंडेक्समध्ये पोझिशन्स
+MAX_SIMULTANEOUS_POSITIONS = 2     # एकाच वेळी कमाल २ वेगवेगळ्या इंडेक्समध्ये पोझिशन्स
 
-# Pure Integer Gann & Breakout-Retest Parameters
-GANN_PROXIMITY_PCT = 0.0014        # शुद्ध पूर्णांक Gann Level जवळचा झोन = 0.14%
-GANN_RETEST_BAND_PCT = 0.0020      # Gann Retest झोन = 0.20%
-ENTRY_BUFFER_PCT = 0.00025         # Breakout Buffer = 0.025%
+# Gann 0.50 Lattice, VWAP & Price Action Parameters
+GANN_PROXIMITY_PCT = 0.0012        # Gann Level (1.0 & 0.5 step) जवळचा झोन = 0.12%
+GANN_RETEST_BAND_PCT = 0.0018      # Gann Retest झोन = 0.18%
+VWAP_TOUCH_BAND_PCT = 0.0008       # VWAP Rejection स्पर्श झोन = 0.08%
+ENTRY_BUFFER_PCT = 0.00020         # Breakout Buffer = 0.020%
 MIN_REMAINING_FUEL_PCT = 0.0010    # दिवसाचे किमान शिल्लक इंधन = 0.10%
 STRIKE_SCAN_RANGE_PCT = 0.020      # Spot च्या ±2.0% रेंजमधील सर्व स्ट्राइक्स
 
-# Backtest-Proven Candle & Volume Expansion Rules
-MIN_FUT_VOL_RATIO = 1.20           # Futures Volume >= 1.20x of 20-bar SMA
-MIN_RANGE_ATR_MULT = 1.15          # Candle Range >= 1.15x of ATR14
+# Price Action & Momentum Thresholds
+MIN_ADX_MOMENTUM = 18.0            # ट्रेंडिंग मोमेंटमसाठी किमान ADX
+MIN_FUT_VOL_RATIO = 1.15           # Futures Volume >= 1.15x of 20-bar SMA
+MIN_RANGE_ATR_MULT = 1.10          # Candle Range >= 1.10x of ATR14
 MIN_BODY_RATIO = 0.45              # Solid Candle Body >= 45%
+MIN_REJECTION_WICK_RATIO = 0.45    # Reversal Rejection Wick >= 45%
+
+# PCR Velocity (Slope) Thresholds
+PCR_SLOPE_BEAR_THRESHOLD = -0.22
+PCR_SLOPE_BULL_THRESHOLD = 0.20
 
 # Option Premium Percentage & ATR*Delta SL/Target (1 : 1.50 R:R)
 MIN_OPT_SL_PCT = 0.10              # ऑप्शन प्रीमियमच्या किमान 10% SL
@@ -122,7 +129,7 @@ MAX_OPT_TRG_PCT = 0.35             # ऑप्शन प्रीमियमच
 REALISTIC_RRR = 1.50               # 1 : 1.50 रिस्क-रिवॉर्ड
 
 # Global Daily Capital Protection
-GLOBAL_DAILY_PROFIT_GOAL = 3000.0
+GLOBAL_DAILY_PROFIT_GOAL = 3500.0
 GLOBAL_DAILY_MAX_LOSS = -2500.0
 MAX_CONSECUTIVE_LOSSES = 2
 
@@ -157,14 +164,18 @@ def send_telegram_chart_alert(index_code: str, df_5m: pd.DataFrame, gann_level: 
         return
 
     try:
-        recent = df_5m.tail(25)
+        recent = df_5m.tail(28)
         plt.figure(figsize=(10, 5))
         plt.plot(recent['dt'], recent['close'], label=f'{index_code} 5M Spot', color='black', linewidth=1.5)
-        plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Integer Gann Pivot: {int(gann_level)}')
+        if 'vwap' in recent.columns:
+            plt.plot(recent['dt'], recent['vwap'], label='Spot VWAP', color='orange', linestyle='-.', linewidth=1.2)
+        if 'ema20' in recent.columns:
+            plt.plot(recent['dt'], recent['ema20'], label='EMA 20', color='green', linestyle='--', linewidth=1.0)
+        plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Gann Pivot: {gann_level:.0f}')
         plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Spot SL: {sl_price:.1f}')
         plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Spot Target: {trg_price:.1f}')
-        plt.title(f"{index_code} 5M Integer Gann + Breakout-Retest Setup", fontsize=12, fontweight='bold')
-        plt.legend(loc='upper left', fontsize=9)
+        plt.title(f"{index_code} 5M Levels + Price Action Confluence Setup", fontsize=12, fontweight='bold')
+        plt.legend(loc='upper left', fontsize=8)
         plt.grid(True, linestyle=":", alpha=0.5)
         plt.tight_layout()
 
@@ -202,22 +213,23 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
-# ========================= PURE INTEGER GANN LEVELS =========================
-def get_gann_levels(current_price: float, count: int = 5) -> dict:
+# ========================= GANN 0.50 HALF-STEP LATTICE =========================
+def get_gann_levels(current_price: float, steps_each_side: int = 6) -> dict:
     """
-    फक्त शुद्ध पूर्णांक (Integer) Gann Square of 9 लेव्हल्स (कोणतेही दशांश/डेसिमल लेव्हल्स नाहीत).
+    0.50 Gann Square of 9 लेव्हल्स (उदा. 158.0^2 = 24964, 158.5^2 = 25122, 159.0^2 = 25281):
+    ज्यामुळे दोन पूर्णांक गॅन लेव्हल्सच्या मधला मोठा गॅप भरून अचूक मिड-पिव्होट मिळतो.
     """
-    base_root = int(math.floor(math.sqrt(current_price)))
-    lower_levels = [float((base_root - i) ** 2) for i in range(count, 0, -1)]
-    base_level = [float(base_root ** 2)]
-    upper_levels = [float((base_root + i) ** 2) for i in range(1, count + 1)]
-    all_levels = sorted(lower_levels + base_level + upper_levels)
+    base_half_root = math.floor(math.sqrt(current_price) * 2.0) / 2.0
+    all_levels = sorted([
+        round((base_half_root + (i * 0.5)) ** 2, 0)
+        for i in range(-steps_each_side, steps_each_side + 1)
+    ])
 
     supports = [lvl for lvl in all_levels if lvl <= current_price]
     resistances = [lvl for lvl in all_levels if lvl > current_price]
 
-    immediate_sup = max(supports) if supports else float((base_root - 1) ** 2)
-    immediate_res = min(resistances) if resistances else float((base_root + 1) ** 2)
+    immediate_sup = max(supports) if supports else round((base_half_root - 0.5) ** 2, 0)
+    immediate_res = min(resistances) if resistances else round((base_half_root + 0.5) ** 2, 0)
     next_res = [lvl for lvl in resistances if lvl > immediate_res]
     next_sup = [lvl for lvl in supports if lvl < immediate_sup]
 
@@ -225,8 +237,8 @@ def get_gann_levels(current_price: float, count: int = 5) -> dict:
         "all_levels": all_levels,
         "immediate_support": immediate_sup,
         "immediate_resistance": immediate_res,
-        "target_ce": next_res[0] if next_res else float((base_root + 2) ** 2),
-        "target_pe": next_sup[-1] if next_sup else float((base_root - 2) ** 2)
+        "target_ce": next_res[0] if next_res else round((base_half_root + 1.0) ** 2, 0),
+        "target_pe": next_sup[-1] if next_sup else round((base_half_root - 1.0) ** 2, 0)
     }
 
 
@@ -601,6 +613,7 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     tp = (x["high"] + x["low"] + c) / 3.0
     v = x["volume"].replace(0, 1.0)
     x["vwap"] = (tp * v).cumsum() / v.cumsum()
+    x["ema20"] = c.ewm(span=20, adjust=False).mean()
 
     tr = pd.concat([
         x["high"] - x["low"],
@@ -643,7 +656,7 @@ def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shif
     return "STEADY_TREND_FLOW", "⚪ STEADY OI FLOW"
 
 
-# ========================= MULTI-INDEX LIVE TRADING ENGINE =========================
+# ========================= SENIOR ANALYST MULTI-INDEX LIVE ENGINE =========================
 class MultiIndexPaperTrader:
     def __init__(self, api: UpstoxClient, timings: dict):
         self.api = api
@@ -654,7 +667,6 @@ class MultiIndexPaperTrader:
         self.consecutive_losses = 0
         self.last_pulse_bar_time = None
 
-        # प्रत्येक इंडेक्ससाठी स्वतंत्र मेमरी रजिस्टर आणि पोझिशन ट्रॅकर
         self.states: Dict[str, dict] = {}
         for idx_code in ACTIVE_INDICES:
             cfg = INDEX_CONFIGS[idx_code]
@@ -671,20 +683,22 @@ class MultiIndexPaperTrader:
                 "fut_symbol": "",
                 "contracts_cache": {},
                 "active_position": None,
-                "pending_gann_setup": None,
+                "pending_setup": None,
                 "cooldown_until": None,
                 "failed_strikes": {},
                 "prev_5m_oi_snapshot": None,
                 "last_evaluated_5m_bar": None,
                 "shift_5m_put_oi": 0,
                 "shift_5m_call_oi": 0,
+                "pcr_history": [],
+                "pcr_slope": 0.0,
                 "buildup_code": "STEADY_TREND_FLOW",
                 "buildup_label": "⚪ STEADY OI FLOW",
                 "latest_summary": None
             }
 
         self.load_all_indices_contracts()
-        print("[*] 5-Index Integer Gann + Breakout-Retest Engine Ready!", flush=True)
+        print("[*] Senior Analyst 5-Index Confluence Engine Ready!", flush=True)
 
     def load_all_indices_contracts(self):
         try:
@@ -700,7 +714,6 @@ class MultiIndexPaperTrader:
                 exch = cfg["fo_exchange"]
                 names = [n.upper() for n in cfg["master_names"]]
 
-                # 1. Nearest Active Futures (FUTIDX)
                 futs = df[(df["exchange"] == exch) & (df["name_upper"].isin(names)) & (df["instrument_type"] == "FUTIDX")].copy()
                 if not futs.empty:
                     futs["expiry"] = pd.to_datetime(futs["expiry"]).dt.strftime("%Y-%m-%d")
@@ -712,7 +725,6 @@ class MultiIndexPaperTrader:
                         if "lot_size" in top_fut and pd.notna(top_fut["lot_size"]):
                             st["lot_size"] = int(float(top_fut["lot_size"]))
 
-                # 2. Nearest Active Options (OPTIDX)
                 opts = df[(df["exchange"] == exch) & (df["name_upper"].isin(names)) & (df["instrument_type"] == "OPTIDX")].copy()
                 if not opts.empty:
                     opts["expiry"] = pd.to_datetime(opts["expiry"]).dt.strftime("%Y-%m-%d")
@@ -770,7 +782,7 @@ class MultiIndexPaperTrader:
             "fuel_left_pct_of_day": fuel_left_ratio
         }
 
-    def update_5m_oi_shift_register(self, st: dict, bar_time_str: str, is_green: bool, is_red: bool, mem: dict):
+    def update_5m_registers(self, st: dict, bar_time_str: str, is_green: bool, is_red: bool, mem: dict, delta_pcr: float):
         if st["last_evaluated_5m_bar"] == bar_time_str:
             return
 
@@ -794,6 +806,13 @@ class MultiIndexPaperTrader:
             "put_chg": cur_put_chg,
             "call_chg": cur_call_chg
         }
+
+        hist = st["pcr_history"]
+        hist.append(delta_pcr)
+        if len(hist) > 4:
+            hist.pop(0)
+
+        st["pcr_slope"] = round(hist[-1] - hist[-2], 2) if len(hist) >= 2 else 0.0
         st["last_evaluated_5m_bar"] = bar_time_str
 
     def log_journal_csv(self, row: dict):
@@ -823,26 +842,26 @@ class MultiIndexPaperTrader:
                 continue
 
             blocks.append(
-                f"🔹 <b>{idx_code}</b> (Lot:{s['lot_size']}): <code>{s['spot']:.1f}</code>\n"
-                f"   • <b>Gann:</b> <code>{int(s['sup'])}</code> ⬅️ ➡️ <code>{int(s['res'])}</code> | <b>{s['gann_zone']}</b>\n"
-                f"   • <b>ΔPCR:</b> <code>{s['delta_pcr']:.2f}</code> | <b>MaxPain:</b> <code>{s['max_pain']}</code> | <b>Fuel:</b> <code>{s['fuel_pct']}%</code>\n"
-                f"   • <b>Fut VWAP:</b> <code>{s['fut_vwap_status']}</code> | <b>VolRatio:</b> <code>{s['vol_ratio']}x</code> | <b>ATR:</b> <code>{s['atr']:.1f}</code>"
+                f"🔹 <b>{idx_code}</b> (Lot:{s['lot_size']}): <code>{s['spot']:.1f}</code> | EMA20: <code>{s['ema20']:.1f}</code>\n"
+                f"   • <b>Gann 0.5:</b> <code>{int(s['sup'])}</code> ⬅️ ➡️ <code>{int(s['res'])}</code> | <b>{s['gann_zone']}</b>\n"
+                f"   • <b>ΔPCR:</b> <code>{s['delta_pcr']:.2f}</code> (Slope: <code>{s['pcr_slope']:+.2f}</code>) | <b>ADX:</b> <code>{s['adx']:.1f}</code> | <b>Fuel:</b> <code>{s['fuel_pct']}%</code>\n"
+                f"   • <b>Fut VWAP:</b> <code>{s['fut_vwap_status']}</code> | <b>Vol:</b> <code>{s['vol_ratio']}x</code> | <b>MaxPain:</b> <code>{s['max_pain']}</code>"
             )
 
         msg = (
-            f"📊 <b>5-INDEX INTEGER GANN PULSE ({bar_time_str} IST)</b>\n"
+            f"📊 <b>5-INDEX LEVELS + PRICE ACTION PULSE ({bar_time_str} IST)</b>\n"
             f"🌡️ <b>India VIX:</b> <code>{vix_str}</code> | 💰 <b>Day PnL:</b> <code>₹{self.cumulative_pnl:+,.0f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             + "\n\n".join(blocks) +
             f"\n━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>RULE:</b> <i>Wait for Integer Gann Reach + Vol/Range Breakout & Retest</i>"
+            f"🎯 <b>CONFLUENCE:</b> <i>Gann 0.5 Lattice | PA Swing Momentum | VWAP Reject | PCR Slope</i>"
         )
         send_telegram(msg)
-        print(f"[{bar_time_str}] 5-Index Pulse Sent | DayPnL: ₹{self.cumulative_pnl:+,.2f}", flush=True)
+        print(f"[{bar_time_str}] 5-Index Confluence Pulse Sent | DayPnL: ₹{self.cumulative_pnl:+,.2f}", flush=True)
 
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
-            f"🚀 <b>[{pos['index_code']}] INTEGER GANN BREAKOUT-RETEST: एन्ट्री (#{pos['trade_id']})</b>\n"
+            f"🚀 <b>[{pos['index_code']}] ALGO एन्ट्री (#{pos['trade_id']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>ऑर्डर:</b> <b>BUY {pos['clean_name']}</b>\n"
             f"🏷️ <b>सिम्बॉल:</b> <code>{pos['symbol']}</code>\n"
@@ -851,8 +870,8 @@ class MultiIndexPaperTrader:
             f"🛑 <b>स्टॉपलॉस:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts / -{pos['opt_sl_pct']:.1f}% | Spot SL: {pos['spot_sl']})\n"
             f"🏁 <b>टार्गेट (1:1.5):</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts / +{pos['opt_trg_pct']:.1f}% | Spot Trg: {pos['spot_target']})\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📐 <b>Integer Gann Anchor:</b> <code>{int(pos['gann_level'])}</code> | ⛽ <b>Fuel Left:</b> <code>{pos['rem_fuel_pts']:.1f} pts</code>\n"
-            f"🧬 <b>Live Option Greeks & OI Data:</b>\n"
+            f"📐 <b>Gann Pivot:</b> <code>{int(pos['gann_level'])}</code> | ⛽ <b>Fuel Left:</b> <code>{pos['rem_fuel_pts']:.1f} pts</code>\n"
+            f"🧬 <b>Live Greeks & OI Data:</b>\n"
             f"• <b>Delta (Δ):</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code> | <b>Theta:</b> <code>{pos['entry_theta']:.1f}</code>\n"
             f"• <b>Strike OI:</b> <code>{pos['strike_oi']:,}</code> | <b>Chg OI:</b> <code>{pos['change_oi']:+,}</code> | <b>Day ΔPCR:</b> <code>{pos['delta_pcr']:.2f}</code>\n"
             f"• <b>Fut Build-up:</b> <code>{pos['fut_buildup']}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
@@ -966,7 +985,7 @@ class MultiIndexPaperTrader:
         }
 
         st["active_position"] = pos
-        print(f"\n[एन्ट्री ट्रिगर] {clean_name} (Lot:{st['lot_size']}) @ ₹{entry_price} | Gann:{int(gann_level)} | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
+        print(f"\n[एन्ट्री ट्रिगर] {clean_name} (Lot:{st['lot_size']}) @ ₹{entry_price} | Setup:{setup_type} | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
         self.send_entry_alert(pos, df_5m)
 
     def execute_exit(self, st: dict, exit_price: float, reason: str):
@@ -1012,7 +1031,7 @@ class MultiIndexPaperTrader:
             send_telegram(f"🔒 <b>कॅपिटल प्रोटेक्शन लॉक:</b>\nसलग २ स्टॉपलॉस हिट झाल्याने ट्रेड्स थांबवले आहेत.")
 
         st["active_position"] = None
-        st["pending_gann_setup"] = None
+        st["pending_setup"] = None
         st["cooldown_until"] = time.monotonic() + 300
 
     def check_all_positions_management(self):
@@ -1058,7 +1077,7 @@ class MultiIndexPaperTrader:
             return None
 
         df_5m = self.api.get_spot_candles_5m(st["spot_key"])
-        if df_5m.empty or len(df_5m) < 2:
+        if df_5m.empty or len(df_5m) < 4:
             return None
 
         df_5m = add_indicators_5m(df_5m)
@@ -1071,6 +1090,8 @@ class MultiIndexPaperTrader:
         spot_high = float(completed_bar["high"])
         spot_low = float(completed_bar["low"])
         spot_vwap_5m = float(completed_bar["vwap"])
+        ema20_5m = float(completed_bar.get("ema20", spot_close))
+        adx_val = float(completed_bar.get("adx14", 0.0)) if pd.notna(completed_bar.get("adx14")) else 0.0
         atr_val = float(completed_bar.get("atr14", spot_close * 0.0006)) if pd.notna(completed_bar.get("atr14")) else (spot_close * 0.0006)
 
         fuel_info = self.calculate_remaining_daily_fuel(st, df_5m, spot_close, vix_info)
@@ -1086,11 +1107,13 @@ class MultiIndexPaperTrader:
 
         fut_mem = self.api.get_futures_5m_metrics(st["fut_instrument_key"])
 
-        gann = get_gann_levels(spot_close, count=5)
+        # Gann 0.50 Lattice (उदा. 24964, 25122, 25281)
+        gann = get_gann_levels(spot_close, steps_each_side=6)
         sup_level = gann["immediate_support"]
         res_level = gann["immediate_resistance"]
         gann_prox_pts = spot_close * GANN_PROXIMITY_PCT
         gann_retest_pts = spot_close * GANN_RETEST_BAND_PCT
+        vwap_band_pts = spot_close * VWAP_TOUCH_BAND_PCT
 
         near_sup_gann = (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - gann_prox_pts)
         near_res_gann = (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + gann_prox_pts)
@@ -1102,9 +1125,10 @@ class MultiIndexPaperTrader:
         elif near_res_gann or broke_res_gann:
             gann_zone_status = f"NEAR_{int(res_level)}"
         else:
-            gann_zone_status = "MID-ZONE"
+            gann_zone_status = "PA_SCAN"
 
-        self.update_5m_oi_shift_register(st, bar_time_str, is_green, is_red, mem)
+        self.update_5m_registers(st, bar_time_str, is_green, is_red, mem, delta_pcr)
+        pcr_slope = st["pcr_slope"]
 
         fut_vwap_status = "N/A"
         if fut_mem.get("valid"):
@@ -1113,10 +1137,13 @@ class MultiIndexPaperTrader:
         st["latest_summary"] = {
             "lot_size": st["lot_size"],
             "spot": spot_close,
+            "ema20": ema20_5m,
             "sup": sup_level,
             "res": res_level,
             "gann_zone": gann_zone_status,
             "delta_pcr": delta_pcr,
+            "pcr_slope": pcr_slope,
+            "adx": adx_val,
             "max_pain": max_pain_display,
             "fuel_pct": fuel_info["fuel_left_pct_of_day"],
             "fut_vwap_status": fut_vwap_status,
@@ -1124,7 +1151,6 @@ class MultiIndexPaperTrader:
             "atr": atr_val
         }
 
-        # जर या इंडेक्सवर आधीच पोझिशन चालू असेल किंवा कूलडाऊन असेल किंवा लॉक असेल तर नवीन एन्ट्री नको
         if st["active_position"] or self.daily_locked:
             return bar_time_str
         if st["cooldown_until"] and time.monotonic() < st["cooldown_until"]:
@@ -1134,13 +1160,21 @@ class MultiIndexPaperTrader:
         if len(df_5m) < 6 or fuel_info["remaining_pct"] < MIN_REMAINING_FUEL_PCT:
             return bar_time_str
         if st["buildup_code"] in ("BULL_TRAP", "BEAR_TRAP"):
-            st["pending_gann_setup"] = None
+            st["pending_setup"] = None
             return bar_time_str
 
-        # STAGE 1: PURE INTEGER GANN + VOLUME/RANGE EXPANSION
+        # =========================================================================
+        # SENIOR ANALYST CONFLUENCE ENGINE (4 PROVEN SETUPS):
+        # 1) Gann 0.50 Lattice Breakout / Retest (24964, 25122, 25281...)
+        # 2) PA Swing Momentum Breakdown / Breakout (10:50 AM सारखी मोठी चाल)
+        # 3) PA Rejection Wick Reversal at Day Extreme (14:20 PM सारखा रिव्हर्सल)
+        # 4) SMC VWAP Rejection + PCR Velocity Slope
+        # =========================================================================
         c_range = max(spot_high - spot_low, 1e-9)
         c_body = abs(spot_close - spot_open)
         body_ratio = c_body / c_range
+        lower_wick_ratio = (min(spot_open, spot_close) - spot_low) / c_range
+        upper_wick_ratio = (spot_high - max(spot_open, spot_close)) / c_range
 
         fut_vol_surge = fut_mem.get("fut_vol_surge", False)
         is_range_expansion = c_range >= (MIN_RANGE_ATR_MULT * atr_val)
@@ -1150,59 +1184,131 @@ class MultiIndexPaperTrader:
         above_fut_vwap = fut_mem.get("above_fut_vwap", True) if fut_valid else True
         below_fut_vwap = (not fut_mem.get("above_fut_vwap", False)) if fut_valid else True
 
+        # मागील ३ कॅन्डल्सचा Swing High / Low आणि दिवसाचा High / Low
+        prior_3 = df_5m.iloc[-4:-1]
+        swing_3_high = float(prior_3["high"].max())
+        swing_3_low = float(prior_3["low"].min())
+        day_high_so_far = float(df_5m["high"].max())
+        day_low_so_far = float(df_5m["low"].min())
+
         swing_pad_pts = round(spot_close * 0.0002, 2)
-        retest_buf_pts = round(0.30 * atr_val, 2)
+        retest_buf_pts = round(0.28 * atr_val, 2)
 
-        if not st["pending_gann_setup"] and (fut_vol_surge or is_range_expansion) and is_body_solid:
-            if is_green and (spot_close > spot_vwap_5m) and above_fut_vwap:
-                gann_sup_bounce_ce = (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - (gann_prox_pts * 0.5))
-                gann_sup_retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - gann_prox_pts <= spot_low <= sup_level + gann_retest_pts)
-                gann_res_breakout_ce = (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
+        if not st["pending_setup"]:
+            # ---------------------- 🟢 CE SETUPS ----------------------
+            # A. Gann 0.50 Lattice Setup
+            gann_sup_bounce_ce = is_green and is_body_solid and (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - (gann_prox_pts * 0.5))
+            gann_res_breakout_ce = is_green and is_body_solid and (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
+            has_gann_ce = (fut_vol_surge or is_range_expansion) and (gann_sup_bounce_ce or gann_res_breakout_ce) and (spot_close > spot_vwap_5m) and above_fut_vwap
 
-                if gann_sup_bounce_ce or gann_sup_retest_ce or gann_res_breakout_ce:
-                    if gann_res_breakout_ce:
-                        setup_name = f"{idx_code}_GANN_{int(res_level)}_BREAKOUT_CE"
-                        anchor_gann, next_barrier = res_level, gann["target_ce"]
-                    elif gann_sup_bounce_ce:
-                        setup_name = f"{idx_code}_GANN_{int(sup_level)}_BOUNCE_CE"
-                        anchor_gann, next_barrier = sup_level, res_level
+            # B. Price Action Swing Momentum Breakout (EMA20 + VWAP + ADX >= 18 + 3-Bar High Break)
+            has_pa_momentum_ce = (
+                is_green and is_body_solid and (adx_val >= MIN_ADX_MOMENTUM)
+                and (spot_close > spot_vwap_5m) and above_fut_vwap and (spot_close > ema20_5m)
+                and (spot_close > swing_3_high) and (fut_vol_surge or is_range_expansion)
+            )
+
+            # C. Price Action Bottom Rejection Reversal (14:20 PM सारखा Intraday Low वर मोठी खालची विक + EMA20 क्रॉस)
+            near_day_low = (spot_low <= day_low_so_far + (0.35 * atr_val))
+            has_pa_reversal_ce = (
+                is_green and near_day_low and (lower_wick_ratio >= MIN_REJECTION_WICK_RATIO)
+                and (spot_close > ema20_5m) and (delta_pcr >= 0.65 or pcr_slope > 0)
+            )
+
+            # D. SMC VWAP Bounce / Early PCR Velocity
+            touched_vwap_ce = is_green and is_body_solid and (spot_low <= spot_vwap_5m + vwap_band_pts) and (spot_close > spot_vwap_5m) and above_fut_vwap
+            has_vwap_or_pcr_ce = (delta_pcr > 1.15 and touched_vwap_ce) or (
+                is_green and is_body_solid and (pcr_slope >= PCR_SLOPE_BULL_THRESHOLD) and (float(prev_bar["close"]) <= spot_vwap_5m) and (spot_close > spot_vwap_5m)
+            )
+
+            if has_gann_ce or has_pa_momentum_ce or has_pa_reversal_ce or has_vwap_or_pcr_ce:
+                if has_gann_ce:
+                    setup_name = f"{idx_code}_GANN_{int(res_level if gann_res_breakout_ce else sup_level)}_CE"
+                    anchor_gann = res_level if gann_res_breakout_ce else sup_level
+                    next_barrier = gann["target_ce"] if gann_res_breakout_ce else res_level
+                    needs_retest = True
+                elif has_pa_momentum_ce:
+                    setup_name = f"{idx_code}_PA_SWING_MOMENTUM_CE"
+                    anchor_gann = sup_level
+                    next_barrier = res_level
+                    needs_retest = False
+                elif has_pa_reversal_ce:
+                    setup_name = f"{idx_code}_PA_BOTTOM_REVERSAL_CE"
+                    anchor_gann = sup_level
+                    next_barrier = res_level
+                    needs_retest = False
+                else:
+                    setup_name = f"{idx_code}_SMC_VWAP_PCR_CE"
+                    anchor_gann = sup_level
+                    next_barrier = res_level
+                    needs_retest = False
+
+                st["pending_setup"] = {
+                    "side": "CE",
+                    "setup_type": setup_name,
+                    "oi_buildup": st["buildup_code"],
+                    "gann_level": anchor_gann,
+                    "gann_barrier": next_barrier,
+                    "breakout_level": spot_high,
+                    "retest_min": round(spot_high - retest_buf_pts, 2),
+                    "trigger_level": round(spot_high + (spot_close * ENTRY_BUFFER_PCT), 2),
+                    "retest_touched": (not needs_retest),
+                    "raw_spot_sl": round(spot_low - swing_pad_pts, 2),
+                    "atr_5m": atr_val,
+                    "armed_time": time.monotonic()
+                }
+                print(f"[!] [{idx_code}] CE Armed: {setup_name} | Trigger @ {st['pending_setup']['trigger_level']}", flush=True)
+
+            # ---------------------- 🔴 PE SETUPS ----------------------
+            else:
+                # A. Gann 0.50 Lattice Setup
+                gann_res_reject_pe = is_red and is_body_solid and (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + (gann_prox_pts * 0.5))
+                gann_sup_breakdown_pe = is_red and is_body_solid and (float(prev_bar["close"]) >= sup_level) and (spot_close < sup_level)
+                has_gann_pe = (fut_vol_surge or is_range_expansion) and (gann_res_reject_pe or gann_sup_breakdown_pe) and (spot_close < spot_vwap_5m) and below_fut_vwap
+
+                # B. Price Action Swing Momentum Breakdown (10:50 AM सारखा VWAP + EMA20 + 3-Bar Swing Low तुटल्यावर)
+                has_pa_momentum_pe = (
+                    is_red and is_body_solid and (adx_val >= MIN_ADX_MOMENTUM)
+                    and (spot_close < spot_vwap_5m) and below_fut_vwap and (spot_close < ema20_5m)
+                    and (spot_close < swing_3_low) and (fut_vol_surge or is_range_expansion)
+                )
+
+                # C. Price Action Top Rejection Reversal (Intraday High वर मोठी वरची विक + EMA20 खाली क्लोज)
+                near_day_high = (spot_high >= day_high_so_far - (0.35 * atr_val))
+                has_pa_reversal_pe = (
+                    is_red and near_day_high and (upper_wick_ratio >= MIN_REJECTION_WICK_RATIO)
+                    and (spot_close < ema20_5m) and (delta_pcr <= 1.25 or pcr_slope < 0)
+                )
+
+                # D. SMC VWAP Rejection / Early PCR Velocity
+                touched_vwap_pe = is_red and is_body_solid and (spot_high >= spot_vwap_5m - vwap_band_pts) and (spot_close < spot_vwap_5m) and below_fut_vwap
+                has_vwap_or_pcr_pe = (delta_pcr < 0.85 and touched_vwap_pe) or (
+                    is_red and is_body_solid and (pcr_slope <= PCR_SLOPE_BEAR_THRESHOLD) and (float(prev_bar["close"]) >= spot_vwap_5m) and (spot_close < spot_vwap_5m)
+                )
+
+                if has_gann_pe or has_pa_momentum_pe or has_pa_reversal_pe or has_vwap_or_pcr_pe:
+                    if has_gann_pe:
+                        setup_name = f"{idx_code}_GANN_{int(sup_level if gann_sup_breakdown_pe else res_level)}_PE"
+                        anchor_gann = sup_level if gann_sup_breakdown_pe else res_level
+                        next_barrier = gann["target_pe"] if gann_sup_breakdown_pe else sup_level
+                        needs_retest = True
+                    elif has_pa_momentum_pe:
+                        setup_name = f"{idx_code}_PA_SWING_MOMENTUM_PE"
+                        anchor_gann = res_level
+                        next_barrier = sup_level
+                        needs_retest = False
+                    elif has_pa_reversal_pe:
+                        setup_name = f"{idx_code}_PA_TOP_REVERSAL_PE"
+                        anchor_gann = res_level
+                        next_barrier = sup_level
+                        needs_retest = False
                     else:
-                        setup_name = f"{idx_code}_GANN_{int(sup_level)}_RETEST_CE"
-                        anchor_gann, next_barrier = sup_level, res_level
+                        setup_name = f"{idx_code}_SMC_VWAP_PCR_PE"
+                        anchor_gann = res_level
+                        next_barrier = sup_level
+                        needs_retest = False
 
-                    st["pending_gann_setup"] = {
-                        "side": "CE",
-                        "setup_type": setup_name,
-                        "oi_buildup": st["buildup_code"],
-                        "gann_level": anchor_gann,
-                        "gann_barrier": next_barrier,
-                        "breakout_level": spot_high,
-                        "retest_min": round(spot_high - retest_buf_pts, 2),
-                        "trigger_level": round(spot_high + (spot_close * ENTRY_BUFFER_PCT), 2),
-                        "retest_touched": False,
-                        "raw_spot_sl": round(spot_low - swing_pad_pts, 2),
-                        "atr_5m": atr_val,
-                        "armed_time": time.monotonic()
-                    }
-                    print(f"[!] [{idx_code}] Gann CE Armed: {setup_name} | Trigger @ {st['pending_gann_setup']['trigger_level']}", flush=True)
-
-            elif is_red and (spot_close < spot_vwap_5m) and below_fut_vwap:
-                gann_res_reject_pe = (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + (gann_prox_pts * 0.5))
-                gann_res_retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - gann_retest_pts <= spot_high <= res_level + gann_prox_pts)
-                gann_sup_breakdown_pe = (float(prev_bar["close"]) >= sup_level) and (spot_close < sup_level)
-
-                if gann_res_reject_pe or gann_res_retest_pe or gann_sup_breakdown_pe:
-                    if gann_sup_breakdown_pe:
-                        setup_name = f"{idx_code}_GANN_{int(sup_level)}_BREAKDOWN_PE"
-                        anchor_gann, next_barrier = sup_level, gann["target_pe"]
-                    elif gann_res_reject_pe:
-                        setup_name = f"{idx_code}_GANN_{int(res_level)}_REJECT_PE"
-                        anchor_gann, next_barrier = res_level, sup_level
-                    else:
-                        setup_name = f"{idx_code}_GANN_{int(res_level)}_RETEST_PE"
-                        anchor_gann, next_barrier = res_level, sup_level
-
-                    st["pending_gann_setup"] = {
+                    st["pending_setup"] = {
                         "side": "PE",
                         "setup_type": setup_name,
                         "oi_buildup": st["buildup_code"],
@@ -1211,18 +1317,18 @@ class MultiIndexPaperTrader:
                         "breakout_level": spot_low,
                         "retest_max": round(spot_low + retest_buf_pts, 2),
                         "trigger_level": round(spot_low - (spot_close * ENTRY_BUFFER_PCT), 2),
-                        "retest_touched": False,
+                        "retest_touched": (not needs_retest),
                         "raw_spot_sl": round(spot_high + swing_pad_pts, 2),
                         "atr_5m": atr_val,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] [{idx_code}] Gann PE Armed: {setup_name} | Trigger @ {st['pending_gann_setup']['trigger_level']}", flush=True)
+                    print(f"[!] [{idx_code}] PE Armed: {setup_name} | Trigger @ {st['pending_setup']['trigger_level']}", flush=True)
 
-        # STAGE 2: RETEST CONFIRMATION & LIVE ENTRY
-        if st["pending_gann_setup"]:
-            setup = st["pending_gann_setup"]
+        # STAGE 2: TICK TRIGGER CONFIRMATION & LIVE ENTRY
+        if st["pending_setup"]:
+            setup = st["pending_setup"]
             if time.monotonic() - setup["armed_time"] > 900:
-                st["pending_gann_setup"] = None
+                st["pending_setup"] = None
                 return bar_time_str
 
             current_spot_tick = self.api.get_ltp(st["spot_key"]) or spot_close
@@ -1231,14 +1337,14 @@ class MultiIndexPaperTrader:
                 if setup["retest_min"] <= current_spot_tick <= setup["breakout_level"]:
                     setup["retest_touched"] = True
                 if current_spot_tick < setup["raw_spot_sl"]:
-                    st["pending_gann_setup"] = None
+                    st["pending_setup"] = None
                     return bar_time_str
                 triggered = setup["retest_touched"] and (current_spot_tick >= setup["trigger_level"])
             else:
                 if setup["breakout_level"] <= current_spot_tick <= setup["retest_max"]:
                     setup["retest_touched"] = True
                 if current_spot_tick > setup["raw_spot_sl"]:
-                    st["pending_gann_setup"] = None
+                    st["pending_setup"] = None
                     return bar_time_str
                 triggered = setup["retest_touched"] and (current_spot_tick <= setup["trigger_level"])
 
@@ -1247,7 +1353,7 @@ class MultiIndexPaperTrader:
 
                 if atm_strike in st["failed_strikes"]:
                     if time.monotonic() < st["failed_strikes"][atm_strike]:
-                        st["pending_gann_setup"] = None
+                        st["pending_setup"] = None
                         return bar_time_str
                     else:
                         del st["failed_strikes"][atm_strike]
@@ -1260,7 +1366,7 @@ class MultiIndexPaperTrader:
                 max_iv_limit = vix_info.get("max_iv", MAX_ALLOWED_IV)
 
                 if live_iv > max_iv_limit or live_abs_delta < MIN_ABS_DELTA:
-                    st["pending_gann_setup"] = None
+                    st["pending_setup"] = None
                     return bar_time_str
 
                 contract_info = st["contracts_cache"].get((atm_strike, setup["side"]))
@@ -1298,7 +1404,7 @@ class MultiIndexPaperTrader:
                         setup_type=setup["setup_type"],
                         df_5m=df_5m
                     )
-                    st["pending_gann_setup"] = None
+                    st["pending_setup"] = None
 
         return bar_time_str
 
@@ -1337,13 +1443,13 @@ def main():
 
     lot_summary = " | ".join([f"{k}:{trader.states[k]['lot_size']}" for k in ACTIVE_INDICES])
     send_telegram(
-        f"🟢 <b>5-INDEX INTEGER GANN ALGO: सुरू झाले</b>\n"
+        f"🟢 <b>5-INDEX SENIOR ANALYST CONFLUENCE ALGO: सुरू झाले</b>\n"
         f"तारीख: <code>{TODAY_STR}</code>\n"
         f"इंडेक्सेस: <b>NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX</b>\n"
         f"Dynamic Lots: <code>{lot_summary}</code>\n"
-        f"ट्रेडिंग विंडो: <b>{timings['session_start']} ते {timings['entry_end']} IST</b> (Force Exit: {timings['force_exit']})"
+        f"सेटअप्स: <b>Gann 0.50 Lattice + PA Swing Momentum + Bottom/Top Reversal + VWAP/PCR</b>"
     )
-    print(f"[*] 5-Index Integer Gann Engine Active ({timings['session_start']} - {timings['entry_end']}) for {TODAY_STR}...", flush=True)
+    print(f"[*] Senior Analyst 5-Index Engine Active ({timings['session_start']} - {timings['entry_end']}) for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
