@@ -51,40 +51,38 @@ TOKEN = fetch_token()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ========================= SCALE-INVARIANT PERCENTAGE PARAMETERS =========================
+# ========================= SCALE-INVARIANT PERCENTAGE & STRATEGY PARAMETERS =========================
 POLL_INTERVAL = 1.0
 STRATEGY_INTERVAL = 10.0
 POSITION_UPDATE_INTERVAL = 180.0
 
-# Spot Percentage Parameters
-MIN_SPOT_SL_PCT = 0.0007           # किमान Spot SL = 0.07% (25k वर ~17.5 pts)
-MAX_SPOT_SL_PCT = 0.0016           # कमाल Spot SL = 0.16% (25k वर ~40 pts)
-GANN_PROXIMITY_PCT = 0.0012        # शुद्ध पूर्णांक Gann Level जवळचा झोन = 0.12% (25k वर ~30 pts)
-GANN_RETEST_BAND_PCT = 0.0018      # Gann Retest झोन = 0.18% (25k वर ~45 pts)
+# Pure Integer Gann & Breakout-Retest Parameters
+GANN_PROXIMITY_PCT = 0.0014        # शुद्ध पूर्णांक Gann Level जवळचा झोन = 0.14% (~35 pts on 25k)
+GANN_RETEST_BAND_PCT = 0.0020      # Gann Retest झोन = 0.20% (~50 pts on 25k)
 ENTRY_BUFFER_PCT = 0.00025         # Breakout Buffer = 0.025%
 MIN_REMAINING_FUEL_PCT = 0.0010    # दिवसाचे किमान शिल्लक इंधन = 0.10%
 STRIKE_SCAN_RANGE_PCT = 0.020      # Spot च्या ±2.0% रेंजमधील सर्व स्ट्राइक्स
 
-# Option Premium Percentage Parameters (ATR-Aware Realistic SL/Target)
-MIN_OPT_SL_PCT = 0.12              # ऑप्शन प्रीमियमच्या किमान 12% SL
-HIGH_ATR_MIN_OPT_SL_PCT = 0.14     # जेव्हा 5M ATR जास्त असेल तेव्हा किमान 14% SL (Noise टाळण्यासाठी)
+# Backtest-Proven Candle & Volume Expansion Rules
+MIN_FUT_VOL_RATIO = 1.20           # Futures Volume >= 1.20x of 20-bar SMA
+MIN_RANGE_ATR_MULT = 1.15          # Candle Range >= 1.15x of ATR14
+MIN_BODY_RATIO = 0.45              # Solid Candle Body >= 45%
+
+# Option Premium Percentage & ATR*Delta SL/Target (1 : 1.50 R:R)
+MIN_OPT_SL_PCT = 0.10              # ऑप्शन प्रीमियमच्या किमान 10% SL
 MAX_OPT_SL_PCT = 0.22              # ऑप्शन प्रीमियमच्या कमाल 22% SL
-MAX_OPT_TRG_PCT = 0.30             # ऑप्शन प्रीमियमच्या कमाल 30% वास्तववादी Target
-REALISTIC_RRR = 1.50               # 1 : 1.50 रिस्क-रिवॉर्ड
+MAX_OPT_TRG_PCT = 0.35             # ऑप्शन प्रीमियमच्या कमाल 35% Target
+REALISTIC_RRR = 1.50               # बॅकटेस्ट सिद्ध 1 : 1.50 रिस्क-रिवॉर्ड
 
 # Daily Capital Protection (1 Lot Risk Multiplier)
-DAILY_GOAL_LOT_RISK_MULT = 1.35
-DAILY_LOSS_LOT_RISK_MULT = -1.35
+DAILY_GOAL_LOT_RISK_MULT = 1.50
+DAILY_LOSS_LOT_RISK_MULT = -1.50
 MAX_CONSECUTIVE_LOSSES = 2
 
-# Technical, VIX & Greeks Filters
-BASE_MIN_ADX_TREND = 18.0
-MIN_BODY_RATIO = 0.40
+# Live Greeks & OI Safety Guards
 MAX_ALLOWED_IV = 28.0
 MIN_ABS_DELTA = 0.35
-MIN_5M_OI_SHIFT = 250000           # ५-मिनिटांचा गोंधळ टाळण्यासाठी किमान २,५०,००० OI बदल असेल तरच Squeeze मानणे
-MAX_ENTRY_RSI_CE = 78.0            # अत्यंत Overbought (RSI > 78) असताना वरच्या टोकाला CE न घेणे
-MIN_ENTRY_RSI_PE = 22.0            # अत्यंत Oversold (RSI < 22) असताना खालच्या टोकाला PE न घेणे
+MIN_5M_OI_SHIFT = 250000
 
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
@@ -115,10 +113,10 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
         recent = df_5m.tail(25)
         plt.figure(figsize=(10, 5))
         plt.plot(recent['dt'], recent['close'], label='NIFTY 5M Spot', color='black', linewidth=1.5)
-        plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Integer Gann Pivot: {gann_level:.1f}')
-        plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Dynamic Spot SL: {sl_price:.1f}')
-        plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Fuel-Capped Target: {trg_price:.1f}')
-        plt.title("NIFTY 5M Pure Integer Gann + Dual VWAP + VIX Setup", fontsize=12, fontweight='bold')
+        plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Integer Gann Pivot: {int(gann_level)}')
+        plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Spot SL: {sl_price:.1f}')
+        plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Spot Target: {trg_price:.1f}')
+        plt.title("NIFTY 5M Integer Gann + Fut Vol Breakout-Retest Setup", fontsize=12, fontweight='bold')
         plt.legend(loc='upper left', fontsize=9)
         plt.grid(True, linestyle=":", alpha=0.5)
         plt.tight_layout()
@@ -218,7 +216,6 @@ class UpstoxClient:
             return {
                 "vix": None,
                 "regime": "NORMAL (N/A)",
-                "min_adx": BASE_MIN_ADX_TREND,
                 "max_iv": MAX_ALLOWED_IV,
                 "implied_daily_pct": 0.0085
             }
@@ -227,25 +224,20 @@ class UpstoxClient:
 
         if vix_val < 13.0:
             regime = "CALM (<13 · Slow)"
-            min_adx = 21.0
             max_iv = MAX_ALLOWED_IV
         elif vix_val <= 17.5:
             regime = "NORMAL (13-17.5)"
-            min_adx = BASE_MIN_ADX_TREND
             max_iv = MAX_ALLOWED_IV
         elif vix_val <= 22.0:
             regime = "ELEVATED (17.5-22)"
-            min_adx = BASE_MIN_ADX_TREND
             max_iv = MAX_ALLOWED_IV
         else:
             regime = "PANIC (>22 · High Vol)"
-            min_adx = 19.0
             max_iv = 26.0
 
         return {
             "vix": round(vix_val, 2),
             "regime": regime,
-            "min_adx": min_adx,
             "max_iv": max_iv,
             "implied_daily_pct": implied_daily_pct
         }
@@ -314,6 +306,7 @@ class UpstoxClient:
             "above_fut_vwap": None,
             "fut_5m_vol": 0,
             "fut_avg_5m_vol": 0,
+            "fut_vol_ratio": 1.0,
             "fut_vol_surge": False,
             "fut_oi": 0,
             "fut_5m_oi_chg": 0,
@@ -354,8 +347,9 @@ class UpstoxClient:
             fut_vwap = float(cur_bar["true_vwap"]) if pd.notna(cur_bar["true_vwap"]) else fut_close
 
             cur_vol = int(cur_bar["volume"])
-            avg_vol = int(df_5m["volume"].tail(12).mean())
-            vol_surge = cur_vol >= (avg_vol * 1.15) if avg_vol > 0 else False
+            avg_vol = float(df_5m["volume"].tail(20).mean())
+            vol_ratio = round(cur_vol / avg_vol, 2) if avg_vol > 0 else 1.0
+            vol_surge = vol_ratio >= MIN_FUT_VOL_RATIO
 
             cur_oi = int(cur_bar["oi"])
             prev_oi = int(prev_bar["oi"])
@@ -386,7 +380,8 @@ class UpstoxClient:
                 "fut_vwap": round(fut_vwap, 2),
                 "above_fut_vwap": fut_close >= fut_vwap,
                 "fut_5m_vol": cur_vol,
-                "fut_avg_5m_vol": avg_vol,
+                "fut_avg_5m_vol": int(avg_vol),
+                "fut_vol_ratio": vol_ratio,
                 "fut_vol_surge": vol_surge,
                 "fut_oi": cur_oi,
                 "fut_5m_oi_chg": oi_5m_chg,
@@ -570,9 +565,10 @@ class UpstoxClient:
 
 
 def get_live_market_session_timings(api: UpstoxClient, target_date: str) -> dict:
+    # सकाळी 09:20 ते दुपारी 15:10 (3:10 PM) पर्यंत सलग ट्रेडिंग विंडो
     return {
         "session_start": "09:20",
-        "entry_end": "15:00",
+        "entry_end": "15:10",
         "force_exit": "15:20",
         "market_end": "15:30",
         "raw_start": "09:15",
@@ -614,10 +610,6 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     return x
 
 def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shift_call_oi: int) -> Tuple[str, str]:
-    """
-    फक्त मोठा संस्थात्मक OI बदल (>= 2,50,000) असेल तरच विशेष Squeeze/Trap लेबल देणे;
-    किरकोळ ५-मिनिटांच्या बदलांवर दिशा न बदलणे.
-    """
     if is_green:
         if shift_call_oi <= -MIN_5M_OI_SHIFT:
             return "MAJOR_SHORT_COVERING", "🚀 MAJOR SHORT COVERING (Call Exit)"
@@ -633,29 +625,7 @@ def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shif
         if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= -MIN_5M_OI_SHIFT:
             return "BEAR_TRAP", "⚠️ BEAR TRAP (Heavy Put Writing on Fall)"
 
-    return "STEADY_TREND_FLOW", "⚪ STEADY OI FLOW (Follow Day ΔOI)"
-
-
-def is_market_choppy(df_5m: pd.DataFrame, delta_pcr: float, buildup_code: str, dynamic_min_adx: float) -> Tuple[bool, str]:
-    if len(df_5m) < 10:
-        return True, "INSUFFICIENT_DATA"
-
-    last_bar = df_5m.iloc[-1]
-    adx = safe_float(last_bar.get("adx14"))
-    c_range = max(last_bar["high"] - last_bar["low"], 1e-9)
-    c_body = abs(last_bar["close"] - last_bar["open"])
-    is_strong_bar = (c_body / c_range) >= 0.50
-
-    if buildup_code in ("BULL_TRAP", "BEAR_TRAP"):
-        return True, f"OI_TRAP_DETECTED ({buildup_code})"
-
-    if adx is not None and adx < dynamic_min_adx and not is_strong_bar:
-        return True, f"CHOPPY_REGIME_ADX_LOW ({adx:.1f} < {dynamic_min_adx})"
-
-    if 0.85 <= delta_pcr <= 1.15 and not is_strong_bar:
-        return True, f"NEUTRAL_DEAD_ZONE_DELTA_PCR (±2% ΔOI:{delta_pcr:.2f})"
-
-    return False, "TRENDING_CLEAR"
+    return "STEADY_TREND_FLOW", "⚪ STEADY OI FLOW"
 
 
 # ========================= LIVE TRADING ENGINE =========================
@@ -678,7 +648,7 @@ class LivePaperTrader:
         self.prev_5m_oi_snapshot = None
         self.last_evaluated_5m_bar = None
         self.current_5m_buildup_code = "STEADY_TREND_FLOW"
-        self.current_5m_buildup_label = "⚪ STEADY OI FLOW (Follow Day ΔOI)"
+        self.current_5m_buildup_label = "⚪ STEADY OI FLOW"
         self.shift_5m_put_oi = 0
         self.shift_5m_call_oi = 0
 
@@ -695,7 +665,7 @@ class LivePaperTrader:
         self.contracts_cache = {}
         self.failed_strikes = {}
         self.load_expiry_and_contracts()
-        print(f"[*] Pure Integer Gann + Scale-Invariant Engine Ready | LotSize: {self.lot_size} | StrikeStep: {self.strike_step}", flush=True)
+        print(f"[*] Integer Gann + Continuous (09:20-15:10) Engine Ready | LotSize: {self.lot_size} | StrikeStep: {self.strike_step}", flush=True)
 
     def load_expiry_and_contracts(self):
         try:
@@ -767,8 +737,8 @@ class LivePaperTrader:
 
     def update_dynamic_daily_limits(self, spot_close: float):
         one_trade_std_risk_rupees = (spot_close * 0.0012 * 0.52) * self.lot_size
-        self.daily_profit_goal = round(max(1000.0, one_trade_std_risk_rupees * DAILY_GOAL_LOT_RISK_MULT), 0)
-        self.daily_max_loss = round(min(-1000.0, one_trade_std_risk_rupees * DAILY_LOSS_LOT_RISK_MULT), 0)
+        self.daily_profit_goal = round(max(1200.0, one_trade_std_risk_rupees * DAILY_GOAL_LOT_RISK_MULT), 0)
+        self.daily_max_loss = round(min(-1200.0, one_trade_std_risk_rupees * DAILY_LOSS_LOT_RISK_MULT), 0)
 
     def update_5m_oi_shift_register(self, bar_time_str: str, is_green: bool, is_red: bool, mem: dict):
         if self.last_evaluated_5m_bar == bar_time_str:
@@ -829,43 +799,30 @@ class LivePaperTrader:
         fut_vwap = fut_mem.get("fut_vwap") or spot_vwap
         fut_basis = round(fut_px - spot, 1) if fut_valid else 0.0
         fut_vol = fut_mem.get("fut_5m_vol", 0)
+        fut_vol_ratio = fut_mem.get("fut_vol_ratio", 1.0)
         fut_oi_chg = fut_mem.get("fut_5m_oi_chg", 0)
         fut_label = fut_mem.get("fut_buildup_label", "⚪ FUT N/A")
         smart_tag = smart_info.get("smartlist_tag", "N/A")
 
         s_range = mem.get("strike_range", "")
+        tot_pe_chg = mem.get("total_put_chg", 0)
+        tot_ce_chg = mem.get("total_call_chg", 0)
         ce_g = mem.get("ce", {})
         pe_g = mem.get("pe", {})
-
-        is_bullish = (delta_pcr > 1.20) and (spot > spot_vwap)
-        is_bearish = (delta_pcr < 0.80) and (spot < spot_vwap)
 
         gann = get_gann_levels(spot, count=3)
         sup = gann["immediate_support"]
         res = gann["immediate_resistance"]
 
         if fuel_info["remaining_pct"] < MIN_REMAINING_FUEL_PCT:
-            total_sentiment = "⛽ DAILY FUEL EXHAUSTED (Range Done)"
-            focus_action = "🛑 NO NEW TRADES (Insufficient Daily Fuel Left)"
-        elif self.current_5m_buildup_code in ("BULL_TRAP", "BEAR_TRAP"):
-            total_sentiment = f"{self.current_5m_buildup_label}"
-            focus_action = "🚫 TRAP BLOCKED (Wait for Clean Confirmation)"
-        elif adx < vix_info.get("min_adx", BASE_MIN_ADX_TREND) and (0.85 <= delta_pcr <= 1.15):
-            total_sentiment = "⚪ CHOPPY / RANGEBOUND 💤"
-            focus_action = "🚫 NO TRADE (Wait for Integer Gann Level)"
+            total_sentiment = "⛽ DAILY FUEL EXHAUSTED"
+            focus_action = "🛑 NO NEW TRADES (Daily Range Done)"
         elif gann_zone_status == "NO_GANN_ZONE":
-            bias_txt = "BULLISH BIAS 🟢" if is_bullish else ("BEARISH BIAS 🔴" if is_bearish else "NEUTRAL 🟡")
-            total_sentiment = f"{bias_txt} (Mid-Zone)"
-            focus_action = f"⏳ WAIT FOR INTEGER GANN ({int(sup)} or {int(res)})"
-        elif is_bullish:
-            total_sentiment = "🟢 AT GANN + BULLISH 🚀"
-            focus_action = "🟢 ACTIVE CE WATCH AT INTEGER GANN LEVEL"
-        elif is_bearish:
-            total_sentiment = "🔴 AT GANN + BEARISH 🔻"
-            focus_action = "🔴 ACTIVE PE WATCH AT INTEGER GANN LEVEL"
+            total_sentiment = f"📐 MID-ZONE ({int(sup)} ↔ {int(res)})"
+            focus_action = f"⏳ WAIT FOR INTEGER GANN LEVEL ({int(sup)} or {int(res)})"
         else:
-            total_sentiment = "🟡 MIXED BIAS ⏳"
-            focus_action = "⏳ WAIT & WATCH (Selective Gann Levels Only)"
+            total_sentiment = f"🎯 AT {gann_zone_status} (VolRatio: {fut_vol_ratio}x)"
+            focus_action = "🔥 WATCHING CANDLE BREAKOUT + RETEST AT GANN"
 
         fut_vwap_status = "Above Fut-VWAP 🟢" if fut_px >= fut_vwap else "Below Fut-VWAP 🔴"
 
@@ -873,41 +830,42 @@ class LivePaperTrader:
             f"📊 <b>NIFTY 5M INTEGER GANN PULSE ({bar_time_str} IST)</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 <b>Spot:</b> <code>{spot:.2f}</code> | <b>Gann:</b> <code>{int(sup)}</code> ⬅️ ➡️ <code>{int(res)}</code> ({gann_zone_status})\n"
-            f"🌡️ <b>India VIX:</b> <code>{vix_str}</code>\n"
-            f"⛽ <b>Remaining Daily Fuel:</b> <code>{fuel_info['remaining_pts']:.1f} pts</code> ({fuel_info['fuel_left_pct_of_day']}% left of {fuel_info['expected_pts']:.0f} pts)\n"
+            f"🌡️ <b>India VIX:</b> <code>{vix_str}</code> | ⛽ <b>Fuel Left:</b> <code>{fuel_info['remaining_pts']:.1f} pts</code> ({fuel_info['fuel_left_pct_of_day']}%)\n"
             f"📈 <b>Futures ({self.fut_symbol}):</b> <code>{fut_px:.2f}</code> (Basis: <code>{fut_basis:+.1f}</code>)\n"
             f"• <b>True Fut VWAP:</b> <code>{fut_vwap:.2f}</code> ({fut_vwap_status})\n"
-            f"• <b>Fut 5M Vol:</b> <code>{fut_vol:,}</code> | <b>5M OI Chg:</b> <code>{fut_oi_chg:+,}</code>\n"
+            f"• <b>Fut 5M Vol:</b> <code>{fut_vol:,}</code> (<code>{fut_vol_ratio}x</code>) | <b>5M OI Chg:</b> <code>{fut_oi_chg:+,}</code>\n"
             f"• <b>Fut Build-up:</b> <b>{fut_label}</b> | <b>Smartlist:</b> <code>{smart_tag}</code>\n\n"
-            f"🔹 <b>SMC ±2% STRIKES ΔOI ({s_range}):</b>\n"
-            f"• <b>Day Intraday ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain_display}</code>\n"
-            f"• <b>5M Shift:</b> <code>PE {self.shift_5m_put_oi:+,}</code> | <code>CE {self.shift_5m_call_oi:+,}</code> | <b>{self.current_5m_buildup_label}</b>\n\n"
+            f"🔹 <b>SMC ±2% STRIKES OI & ΔOI ({s_range}):</b>\n"
+            f"• <b>Day ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain_display}</code>\n"
+            f"• <b>Day Chg OI:</b> <code>PE {tot_pe_chg:+,}</code> | <code>CE {tot_ce_chg:+,}</code>\n"
+            f"• <b>5M Shift:</b> <code>PE {self.shift_5m_put_oi:+,}</code> | <code>CE {self.shift_5m_call_oi:+,}</code> ({self.current_5m_buildup_label})\n\n"
             f"🔹 <b>LIVE ATM GREEKS ({int(mem.get('atm_strike', 0))}):</b>\n"
-            f"• <b>CE:</b> Δ <code>{ce_g.get('delta', 0):.2f}</code> | IV <code>{ce_g.get('iv', 0):.1f}%</code> | θ <code>{ce_g.get('theta', 0):.1f}</code>\n"
-            f"• <b>PE:</b> Δ <code>{pe_g.get('delta', 0):.2f}</code> | IV <code>{pe_g.get('iv', 0):.1f}%</code> | θ <code>{pe_g.get('theta', 0):.1f}</code>\n\n"
+            f"• <b>CE:</b> Δ <code>{ce_g.get('delta', 0):.2f}</code> | IV <code>{ce_g.get('iv', 0):.1f}%</code> | θ <code>{ce_g.get('theta', 0):.1f}</code> | OI <code>{ce_g.get('oi', 0):,}</code>\n"
+            f"• <b>PE:</b> Δ <code>{pe_g.get('delta', 0):.2f}</code> | IV <code>{pe_g.get('iv', 0):.1f}%</code> | θ <code>{pe_g.get('theta', 0):.1f}</code> | OI <code>{pe_g.get('oi', 0):,}</code>\n\n"
             f"🔹 <b>MOMENTUM:</b> RSI <code>{rsi:.1f}</code> | ADX <code>{adx:.1f}</code> | ATR <code>{atr:.1f}</code> | Lot: <code>{self.lot_size}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏁 <b>TOTAL SENTIMENT:</b> <b>{total_sentiment}</b>\n"
-            f"🎯 <b>STRATEGY FOCUS:</b> <b>{focus_action}</b>"
+            f"🏁 <b>STATUS:</b> <b>{total_sentiment}</b>\n"
+            f"🎯 <b>ACTION:</b> <b>{focus_action}</b>"
         )
         send_telegram(msg)
-        print(f"[{bar_time_str}] Pulse: {total_sentiment} | GannZone:{gann_zone_status} | DayΔPCR:{delta_pcr:.2f}", flush=True)
+        print(f"[{bar_time_str}] Pulse: {total_sentiment} | VolRatio:{fut_vol_ratio}x | DayΔPCR:{delta_pcr:.2f}", flush=True)
 
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
-            f"🚀 <b>NIFTY 5M INTEGER GANN ALGO: नवीन एन्ट्री (#{pos['trade_id']})</b>\n"
+            f"🚀 <b>NIFTY 5M INTEGER GANN BREAKOUT-RETEST: एन्ट्री (#{pos['trade_id']})</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"🎯 <b>ऑर्डर:</b> <b>BUY {pos['clean_name']}</b>\n"
             f"🏷️ <b>सिम्बॉल:</b> <code>{pos['symbol']}</code>\n"
             f"📦 <b>लॉट:</b> <code>1 Lot</code> (Dynamic Qty: <code>{pos['lot_size']}</code>)\n"
             f"💵 <b>खरेदी किंमत:</b> <code>₹{pos['entry_px']:.2f}</code>\n"
             f"🛑 <b>स्टॉपलॉस:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts / -{pos['opt_sl_pct']:.1f}% | Spot SL: {pos['spot_sl']})\n"
-            f"🏁 <b>टार्गेट:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts / +{pos['opt_trg_pct']:.1f}% | Spot Trg: {pos['spot_target']})\n"
+            f"🏁 <b>टार्गेट (1:1.5):</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts / +{pos['opt_trg_pct']:.1f}% | Spot Trg: {pos['spot_target']})\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📐 <b>Integer Gann Anchor:</b> <code>{int(pos['gann_level'])}</code> | ⛽ <b>Fuel Left:</b> <code>{pos['rem_fuel_pts']:.1f} pts</code>\n"
-            f"🧬 <b>Live Option Greeks & Dual Build-up:</b>\n"
+            f"🧬 <b>Live Option Greeks & OI Data:</b>\n"
             f"• <b>Delta (Δ):</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code> | <b>Theta:</b> <code>{pos['entry_theta']:.1f}</code>\n"
-            f"• <b>Day ΔOI PCR:</b> <code>{pos['delta_pcr']:.2f}</code> | <b>Fut:</b> <code>{pos['fut_buildup']}</code>\n"
+            f"• <b>Strike OI:</b> <code>{pos['strike_oi']:,}</code> | <b>Chg OI:</b> <code>{pos['change_oi']:+,}</code> | <b>Day ΔPCR:</b> <code>{pos['delta_pcr']:.2f}</code>\n"
+            f"• <b>Fut Build-up:</b> <code>{pos['fut_buildup']}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
             f"📍 <b>NIFTY Spot:</b> <code>{pos['spot_px']:.2f}</code> | <b>India VIX:</b> <code>{pos['india_vix']}</code>\n"
             f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
             f"⏱️ <b>वेळ:</b> <code>{pos['entry_time']}</code>"
@@ -952,44 +910,21 @@ class LivePaperTrader:
         entry_price = ltp
         live_abs_delta = max(0.35, min(0.75, abs(float(greeks.get("delta", 0.52)))))
 
-        min_spot_sl_pts = spot_px * MIN_SPOT_SL_PCT
-        max_spot_sl_pts = spot_px * MAX_SPOT_SL_PCT
-        raw_spot_risk = abs(spot_px - raw_spot_sl)
-        capped_spot_risk = round(min(max_spot_sl_pts, max(min_spot_sl_pts, raw_spot_risk)), 2)
-
-        if side == "CE":
-            realistic_spot_sl = round(spot_px - capped_spot_risk, 2)
-        else:
-            realistic_spot_sl = round(spot_px + capped_spot_risk, 2)
-
-        base_spot_reward = capped_spot_risk * REALISTIC_RRR
-        atr_reach_cap = (atr_5m * 3.5) if (atr_5m and atr_5m > 0) else base_spot_reward
-        fuel_reach_cap = max(min_spot_sl_pts * 1.2, fuel_info["remaining_pts"] * 0.70)
-        gann_dist = abs(gann_barrier - spot_px)
-
-        candidate_rewards = [base_spot_reward, atr_reach_cap, fuel_reach_cap]
-        if gann_dist >= min_spot_sl_pts * 1.5:
-            candidate_rewards.append(max(min_spot_sl_pts * 1.2, gann_dist * 0.92))
-
-        realistic_spot_reward = round(max(min_spot_sl_pts * 1.2, min(candidate_rewards)), 2)
-
-        if side == "CE":
-            realistic_spot_target = round(spot_px + realistic_spot_reward, 2)
-        else:
-            realistic_spot_target = round(spot_px - realistic_spot_reward, 2)
-
-        # ATR-Aware Option SL (जर 5M ATR > 0.10% ऑफ Spot असेल तर किमान 14% SL जेणेकरून नॉईजमध्ये SL हिट होऊ नये)
-        high_volatility_bar = (atr_5m >= (spot_px * 0.0010))
-        eff_min_opt_sl_pct = HIGH_ATR_MIN_OPT_SL_PCT if high_volatility_bar else MIN_OPT_SL_PCT
-
-        delta_opt_sl = capped_spot_risk * live_abs_delta
-        min_opt_sl = entry_price * eff_min_opt_sl_pct
+        # बॅकटेस्ट सिद्ध सूत्र: calc_sl_pts = atr * 1.2 * Live_Delta (किमान 10% आणि कमाल 22% ऑफ प्रीमियम)
+        atr_opt_sl = atr_5m * 1.2 * live_abs_delta
+        min_opt_sl = entry_price * MIN_OPT_SL_PCT
         max_opt_sl = entry_price * MAX_OPT_SL_PCT
-        opt_sl_pts = round(min(max_opt_sl, max(min_opt_sl, delta_opt_sl)), 2)
+        opt_sl_pts = round(min(max_opt_sl, max(min_opt_sl, atr_opt_sl)), 2)
 
-        delta_opt_trg = realistic_spot_reward * live_abs_delta
+        # 1 : 1.50 Risk-to-Reward (शिल्लक दैनिक इंधनाच्या मर्यादेत)
+        fuel_opt_cap = max(opt_sl_pts * 1.25, (fuel_info["remaining_pts"] * 0.70) * live_abs_delta)
         max_opt_trg = entry_price * MAX_OPT_TRG_PCT
-        opt_trg_pts = round(min(max_opt_trg, max(opt_sl_pts * 1.35, delta_opt_trg)), 2)
+        opt_trg_pts = round(min(max_opt_trg, fuel_opt_cap, opt_sl_pts * REALISTIC_RRR), 2)
+
+        spot_risk = round(opt_sl_pts / live_abs_delta, 2)
+        spot_reward = round(opt_trg_pts / live_abs_delta, 2)
+        realistic_spot_sl = round((spot_px - spot_risk) if side == "CE" else (spot_px + spot_risk), 2)
+        realistic_spot_target = round((spot_px + spot_reward) if side == "CE" else (spot_px - spot_reward), 2)
 
         opt_sl_pct = round((opt_sl_pts / entry_price) * 100.0, 1)
         opt_trg_pct = round((opt_trg_pts / entry_price) * 100.0, 1)
@@ -1086,7 +1021,7 @@ class LivePaperTrader:
 
         self.active_position = None
         self.pending_gann_setup = None
-        self.cooldown_until = time.monotonic() + 600
+        self.cooldown_until = time.monotonic() + 300
 
     def check_position_management(self):
         pos = self.active_position
@@ -1148,8 +1083,6 @@ class LivePaperTrader:
         spot_high = float(completed_bar["high"])
         spot_low = float(completed_bar["low"])
         spot_vwap_5m = float(completed_bar["vwap"])
-        rsi_val = float(completed_bar.get("rsi14", 50.0)) if pd.notna(completed_bar.get("rsi14")) else 50.0
-        adx_val = float(completed_bar.get("adx14", 0.0)) if pd.notna(completed_bar.get("adx14")) else 0.0
         atr_val = float(completed_bar.get("atr14", spot_close * 0.0006)) if pd.notna(completed_bar.get("atr14")) else (spot_close * 0.0006)
 
         self.vix_register = self.api.get_live_india_vix()
@@ -1175,7 +1108,6 @@ class LivePaperTrader:
         gann_prox_pts = spot_close * GANN_PROXIMITY_PCT
         gann_retest_pts = spot_close * GANN_RETEST_BAND_PCT
 
-        # किंमत शुद्ध पूर्णांक Gann Level (158^2 किंवा 159^2) जवळ आहे का ते तपासणे
         near_sup_gann = (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - gann_prox_pts)
         near_res_gann = (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + gann_prox_pts)
         broke_res_gann = (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
@@ -1191,7 +1123,7 @@ class LivePaperTrader:
         self.update_5m_oi_shift_register(bar_time_str, is_green, is_red, self.live_memory_register)
         self.send_5m_sentiment_pulse(df_5m, delta_pcr, max_pain_display, self.live_memory_register, self.futures_memory_register, smartlist_info, fuel_info, self.vix_register, gann_zone_status)
 
-        if len(df_5m) < 10:
+        if len(df_5m) < 6:
             return
 
         if fuel_info["remaining_pct"] < MIN_REMAINING_FUEL_PCT:
@@ -1199,57 +1131,48 @@ class LivePaperTrader:
                 self.pending_gann_setup = None
             return
 
-        dynamic_min_adx = self.vix_register.get("min_adx", BASE_MIN_ADX_TREND)
-        choppy, chop_reason = is_market_choppy(df_5m, delta_pcr, self.current_5m_buildup_code, dynamic_min_adx)
-        if choppy:
-            if self.pending_gann_setup:
-                self.pending_gann_setup = None
+        # जर खूप मोठा Trap (2.5L+ विरुद्ध OI लेखन) असेल तरच ब्लॉक करा
+        if self.current_5m_buildup_code in ("BULL_TRAP", "BEAR_TRAP"):
+            self.pending_gann_setup = None
             return
 
+        # =========================================================================
+        # STAGE 1: PURE INTEGER GANN REACH + CANDLE EXPANSION / VOLUME BREAKOUT
+        # बॅकटेस्ट नियम: (has_volume >= 1.20x OR range >= 1.15x ATR) AND solid body >= 0.45
+        # =========================================================================
         c_range = max(spot_high - spot_low, 1e-9)
         c_body = abs(spot_close - spot_open)
         body_ratio = c_body / c_range
 
-        buffer_pts = round(spot_close * ENTRY_BUFFER_PCT, 2)
-        swing_pad_pts = round(spot_close * 0.0002, 2)
+        fut_vol_surge = self.futures_memory_register.get("fut_vol_surge", False)
+        is_range_expansion = c_range >= (MIN_RANGE_ATR_MULT * atr_val)
+        is_body_solid = body_ratio >= MIN_BODY_RATIO
 
         fut_valid = self.futures_memory_register.get("valid", False)
         above_fut_vwap = self.futures_memory_register.get("above_fut_vwap", True) if fut_valid else True
         below_fut_vwap = (not self.futures_memory_register.get("above_fut_vwap", False)) if fut_valid else True
 
-        # दिवसाचा स्थिर Intraday ΔOI Trend + Dual VWAP (५-मिनिटांच्या OI गोंधळावर अवलंबून न राहता)
-        bullish_sentiment = (delta_pcr > 1.20) and (spot_close > spot_vwap_5m) and above_fut_vwap and (rsi_val <= MAX_ENTRY_RSI_CE)
-        bearish_sentiment = (delta_pcr < 0.80) and (spot_close < spot_vwap_5m) and below_fut_vwap and (rsi_val >= MIN_ENTRY_RSI_PE)
+        swing_pad_pts = round(spot_close * 0.0002, 2)
+        retest_buf_pts = round(0.30 * atr_val, 2)
 
-        if self.pending_gann_setup:
-            if self.pending_gann_setup["side"] == "CE" and not bullish_sentiment:
-                self.pending_gann_setup = None
-            elif self.pending_gann_setup["side"] == "PE" and not bearish_sentiment:
-                self.pending_gann_setup = None
-
-        # =========================================================================
-        # STRICT INTEGER GANN ANCHOR RULE (NO GANN BYPASS IN MID-ZONE!)
-        # फक्त शुद्ध पूर्णांक Gann Level (158^2, 159^2...) जवळ बाऊन्स/रिजेक्ट/ब्रेकआऊट असेल तरच ट्रेड!
-        # =========================================================================
-        if not self.pending_gann_setup:
-            # 🟢 CE SETUP (केवळ Integer Gann Support Bounce किंवा Integer Gann Resistance Breakout वर)
-            if bullish_sentiment and is_green and (body_ratio >= MIN_BODY_RATIO):
+        if not self.pending_gann_setup and (fut_vol_surge or is_range_expansion) and is_body_solid:
+            # 🟢 CE SETUP: शुद्ध पूर्णांक Gann Support Bounce किंवा Gann Resistance Breakout नंतर मजबूत हिरवी कॅन्डल
+            if is_green and (spot_close > spot_vwap_5m) and above_fut_vwap:
                 gann_sup_bounce_ce = (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - (gann_prox_pts * 0.5))
                 gann_sup_retest_ce = (float(prev_bar["high"]) > sup_level) and (sup_level - gann_prox_pts <= spot_low <= sup_level + gann_retest_pts)
                 gann_res_breakout_ce = (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
 
                 if gann_sup_bounce_ce or gann_sup_retest_ce or gann_res_breakout_ce:
-                    trigger_px = round(spot_high + buffer_pts, 2)
                     if gann_res_breakout_ce:
-                        setup_name = f"GANN_{int(res_level)}_BREAKOUT_CE"
+                        setup_name = f"GANN_{int(res_level)}_VOL_BREAKOUT_CE"
                         anchor_gann = res_level
                         next_barrier = gann["target_ce"]
                     elif gann_sup_bounce_ce:
-                        setup_name = f"GANN_{int(sup_level)}_BOUNCE_CE"
+                        setup_name = f"GANN_{int(sup_level)}_VOL_BOUNCE_CE"
                         anchor_gann = sup_level
                         next_barrier = res_level
                     else:
-                        setup_name = f"GANN_{int(sup_level)}_RETEST_CE"
+                        setup_name = f"GANN_{int(sup_level)}_VOL_RETEST_CE"
                         anchor_gann = sup_level
                         next_barrier = res_level
 
@@ -1259,31 +1182,33 @@ class LivePaperTrader:
                         "oi_buildup": self.current_5m_buildup_code,
                         "gann_level": anchor_gann,
                         "gann_barrier": next_barrier,
-                        "trigger_level": trigger_px,
+                        "breakout_level": spot_high,
+                        "retest_min": round(spot_high - retest_buf_pts, 2),
+                        "trigger_level": round(spot_high + (spot_close * ENTRY_BUFFER_PCT), 2),
+                        "retest_touched": False,
                         "raw_spot_sl": round(spot_low - swing_pad_pts, 2),
                         "atr_5m": atr_val,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] Integer Gann CE Armed: {setup_name} | Trigger @ {trigger_px}", flush=True)
+                    print(f"[!] Gann Breakout Armed (CE): {setup_name} | Retest Zone: {self.pending_gann_setup['retest_min']} | Trigger: {self.pending_gann_setup['trigger_level']}", flush=True)
 
-            # 🔴 PE SETUP (केवळ Integer Gann Resistance Reject किंवा Integer Gann Support Breakdown वर)
-            elif bearish_sentiment and is_red and (body_ratio >= MIN_BODY_RATIO):
+            # 🔴 PE SETUP: शुद्ध पूर्णांक Gann Resistance Reject किंवा Gann Support Breakdown नंतर मजबूत लाल कॅन्डल
+            elif is_red and (spot_close < spot_vwap_5m) and below_fut_vwap:
                 gann_res_reject_pe = (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + (gann_prox_pts * 0.5))
                 gann_res_retest_pe = (float(prev_bar["low"]) < res_level) and (res_level - gann_retest_pts <= spot_high <= res_level + gann_prox_pts)
                 gann_sup_breakdown_pe = (float(prev_bar["close"]) >= sup_level) and (spot_close < sup_level)
 
                 if gann_res_reject_pe or gann_res_retest_pe or gann_sup_breakdown_pe:
-                    trigger_px = round(spot_low - buffer_pts, 2)
                     if gann_sup_breakdown_pe:
-                        setup_name = f"GANN_{int(sup_level)}_BREAKDOWN_PE"
+                        setup_name = f"GANN_{int(sup_level)}_VOL_BREAKDOWN_PE"
                         anchor_gann = sup_level
                         next_barrier = gann["target_pe"]
                     elif gann_res_reject_pe:
-                        setup_name = f"GANN_{int(res_level)}_REJECT_PE"
+                        setup_name = f"GANN_{int(res_level)}_VOL_REJECT_PE"
                         anchor_gann = res_level
                         next_barrier = sup_level
                     else:
-                        setup_name = f"GANN_{int(res_level)}_RETEST_PE"
+                        setup_name = f"GANN_{int(res_level)}_VOL_RETEST_PE"
                         anchor_gann = res_level
                         next_barrier = sup_level
 
@@ -1293,13 +1218,19 @@ class LivePaperTrader:
                         "oi_buildup": self.current_5m_buildup_code,
                         "gann_level": anchor_gann,
                         "gann_barrier": next_barrier,
-                        "trigger_level": trigger_px,
+                        "breakout_level": spot_low,
+                        "retest_max": round(spot_low + retest_buf_pts, 2),
+                        "trigger_level": round(spot_low - (spot_close * ENTRY_BUFFER_PCT), 2),
+                        "retest_touched": False,
                         "raw_spot_sl": round(spot_high + swing_pad_pts, 2),
                         "atr_5m": atr_val,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] Integer Gann PE Armed: {setup_name} | Trigger @ {trigger_px}", flush=True)
+                    print(f"[!] Gann Breakout Armed (PE): {setup_name} | Retest Zone: {self.pending_gann_setup['retest_max']} | Trigger: {self.pending_gann_setup['trigger_level']}", flush=True)
 
+        # =========================================================================
+        # STAGE 2: RETEST CONFIRMATION & LIVE ENTRY (बॅकटेस्टची 15-मिनिट री-टेस्ट कन्फर्मेशन)
+        # =========================================================================
         if self.pending_gann_setup:
             setup = self.pending_gann_setup
             if time.monotonic() - setup["armed_time"] > 900:
@@ -1308,11 +1239,20 @@ class LivePaperTrader:
 
             current_spot_tick = self.api.get_ltp("NSE_INDEX|Nifty 50") or spot_close
 
-            triggered = False
-            if setup["side"] == "CE" and current_spot_tick >= setup["trigger_level"]:
-                triggered = True
-            elif setup["side"] == "PE" and current_spot_tick <= setup["trigger_level"]:
-                triggered = True
+            if setup["side"] == "CE":
+                if current_spot_tick <= setup["breakout_level"] and current_spot_tick >= setup["retest_min"]:
+                    setup["retest_touched"] = True
+                if current_spot_tick < setup["raw_spot_sl"]:
+                    self.pending_gann_setup = None
+                    return
+                triggered = setup["retest_touched"] and (current_spot_tick >= setup["trigger_level"])
+            else:
+                if current_spot_tick >= setup["breakout_level"] and current_spot_tick <= setup["retest_max"]:
+                    setup["retest_touched"] = True
+                if current_spot_tick > setup["raw_spot_sl"]:
+                    self.pending_gann_setup = None
+                    return
+                triggered = setup["retest_touched"] and (current_spot_tick <= setup["trigger_level"])
 
             if triggered:
                 atm_strike = round(current_spot_tick / self.strike_step) * self.strike_step
@@ -1327,25 +1267,11 @@ class LivePaperTrader:
                 fresh_mem = self.api.get_live_option_chain_memory(self.expiry, atm_strike, current_spot_tick)
                 opt_greeks = fresh_mem["ce"] if setup["side"] == "CE" else fresh_mem["pe"]
 
-                target_chg_oi = opt_greeks.get("chg_oi", 0)
                 live_iv = float(opt_greeks.get("iv", 0.0))
                 live_abs_delta = abs(float(opt_greeks.get("delta", 0.52)))
-                live_theta = float(opt_greeks.get("theta", 0.0))
                 max_iv_limit = self.vix_register.get("max_iv", MAX_ALLOWED_IV)
 
-                if target_chg_oi < 0 and setup["oi_buildup"] not in ("MAJOR_SHORT_COVERING", "MAJOR_PUT_UNWINDING"):
-                    self.pending_gann_setup = None
-                    return
-
-                if live_iv > max_iv_limit:
-                    self.pending_gann_setup = None
-                    return
-
-                if live_abs_delta < MIN_ABS_DELTA:
-                    self.pending_gann_setup = None
-                    return
-
-                if hhmm >= "14:00" and abs(live_theta) > 15.0 and adx_val < 22.0:
+                if live_iv > max_iv_limit or live_abs_delta < MIN_ABS_DELTA:
                     self.pending_gann_setup = None
                     return
 
@@ -1400,12 +1326,12 @@ def main():
     trader = LivePaperTrader(api, timings)
 
     send_telegram(
-        f"🟢 <b>NIFTY 5M PURE INTEGER GANN ALGO: सुरू झाले</b>\n"
+        f"🟢 <b>NIFTY 5M INTEGER GANN CONTINUOUS ALGO: सुरू झाले</b>\n"
         f"तारीख: <code>{TODAY_STR}</code> | Dynamic Lot: <code>{trader.lot_size}</code>\n"
-        f"सत्र वेळ: <b>{timings['raw_start']} ते {timings['raw_end']} IST</b>\n"
-        f"नियम: <b>Pure Integer Gann Anchor (No Mid-Zone Trades) + Day ΔOI + Dual VWAP</b>"
+        f"ट्रेडिंग विंडो: <b>{timings['session_start']} ते {timings['entry_end']} IST</b> (Force Exit: {timings['force_exit']})\n"
+        f"नियम: <b>Pure Integer Gann + Fut Vol Breakout-Retest + Live Greeks/OI + 1:1.5 R:R</b>"
     )
-    print(f"[*] Pure Integer Gann + Scale-Invariant Engine Active ({timings['raw_start']} - {timings['raw_end']}) for {TODAY_STR}...", flush=True)
+    print(f"[*] Integer Gann Continuous Engine Active ({timings['session_start']} - {timings['entry_end']}) for {TODAY_STR}...", flush=True)
 
     last_strat = 0.0
     try:
