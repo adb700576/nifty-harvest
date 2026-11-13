@@ -97,7 +97,9 @@ def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
-        requests.post(url, json=payload, timeout=5)
+        r = requests.post(url, json=payload, timeout=8)
+        if r.status_code != 200:
+            print(f"[-] Telegram API HTTP {r.status_code}: {r.text[:150]}", flush=True)
     except Exception as e:
         print(f"[-] Telegram Error: {e}", flush=True)
 
@@ -131,6 +133,8 @@ def send_telegram_chart_alert(df_5m: pd.DataFrame, gann_level: float, sl_price: 
                     files={"photo": img},
                     timeout=10
                 )
+        else:
+            send_telegram(caption_text)
     except Exception:
         send_telegram(caption_text)
 
@@ -202,13 +206,6 @@ class UpstoxClient:
             return None
 
     def get_live_india_vix(self) -> dict:
-        """
-        Upstox मधून थेट Live India VIX (NSE_INDEX|India VIX) फॅच करून Volatility Regime ठरवणे:
-        - Calm (< 13.0): संथ बाजार -> कडक ADX (21.0)
-        - Normal (13.0 - 17.5): आदर्श वातावरण -> ADX (18.0)
-        - Elevated (17.5 - 22.0): वेगवान चाल -> ADX (18.0)
-        - Panic (> 22.0): अत्यंत अस्थिर -> कडक IV Cap (26.0%)
-        """
         vix_val = self.get_ltp("NSE_INDEX|India VIX")
         if vix_val is None or vix_val <= 0:
             return {
@@ -219,7 +216,6 @@ class UpstoxClient:
                 "implied_daily_pct": 0.0085
             }
 
-        # Rule of 16: VIX / sqrt(252) ≈ VIX / 15.87 = एका दिवसाची अपेक्षित हालचाल %
         implied_daily_pct = round((vix_val / 100.0) / 15.87, 5)
 
         if vix_val < 13.0:
@@ -523,24 +519,27 @@ class UpstoxClient:
                     }
 
             if not found_chain_chg or (tot_c_chg == 0 and tot_p_chg == 0):
-                tot_c_chg = 0
-                tot_p_chg = 0
-                res_chg = self.get("/v2/market/change-oi", {
-                    "instrument_key": "NSE_INDEX|Nifty 50",
-                    "expiry": expiry,
-                    "date": TODAY_STR,
-                    "interval": 1
-                })
-                for item in res_chg.get("data", {}).get("call_put_oi_data_list", []):
-                    s_price = float(item.get("strike_price", 0))
-                    if abs(s_price - target_strike) <= strike_band:
-                        c_chg = int(item.get("call_change_oi", 0))
-                        p_chg = int(item.get("put_change_oi", 0))
-                        tot_c_chg += c_chg
-                        tot_p_chg += p_chg
-                    if s_price == target_strike:
-                        memory["ce"]["chg_oi"] = int(item.get("call_change_oi", 0))
-                        memory["pe"]["chg_oi"] = int(item.get("put_change_oi", 0))
+                try:
+                    tot_c_chg = 0
+                    tot_p_chg = 0
+                    res_chg = self.get("/v2/market/change-oi", {
+                        "instrument_key": "NSE_INDEX|Nifty 50",
+                        "expiry": expiry,
+                        "date": TODAY_STR,
+                        "interval": 1
+                    })
+                    for item in res_chg.get("data", {}).get("call_put_oi_data_list", []):
+                        s_price = float(item.get("strike_price", 0))
+                        if abs(s_price - target_strike) <= strike_band:
+                            c_chg = int(item.get("call_change_oi", 0))
+                            p_chg = int(item.get("put_change_oi", 0))
+                            tot_c_chg += c_chg
+                            tot_p_chg += p_chg
+                        if s_price == target_strike:
+                            memory["ce"]["chg_oi"] = int(item.get("call_change_oi", 0))
+                            memory["pe"]["chg_oi"] = int(item.get("put_change_oi", 0))
+                except Exception:
+                    pass
 
             memory["total_call_oi"] = tot_c_oi
             memory["total_put_oi"] = tot_p_oi
@@ -553,8 +552,13 @@ class UpstoxClient:
                 memory["delta_oi_pcr"] = 2.50
             elif tot_p_chg <= 0 and tot_c_chg > 0:
                 memory["delta_oi_pcr"] = 0.40
+            elif tot_c_oi > 0:
+                memory["delta_oi_pcr"] = round(tot_p_oi / tot_c_oi, 2)
+            else:
+                memory["delta_oi_pcr"] = 1.00
         except Exception as e:
             print(f"[-] Live Memory Fetch Error: {e}", flush=True)
+            memory["delta_oi_pcr"] = 1.00
         return memory
 
 
@@ -652,7 +656,6 @@ class LivePaperTrader:
         self.active_position = None
         self.trade_counter = 0
 
-        # Dynamic Lot Size, Strike Step & Daily Fuel Capacity
         self.lot_size = 65
         self.strike_step = 50.0
         self.daily_expected_range_pct = self.api.get_daily_expected_range_pct()
@@ -738,7 +741,6 @@ class LivePaperTrader:
         today_low = float(df_5m["low"].min())
         used_pts = max(0.0, today_high - today_low)
 
-        # 14-Day ATR% आणि Live India VIX Implied Daily% यांचा समतोल घेणे
         blended_daily_pct = (self.daily_expected_range_pct + vix_info.get("implied_daily_pct", self.daily_expected_range_pct)) / 2.0
         expected_pts = round(spot_close * blended_daily_pct, 2)
         rem_pts = round(max(0.0, expected_pts - used_pts), 2)
@@ -792,7 +794,7 @@ class LivePaperTrader:
                 writer.writeheader()
             writer.writerow(row)
 
-    def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, delta_pcr: float, max_pain: float, mem: dict, fut_mem: dict, smart_info: dict, fuel_info: dict, vix_info: dict):
+    def send_5m_sentiment_pulse(self, df_5m: pd.DataFrame, delta_pcr: float, max_pain_display: Any, mem: dict, fut_mem: dict, smart_info: dict, fuel_info: dict, vix_info: dict):
         if df_5m.empty:
             return
 
@@ -864,7 +866,7 @@ class LivePaperTrader:
             f"• <b>Fut 5M Vol:</b> <code>{fut_vol:,}</code> | <b>5M OI Chg:</b> <code>{fut_oi_chg:+,}</code>\n"
             f"• <b>Fut Build-up:</b> <b>{fut_label}</b> | <b>Smartlist:</b> <code>{smart_tag}</code>\n\n"
             f"🔹 <b>SMC ±2% STRIKES ΔOI & 5M SHIFT ({s_range}):</b>\n"
-            f"• <b>Intraday ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain}</code>\n"
+            f"• <b>Intraday ΔOI PCR:</b> <code>{delta_pcr:.2f}</code> | <b>Max Pain:</b> <code>{max_pain_display}</code>\n"
             f"• <b>Last 5M Shift:</b> <code>PE {self.shift_5m_put_oi:+,}</code> | <code>CE {self.shift_5m_call_oi:+,}</code>\n"
             f"• <b>Opt 5M Build-up:</b> <b>{self.current_5m_buildup_label}</b>\n\n"
             f"🔹 <b>LIVE ATM GREEKS ({int(mem.get('atm_strike', 0))}):</b>\n"
@@ -933,7 +935,7 @@ class LivePaperTrader:
 
     def execute_entry(self, side: str, strike: float, ltp: float, instrument_key: str, symbol: str,
                       spot_px: float, gann_level: float, trigger_level: float, raw_spot_sl: float, gann_barrier: float,
-                      atr_5m: float, fuel_info: dict, vix_info: dict, delta_pcr: float, max_pain: float, greeks: dict,
+                      atr_5m: float, fuel_info: dict, vix_info: dict, delta_pcr: float, max_pain_display: Any, greeks: dict,
                       oi_buildup: str, fut_mem: dict, setup_type: str, df_5m: pd.DataFrame):
         entry_price = ltp
         live_abs_delta = max(0.35, min(0.75, abs(float(greeks.get("delta", 0.52)))))
@@ -1008,7 +1010,7 @@ class LivePaperTrader:
             "india_vix": f"{vix_val:.2f}" if vix_val else "N/A",
             "pcr": delta_pcr,
             "delta_pcr": delta_pcr,
-            "max_pain": max_pain if max_pain else "N/A",
+            "max_pain": max_pain_display,
             "entry_delta": round(float(greeks.get("delta", 0.52)), 3),
             "entry_iv": round(float(greeks.get("iv", 0.0)), 2),
             "entry_theta": round(float(greeks.get("theta", 0.0)), 2),
@@ -1116,7 +1118,8 @@ class LivePaperTrader:
             return
 
         df_5m = self.api.get_spot_candles_5m()
-        if len(df_5m) < 10:
+        if df_5m.empty or len(df_5m) < 2:
+            print(f"[{hhmm}] Waiting for 5M spot candles...", flush=True)
             return
 
         df_5m = add_indicators_5m(df_5m)
@@ -1129,8 +1132,8 @@ class LivePaperTrader:
         spot_high = float(completed_bar["high"])
         spot_low = float(completed_bar["low"])
         spot_vwap_5m = float(completed_bar["vwap"])
-        adx_val = float(completed_bar.get("adx14", 0.0))
-        atr_val = float(completed_bar.get("atr14", spot_close * 0.0006))
+        adx_val = float(completed_bar.get("adx14", 0.0)) if pd.notna(completed_bar.get("adx14")) else 0.0
+        atr_val = float(completed_bar.get("atr14", spot_close * 0.0006)) if pd.notna(completed_bar.get("atr14")) else (spot_close * 0.0006)
 
         # 1. Live India VIX Regime + Dynamic Daily Limits + Remaining Fuel
         self.vix_register = self.api.get_live_india_vix()
@@ -1141,19 +1144,20 @@ class LivePaperTrader:
         is_red = spot_close < spot_open
 
         max_pain = self.api.get_official_max_pain(self.expiry)
+        max_pain_display = max_pain if max_pain is not None else "Calculating..."
 
         atm_strike = round(spot_close / self.strike_step) * self.strike_step
         self.live_memory_register = self.api.get_live_option_chain_memory(self.expiry, atm_strike, spot_close)
-        delta_pcr = self.live_memory_register.get("delta_oi_pcr")
+        delta_pcr = self.live_memory_register.get("delta_oi_pcr") or 1.00
 
         self.futures_memory_register = self.api.get_futures_5m_metrics(self.fut_instrument_key)
         smartlist_info = self.api.get_futures_smartlist_signal(self.fut_instrument_key)
 
-        if max_pain is None or delta_pcr is None:
-            return
-
         self.update_5m_oi_shift_register(bar_time_str, is_green, is_red, self.live_memory_register)
-        self.send_5m_sentiment_pulse(df_5m, delta_pcr, max_pain, self.live_memory_register, self.futures_memory_register, smartlist_info, fuel_info, self.vix_register)
+        self.send_5m_sentiment_pulse(df_5m, delta_pcr, max_pain_display, self.live_memory_register, self.futures_memory_register, smartlist_info, fuel_info, self.vix_register)
+
+        if len(df_5m) < 10:
+            return
 
         if fuel_info["remaining_pct"] < MIN_REMAINING_FUEL_PCT:
             if self.pending_gann_setup:
@@ -1337,7 +1341,7 @@ class LivePaperTrader:
                         fuel_info=fuel_info,
                         vix_info=self.vix_register,
                         delta_pcr=delta_pcr,
-                        max_pain=max_pain,
+                        max_pain_display=max_pain_display,
                         greeks=opt_greeks,
                         oi_buildup=setup["oi_buildup"],
                         fut_mem=self.futures_memory_register,
