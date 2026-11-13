@@ -101,32 +101,32 @@ ACTIVE_INDICES: List[str] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SE
 POLL_INTERVAL = 1.0
 STRATEGY_INTERVAL = 12.0
 POSITION_UPDATE_INTERVAL = 180.0
-MAX_SIMULTANEOUS_POSITIONS = 2     # एकाच वेळी कमाल २ वेगवेगळ्या इंडेक्समध्ये पोझिशन्स
+MAX_SIMULTANEOUS_POSITIONS = 2
 
 # Gann 0.50 Lattice, VWAP & Price Action Parameters
-GANN_PROXIMITY_PCT = 0.0012        # Gann Level (1.0 & 0.5 step) जवळचा झोन = 0.12%
-GANN_RETEST_BAND_PCT = 0.0018      # Gann Retest झोन = 0.18%
-VWAP_TOUCH_BAND_PCT = 0.0008       # VWAP Rejection स्पर्श झोन = 0.08%
-ENTRY_BUFFER_PCT = 0.00020         # Breakout Buffer = 0.020%
-MIN_REMAINING_FUEL_PCT = 0.0010    # दिवसाचे किमान शिल्लक इंधन = 0.10%
-STRIKE_SCAN_RANGE_PCT = 0.020      # Spot च्या ±2.0% रेंजमधील सर्व स्ट्राइक्स
+GANN_PROXIMITY_PCT = 0.0012
+GANN_RETEST_BAND_PCT = 0.0018
+VWAP_TOUCH_BAND_PCT = 0.0008
+ENTRY_BUFFER_PCT = 0.00020
+MIN_REMAINING_FUEL_PCT = 0.0010
+STRIKE_SCAN_RANGE_PCT = 0.020
 
 # Price Action & Momentum Thresholds
-MIN_ADX_MOMENTUM = 18.0            # ट्रेंडिंग मोमेंटमसाठी किमान ADX
-MIN_FUT_VOL_RATIO = 1.15           # Futures Volume >= 1.15x of 20-bar SMA
-MIN_RANGE_ATR_MULT = 1.10          # Candle Range >= 1.10x of ATR14
-MIN_BODY_RATIO = 0.45              # Solid Candle Body >= 45%
-MIN_REJECTION_WICK_RATIO = 0.45    # Reversal Rejection Wick >= 45%
+MIN_ADX_MOMENTUM = 18.0
+MIN_FUT_VOL_RATIO = 1.15
+MIN_RANGE_ATR_MULT = 1.10
+MIN_BODY_RATIO = 0.45
+MIN_REJECTION_WICK_RATIO = 0.45
 
 # PCR Velocity (Slope) Thresholds
 PCR_SLOPE_BEAR_THRESHOLD = -0.22
 PCR_SLOPE_BULL_THRESHOLD = 0.20
 
 # Option Premium Percentage & ATR*Delta SL/Target (1 : 1.50 R:R)
-MIN_OPT_SL_PCT = 0.10              # ऑप्शन प्रीमियमच्या किमान 10% SL
-MAX_OPT_SL_PCT = 0.22              # ऑप्शन प्रीमियमच्या कमाल 22% SL
-MAX_OPT_TRG_PCT = 0.35             # ऑप्शन प्रीमियमच्या कमाल 35% Target
-REALISTIC_RRR = 1.50               # 1 : 1.50 रिस्क-रिवॉर्ड
+MIN_OPT_SL_PCT = 0.10
+MAX_OPT_SL_PCT = 0.22
+MAX_OPT_TRG_PCT = 0.35
+REALISTIC_RRR = 1.50
 
 # Global Daily Capital Protection
 GLOBAL_DAILY_PROFIT_GOAL = 3500.0
@@ -144,7 +144,7 @@ TODAY_STR = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strfti
 JOURNAL_CSV = JOURNAL_DIR / f"trades_journal_{TODAY_STR}.csv"
 
 
-# ========================= TELEGRAM & ALERTS =========================
+# ========================= SIMPLE VISUAL TELEGRAM ALERTS =========================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"[Telegram Disconnected] {text[:90]}...", flush=True)
@@ -164,23 +164,23 @@ def send_telegram_chart_alert(index_code: str, df_5m: pd.DataFrame, gann_level: 
         return
 
     try:
-        recent = df_5m.tail(28)
-        plt.figure(figsize=(10, 5))
-        plt.plot(recent['dt'], recent['close'], label=f'{index_code} 5M Spot', color='black', linewidth=1.5)
+        recent = df_5m.tail(25)
+        plt.figure(figsize=(9, 4.5))
+        plt.plot(recent['dt'], recent['close'], label=f'{index_code} 5M', color='#111111', linewidth=1.8)
         if 'vwap' in recent.columns:
-            plt.plot(recent['dt'], recent['vwap'], label='Spot VWAP', color='orange', linestyle='-.', linewidth=1.2)
+            plt.plot(recent['dt'], recent['vwap'], label='VWAP', color='#f59e0b', linestyle='-.', linewidth=1.2)
         if 'ema20' in recent.columns:
-            plt.plot(recent['dt'], recent['ema20'], label='EMA 20', color='green', linestyle='--', linewidth=1.0)
-        plt.axhline(y=gann_level, color='blue', linestyle='--', label=f'Gann Pivot: {gann_level:.0f}')
-        plt.axhline(y=sl_price, color='red', linestyle=':', label=f'Spot SL: {sl_price:.1f}')
-        plt.axhline(y=trg_price, color='purple', linestyle=':', label=f'Spot Target: {trg_price:.1f}')
-        plt.title(f"{index_code} 5M Levels + Price Action Confluence Setup", fontsize=12, fontweight='bold')
+            plt.plot(recent['dt'], recent['ema20'], label='EMA 20', color='#10b981', linestyle='--', linewidth=1.1)
+        plt.axhline(y=gann_level, color='#2563eb', linestyle='--', label=f'Gann: {gann_level:.0f}')
+        plt.axhline(y=sl_price, color='#dc2626', linestyle=':', label=f'SL: {sl_price:.0f}')
+        plt.axhline(y=trg_price, color='#7c3aed', linestyle=':', label=f'Target: {trg_price:.0f}')
+        plt.title(f"{index_code} 5M Setup", fontsize=11, fontweight='bold')
         plt.legend(loc='upper left', fontsize=8)
-        plt.grid(True, linestyle=":", alpha=0.5)
+        plt.grid(True, linestyle=":", alpha=0.4)
         plt.tight_layout()
 
         chart_path = f"live_gann_alert_{index_code.lower()}.png"
-        plt.savefig(chart_path, dpi=120)
+        plt.savefig(chart_path, dpi=115)
         plt.close()
 
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -215,10 +215,6 @@ def safe_float(x: Any) -> Optional[float]:
 
 # ========================= GANN 0.50 HALF-STEP LATTICE =========================
 def get_gann_levels(current_price: float, steps_each_side: int = 6) -> dict:
-    """
-    0.50 Gann Square of 9 लेव्हल्स (उदा. 158.0^2 = 24964, 158.5^2 = 25122, 159.0^2 = 25281):
-    ज्यामुळे दोन पूर्णांक गॅन लेव्हल्सच्या मधला मोठा गॅप भरून अचूक मिड-पिव्होट मिळतो.
-    """
     base_half_root = math.floor(math.sqrt(current_price) * 2.0) / 2.0
     all_levels = sorted([
         round((base_half_root + (i * 0.5)) ** 2, 0)
@@ -273,25 +269,20 @@ class UpstoxClient:
         if vix_val is None or vix_val <= 0:
             return {
                 "vix": None,
-                "regime": "NORMAL (N/A)",
+                "regime": "NORMAL",
                 "max_iv": MAX_ALLOWED_IV,
                 "implied_daily_pct": 0.0085
             }
 
         implied_daily_pct = round((vix_val / 100.0) / 15.87, 5)
-
         if vix_val < 13.0:
-            regime = "CALM (<13 · Slow)"
-            max_iv = MAX_ALLOWED_IV
+            regime, max_iv = "CALM", MAX_ALLOWED_IV
         elif vix_val <= 17.5:
-            regime = "NORMAL (13-17.5)"
-            max_iv = MAX_ALLOWED_IV
+            regime, max_iv = "NORMAL", MAX_ALLOWED_IV
         elif vix_val <= 22.0:
-            regime = "ELEVATED (17.5-22)"
-            max_iv = MAX_ALLOWED_IV
+            regime, max_iv = "HIGH", MAX_ALLOWED_IV
         else:
-            regime = "PANIC (>22 · High Vol)"
-            max_iv = 26.0
+            regime, max_iv = "PANIC", 26.0
 
         return {
             "vix": round(vix_val, 2),
@@ -369,7 +360,7 @@ class UpstoxClient:
             "fut_oi": 0,
             "fut_5m_oi_chg": 0,
             "fut_buildup_code": "NEUTRAL",
-            "fut_buildup_label": "⚪ FUT N/A"
+            "fut_buildup_label": "NEUTRAL"
         }
         if not fut_instrument_key:
             return result
@@ -417,20 +408,15 @@ class UpstoxClient:
             price_dn = fut_close < fut_open
 
             if price_up and oi_5m_chg > 0:
-                b_code = "FUT_LONG_BUILDUP"
-                b_label = "🟢 FUT LONG BUILD-UP"
+                b_code, b_label = "FUT_LONG_BUILDUP", "LONG_BUILDUP"
             elif price_dn and oi_5m_chg > 0:
-                b_code = "FUT_SHORT_BUILDUP"
-                b_label = "🔴 FUT SHORT BUILD-UP"
+                b_code, b_label = "FUT_SHORT_BUILDUP", "SHORT_BUILDUP"
             elif price_up and oi_5m_chg < 0:
-                b_code = "FUT_SHORT_COVERING"
-                b_label = "🚀 FUT SHORT COVERING"
+                b_code, b_label = "FUT_SHORT_COVERING", "SHORT_COVERING"
             elif price_dn and oi_5m_chg < 0:
-                b_code = "FUT_LONG_UNWINDING"
-                b_label = "🔻 FUT LONG UNWINDING"
+                b_code, b_label = "FUT_LONG_UNWINDING", "LONG_UNWINDING"
             else:
-                b_code = "FUT_NEUTRAL"
-                b_label = "⚪ FUT NEUTRAL"
+                b_code, b_label = "FUT_NEUTRAL", "NEUTRAL"
 
             result.update({
                 "valid": True,
@@ -640,23 +626,23 @@ def add_indicators_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
 def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shift_call_oi: int) -> Tuple[str, str]:
     if is_green:
         if shift_call_oi <= -MIN_5M_OI_SHIFT:
-            return "MAJOR_SHORT_COVERING", "🚀 MAJOR SHORT COVERING"
+            return "MAJOR_SHORT_COVERING", "SHORT_COVERING"
         if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= 0:
-            return "STRONG_PUT_WRITING", "🟢 STRONG PUT WRITING"
+            return "STRONG_PUT_WRITING", "PUT_WRITING"
         if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= -MIN_5M_OI_SHIFT:
-            return "BULL_TRAP", "⚠️ BULL TRAP"
+            return "BULL_TRAP", "BULL_TRAP"
     elif is_red:
         if shift_put_oi <= -MIN_5M_OI_SHIFT:
-            return "MAJOR_PUT_UNWINDING", "🔻 MAJOR PUT UNWINDING"
+            return "MAJOR_PUT_UNWINDING", "PUT_UNWINDING"
         if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= 0:
-            return "STRONG_CALL_WRITING", "🔴 STRONG CALL WRITING"
+            return "STRONG_CALL_WRITING", "CALL_WRITING"
         if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= -MIN_5M_OI_SHIFT:
-            return "BEAR_TRAP", "⚠️ BEAR TRAP"
+            return "BEAR_TRAP", "BEAR_TRAP"
 
-    return "STEADY_TREND_FLOW", "⚪ STEADY OI FLOW"
+    return "STEADY_TREND_FLOW", "STEADY"
 
 
-# ========================= SENIOR ANALYST MULTI-INDEX LIVE ENGINE =========================
+# ========================= CLEAN VISUAL 5-INDEX LIVE ENGINE =========================
 class MultiIndexPaperTrader:
     def __init__(self, api: UpstoxClient, timings: dict):
         self.api = api
@@ -693,12 +679,12 @@ class MultiIndexPaperTrader:
                 "pcr_history": [],
                 "pcr_slope": 0.0,
                 "buildup_code": "STEADY_TREND_FLOW",
-                "buildup_label": "⚪ STEADY OI FLOW",
+                "buildup_label": "STEADY",
                 "latest_summary": None
             }
 
         self.load_all_indices_contracts()
-        print("[*] Senior Analyst 5-Index Confluence Engine Ready!", flush=True)
+        print("[*] Clean Visual 5-Index Confluence Engine Ready!", flush=True)
 
     def load_all_indices_contracts(self):
         try:
@@ -799,7 +785,7 @@ class MultiIndexPaperTrader:
             st["shift_5m_put_oi"] = 0
             st["shift_5m_call_oi"] = 0
             st["buildup_code"] = "INITIAL_5M_SYNC"
-            st["buildup_label"] = "⏳ SYNCED"
+            st["buildup_label"] = "SYNCED"
 
         st["prev_5m_oi_snapshot"] = {
             "bar_time": bar_time_str,
@@ -826,89 +812,89 @@ class MultiIndexPaperTrader:
     def count_active_positions(self) -> int:
         return sum(1 for st in self.states.values() if st["active_position"] is not None)
 
-    def send_consolidated_5m_pulse(self, bar_time_str: str, vix_info: dict):
+    def send_clean_visual_pulse(self, bar_time_str: str, vix_info: dict):
+        """
+        एका नजरेत समजणारे स्वच्छ Visual Scorecard (क्लिष्ट आकडेवारी न दाखवता)
+        """
         if self.last_pulse_bar_time == bar_time_str:
             return
         self.last_pulse_bar_time = bar_time_str
 
         vix_val = vix_info.get("vix")
-        vix_str = f"{vix_val:.2f} ({vix_info.get('regime')})" if vix_val else "N/A"
+        vix_str = f"{vix_val:.1f}" if vix_val else "N/A"
 
-        blocks = []
+        lines = []
         for idx_code in ACTIVE_INDICES:
-            s = self.states[idx_code].get("latest_summary")
+            st = self.states[idx_code]
+            s = st.get("latest_summary")
             if not s:
-                blocks.append(f"• <b>{idx_code}:</b> <i>Waiting for candles...</i>")
+                lines.append(f"⚪ <b>{idx_code:<10}</b>: <i>Loading...</i>")
                 continue
 
-            blocks.append(
-                f"🔹 <b>{idx_code}</b> (Lot:{s['lot_size']}): <code>{s['spot']:.1f}</code> | EMA20: <code>{s['ema20']:.1f}</code>\n"
-                f"   • <b>Gann 0.5:</b> <code>{int(s['sup'])}</code> ⬅️ ➡️ <code>{int(s['res'])}</code> | <b>{s['gann_zone']}</b>\n"
-                f"   • <b>ΔPCR:</b> <code>{s['delta_pcr']:.2f}</code> (Slope: <code>{s['pcr_slope']:+.2f}</code>) | <b>ADX:</b> <code>{s['adx']:.1f}</code> | <b>Fuel:</b> <code>{s['fuel_pct']}%</code>\n"
-                f"   • <b>Fut VWAP:</b> <code>{s['fut_vwap_status']}</code> | <b>Vol:</b> <code>{s['vol_ratio']}x</code> | <b>MaxPain:</b> <code>{s['max_pain']}</code>"
+            # दिशा व स्थिती दाखवणारा सिम्पल आयकॉन
+            if st["active_position"]:
+                pos = st["active_position"]
+                status_badge = f"🔥 IN {pos['side']}"
+                dot = "🔵"
+            elif st["pending_setup"]:
+                side = st["pending_setup"]["side"]
+                status_badge = f"🎯 ARMED {side}"
+                dot = "🟠"
+            elif s["delta_pcr"] >= 1.15 and s["spot"] > s["ema20"]:
+                status_badge = "BULLISH 🟢"
+                dot = "🟢"
+            elif s["delta_pcr"] <= 0.85 and s["spot"] < s["ema20"]:
+                status_badge = "BEARISH 🔴"
+                dot = "🔴"
+            else:
+                status_badge = "WATCHING 👀"
+                dot = "🟡"
+
+            lines.append(
+                f"{dot} <b>{idx_code:<10}</b>: <code>{s['spot']:.0f}</code> | "
+                f"Gann <code>{int(s['sup'])}-{int(s['res'])}</code> | "
+                f"PCR <code>{s['delta_pcr']:.2f}</code> | <b>{status_badge}</b>"
             )
 
         msg = (
-            f"📊 <b>5-INDEX LEVELS + PRICE ACTION PULSE ({bar_time_str} IST)</b>\n"
-            f"🌡️ <b>India VIX:</b> <code>{vix_str}</code> | 💰 <b>Day PnL:</b> <code>₹{self.cumulative_pnl:+,.0f}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n\n".join(blocks) +
-            f"\n━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>CONFLUENCE:</b> <i>Gann 0.5 Lattice | PA Swing Momentum | VWAP Reject | PCR Slope</i>"
+            f"📊 <b>5-INDEX VISUAL PULSE ({bar_time_str} IST)</b>\n"
+            f"🌡️ VIX: <code>{vix_str}</code> | 💰 Day PnL: <b>₹{self.cumulative_pnl:+,.0f}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(lines)
         )
         send_telegram(msg)
-        print(f"[{bar_time_str}] 5-Index Confluence Pulse Sent | DayPnL: ₹{self.cumulative_pnl:+,.2f}", flush=True)
+        print(f"[{bar_time_str}] Visual Pulse Sent | DayPnL: ₹{self.cumulative_pnl:+,.2f}", flush=True)
 
     def send_entry_alert(self, pos: dict, df_5m: pd.DataFrame):
         caption = (
-            f"🚀 <b>[{pos['index_code']}] ALGO एन्ट्री (#{pos['trade_id']})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎯 <b>ऑर्डर:</b> <b>BUY {pos['clean_name']}</b>\n"
-            f"🏷️ <b>सिम्बॉल:</b> <code>{pos['symbol']}</code>\n"
-            f"📦 <b>लॉट:</b> <code>1 Lot</code> (Dynamic Qty: <code>{pos['lot_size']}</code>)\n"
-            f"💵 <b>खरेदी किंमत:</b> <code>₹{pos['entry_px']:.2f}</code>\n"
-            f"🛑 <b>स्टॉपलॉस:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts / -{pos['opt_sl_pct']:.1f}% | Spot SL: {pos['spot_sl']})\n"
-            f"🏁 <b>टार्गेट (1:1.5):</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts / +{pos['opt_trg_pct']:.1f}% | Spot Trg: {pos['spot_target']})\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📐 <b>Gann Pivot:</b> <code>{int(pos['gann_level'])}</code> | ⛽ <b>Fuel Left:</b> <code>{pos['rem_fuel_pts']:.1f} pts</code>\n"
-            f"🧬 <b>Live Greeks & OI Data:</b>\n"
-            f"• <b>Delta (Δ):</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code> | <b>Theta:</b> <code>{pos['entry_theta']:.1f}</code>\n"
-            f"• <b>Strike OI:</b> <code>{pos['strike_oi']:,}</code> | <b>Chg OI:</b> <code>{pos['change_oi']:+,}</code> | <b>Day ΔPCR:</b> <code>{pos['delta_pcr']:.2f}</code>\n"
-            f"• <b>Fut Build-up:</b> <code>{pos['fut_buildup']}</code> | <b>Max Pain:</b> <code>{pos['max_pain']}</code>\n"
-            f"📍 <b>{pos['index_code']} Spot:</b> <code>{pos['spot_px']:.2f}</code> | <b>India VIX:</b> <code>{pos['india_vix']}</code>\n"
-            f"⚡ <b>सेटअप:</b> <code>{pos['setup_type']}</code>\n"
-            f"⏱️ <b>वेळ:</b> <code>{pos['entry_time']}</code>"
+            f"🚀 <b>ENTRY #{pos['trade_id']} | BUY {pos['clean_name']}</b> (Qty: {pos['lot_size']})\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>Buy:</b> <code>₹{pos['entry_px']:.2f}</code> | 🛑 <b>SL:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pct']:.0f}%)\n"
+            f"🎯 <b>Target:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pct']:.0f}%) | 📐 <b>Spot:</b> <code>{pos['spot_px']:.0f}</code> (Gann {int(pos['gann_level'])})\n"
+            f"📊 <b>ΔPCR:</b> <code>{pos['delta_pcr']:.2f}</code> | <b>Δ:</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code>\n"
+            f"⚡ <b>Setup:</b> <code>{pos['setup_type']}</code> | ⏱️ <code>{pos['entry_time'].split(' ')[1]}</code>"
         )
         send_telegram_chart_alert(pos["index_code"], df_5m, pos["gann_level"], pos["spot_sl"], pos["spot_target"], caption)
 
     def send_periodic_update(self, pos: dict, current_ltp: float):
         cur_pts = round(current_ltp - pos["entry_px"], 2)
         cur_pnl = round(cur_pts * pos["lot_size"], 2)
-        pnl_symbol = "🟢" if cur_pnl >= 0 else "🔴"
+        icon = "🟢" if cur_pnl >= 0 else "🔴"
 
         msg = (
-            f"⏱️ <b>[{pos['index_code']}] ट्रेड #{pos['trade_id']} चालू अपडेट (3-Min Ping)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ <b>{pos['clean_name']} @ ₹{current_ltp:.2f}</b> (Qty: {pos['lot_size']})\n"
-            f"💵 खरेदी: <code>₹{pos['entry_px']:.2f}</code> | SL: <code>₹{pos['sl_px']:.2f}</code>\n"
-            f"📊 चालू पॉईंट्स: <code>{cur_pts:+.2f} pts</code>\n"
-            f"{pnl_symbol} <b>चालू PnL:</b> <b>₹ {cur_pnl:+,.2f}</b>"
+            f"⏱️ <b>#{pos['trade_id']} {pos['clean_name']}</b> @ <code>₹{current_ltp:.2f}</code>\n"
+            f"💵 Buy: <code>₹{pos['entry_px']:.2f}</code> | SL: <code>₹{pos['sl_px']:.2f}</code> | "
+            f"{icon} <b>PnL: ₹{cur_pnl:+,.0f}</b> ({cur_pts:+.1f} pts)"
         )
         send_telegram(msg)
 
     def send_exit_alert(self, pos: dict):
-        status_emoji = "🟢 नफा" if pos["net_pnl"] > 0 else "🔴 तोटा"
+        icon = "🎉" if pos["net_pnl"] > 0 else "⚠️"
         msg = (
-            f"{'🎉' if pos['net_pnl'] > 0 else '⚠️'} <b>[{pos['index_code']}] ट्रेड पूर्ण ({status_emoji})</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 <b>ट्रेड #{pos['trade_id']}: BUY {pos['clean_name']}</b> (Qty: {pos['lot_size']})\n"
-            f"⏱️ <b>कालावधी:</b> <code>{pos['entry_time']} ➡️ {pos['exit_time']}</code>\n"
-            f"💵 <b>एन्ट्री:</b> <code>₹{pos['entry_px']:.2f}</code> ➡️ <b>एक्झिट:</b> <code>₹{pos['exit_px']:.2f}</code>\n"
-            f"📊 <b>पॉईंट्स:</b> <code>{pos['pts']:+.2f} pts</code>\n"
-            f"🛑 <b>कारण:</b> <code>{pos['exit_reason']}</code>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>या ट्रेडचा निव्वळ निकाल:</b> <b>₹ {pos['net_pnl']:+,.2f}</b>\n"
-            f"📈 <b>एकूण संचित नफा (All Indices):</b> <b>₹ {self.cumulative_pnl:+,.2f}</b>"
+            f"{icon} <b>EXIT #{pos['trade_id']} | {pos['clean_name']}</b> ({pos['exit_reason']})\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💵 <b>₹{pos['entry_px']:.2f} ➡️ ₹{pos['exit_px']:.2f}</b> ({pos['pts']:+.1f} pts)\n"
+            f"💰 <b>Net PnL: ₹{pos['net_pnl']:+,.2f}</b> | 📈 <b>Day Total: ₹{self.cumulative_pnl:+,.2f}</b>"
         )
         send_telegram(msg)
 
@@ -985,7 +971,7 @@ class MultiIndexPaperTrader:
         }
 
         st["active_position"] = pos
-        print(f"\n[एन्ट्री ट्रिगर] {clean_name} (Lot:{st['lot_size']}) @ ₹{entry_price} | Setup:{setup_type} | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
+        print(f"\n[ENTRY] {clean_name} @ ₹{entry_price} | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
         self.send_entry_alert(pos, df_5m)
 
     def execute_exit(self, st: dict, exit_price: float, reason: str):
@@ -1010,7 +996,7 @@ class MultiIndexPaperTrader:
         pos["exit_reason"] = reason
         pos["cumulative_pnl"] = self.cumulative_pnl
 
-        print(f"\n[एक्झिट ट्रिगर] {pos['clean_name']} Exit @ ₹{exit_price} | Net: ₹{net_pnl} ({reason})", flush=True)
+        print(f"\n[EXIT] {pos['clean_name']} @ ₹{exit_price} | Net: ₹{net_pnl} ({reason})", flush=True)
         self.send_exit_alert(pos)
         self.log_journal_csv(pos)
 
@@ -1022,13 +1008,13 @@ class MultiIndexPaperTrader:
 
         if self.cumulative_pnl >= GLOBAL_DAILY_PROFIT_GOAL:
             self.daily_locked = True
-            send_telegram(f"🔒 <b>एकत्रित दैनिक उद्दिष्ट पूर्ण!</b>\nसर्व इंडेक्सचा एकूण नफा (₹{self.cumulative_pnl:,.2f}) लॉक केला आहे.")
+            send_telegram(f"🔒 <b>DAILY GOAL HIT!</b> Profit Locked: <b>₹{self.cumulative_pnl:+,.2f}</b>")
         elif self.cumulative_pnl <= GLOBAL_DAILY_MAX_LOSS:
             self.daily_locked = True
-            send_telegram(f"🛑 <b>मॅक्स लॉस मर्यादा आली!</b>\nदैनिक तोटा मर्यादा (₹{GLOBAL_DAILY_MAX_LOSS:,.0f}) ओलांडली. सिस्टीम सुरक्षित बंद केली आहे.")
+            send_telegram(f"🛑 <b>MAX DAILY LOSS HIT!</b> Stopped for today: <b>₹{self.cumulative_pnl:+,.2f}</b>")
         elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             self.daily_locked = True
-            send_telegram(f"🔒 <b>कॅपिटल प्रोटेक्शन लॉक:</b>\nसलग २ स्टॉपलॉस हिट झाल्याने ट्रेड्स थांबवले आहेत.")
+            send_telegram("🔒 <b>2 CONSECUTIVE SL LOCK:</b> Trading paused to protect capital.")
 
         st["active_position"] = None
         st["pending_setup"] = None
@@ -1052,7 +1038,7 @@ class MultiIndexPaperTrader:
             if gain >= pos["opt_sl_pts"] and not pos["runner_mode"]:
                 pos["runner_mode"] = True
                 pos["sl_px"] = max(pos["sl_px"], pos["entry_px"] + 0.15 * pos["opt_sl_pts"])
-                send_telegram(f"🛡️ <b>[{idx_code}] Runner Mode ON: SL ट्रेल केला (₹{pos['sl_px']:.2f})</b>")
+                send_telegram(f"🛡️ <b>[{idx_code}] Runner Mode ON:</b> SL trailed to <code>₹{pos['sl_px']:.2f}</code>")
 
             if gain >= (pos["opt_sl_pts"] * 1.5):
                 new_sl = round(ltp - (pos["opt_sl_pts"] * 0.5), 2)
@@ -1107,7 +1093,6 @@ class MultiIndexPaperTrader:
 
         fut_mem = self.api.get_futures_5m_metrics(st["fut_instrument_key"])
 
-        # Gann 0.50 Lattice (उदा. 24964, 25122, 25281)
         gann = get_gann_levels(spot_close, steps_each_side=6)
         sup_level = gann["immediate_support"]
         res_level = gann["immediate_resistance"]
@@ -1115,24 +1100,8 @@ class MultiIndexPaperTrader:
         gann_retest_pts = spot_close * GANN_RETEST_BAND_PCT
         vwap_band_pts = spot_close * VWAP_TOUCH_BAND_PCT
 
-        near_sup_gann = (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - gann_prox_pts)
-        near_res_gann = (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + gann_prox_pts)
-        broke_res_gann = (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
-        broke_sup_gann = (float(prev_bar["close"]) >= sup_level) and (spot_close < sup_level)
-
-        if near_sup_gann or broke_sup_gann:
-            gann_zone_status = f"NEAR_{int(sup_level)}"
-        elif near_res_gann or broke_res_gann:
-            gann_zone_status = f"NEAR_{int(res_level)}"
-        else:
-            gann_zone_status = "PA_SCAN"
-
         self.update_5m_registers(st, bar_time_str, is_green, is_red, mem, delta_pcr)
         pcr_slope = st["pcr_slope"]
-
-        fut_vwap_status = "N/A"
-        if fut_mem.get("valid"):
-            fut_vwap_status = "Above 🟢" if fut_mem.get("above_fut_vwap") else "Below 🔴"
 
         st["latest_summary"] = {
             "lot_size": st["lot_size"],
@@ -1140,13 +1109,11 @@ class MultiIndexPaperTrader:
             "ema20": ema20_5m,
             "sup": sup_level,
             "res": res_level,
-            "gann_zone": gann_zone_status,
             "delta_pcr": delta_pcr,
             "pcr_slope": pcr_slope,
             "adx": adx_val,
             "max_pain": max_pain_display,
             "fuel_pct": fuel_info["fuel_left_pct_of_day"],
-            "fut_vwap_status": fut_vwap_status,
             "vol_ratio": fut_mem.get("fut_vol_ratio", 1.0),
             "atr": atr_val
         }
@@ -1163,13 +1130,6 @@ class MultiIndexPaperTrader:
             st["pending_setup"] = None
             return bar_time_str
 
-        # =========================================================================
-        # SENIOR ANALYST CONFLUENCE ENGINE (4 PROVEN SETUPS):
-        # 1) Gann 0.50 Lattice Breakout / Retest (24964, 25122, 25281...)
-        # 2) PA Swing Momentum Breakdown / Breakout (10:50 AM सारखी मोठी चाल)
-        # 3) PA Rejection Wick Reversal at Day Extreme (14:20 PM सारखा रिव्हर्सल)
-        # 4) SMC VWAP Rejection + PCR Velocity Slope
-        # =========================================================================
         c_range = max(spot_high - spot_low, 1e-9)
         c_body = abs(spot_close - spot_open)
         body_ratio = c_body / c_range
@@ -1184,7 +1144,6 @@ class MultiIndexPaperTrader:
         above_fut_vwap = fut_mem.get("above_fut_vwap", True) if fut_valid else True
         below_fut_vwap = (not fut_mem.get("above_fut_vwap", False)) if fut_valid else True
 
-        # मागील ३ कॅन्डल्सचा Swing High / Low आणि दिवसाचा High / Low
         prior_3 = df_5m.iloc[-4:-1]
         swing_3_high = float(prior_3["high"].max())
         swing_3_low = float(prior_3["low"].min())
@@ -1196,26 +1155,22 @@ class MultiIndexPaperTrader:
 
         if not st["pending_setup"]:
             # ---------------------- 🟢 CE SETUPS ----------------------
-            # A. Gann 0.50 Lattice Setup
             gann_sup_bounce_ce = is_green and is_body_solid and (spot_low <= sup_level + gann_prox_pts) and (spot_close >= sup_level - (gann_prox_pts * 0.5))
             gann_res_breakout_ce = is_green and is_body_solid and (float(prev_bar["close"]) <= res_level) and (spot_close > res_level)
             has_gann_ce = (fut_vol_surge or is_range_expansion) and (gann_sup_bounce_ce or gann_res_breakout_ce) and (spot_close > spot_vwap_5m) and above_fut_vwap
 
-            # B. Price Action Swing Momentum Breakout (EMA20 + VWAP + ADX >= 18 + 3-Bar High Break)
             has_pa_momentum_ce = (
                 is_green and is_body_solid and (adx_val >= MIN_ADX_MOMENTUM)
                 and (spot_close > spot_vwap_5m) and above_fut_vwap and (spot_close > ema20_5m)
                 and (spot_close > swing_3_high) and (fut_vol_surge or is_range_expansion)
             )
 
-            # C. Price Action Bottom Rejection Reversal (14:20 PM सारखा Intraday Low वर मोठी खालची विक + EMA20 क्रॉस)
             near_day_low = (spot_low <= day_low_so_far + (0.35 * atr_val))
             has_pa_reversal_ce = (
                 is_green and near_day_low and (lower_wick_ratio >= MIN_REJECTION_WICK_RATIO)
                 and (spot_close > ema20_5m) and (delta_pcr >= 0.65 or pcr_slope > 0)
             )
 
-            # D. SMC VWAP Bounce / Early PCR Velocity
             touched_vwap_ce = is_green and is_body_solid and (spot_low <= spot_vwap_5m + vwap_band_pts) and (spot_close > spot_vwap_5m) and above_fut_vwap
             has_vwap_or_pcr_ce = (delta_pcr > 1.15 and touched_vwap_ce) or (
                 is_green and is_body_solid and (pcr_slope >= PCR_SLOPE_BULL_THRESHOLD) and (float(prev_bar["close"]) <= spot_vwap_5m) and (spot_close > spot_vwap_5m)
@@ -1223,25 +1178,19 @@ class MultiIndexPaperTrader:
 
             if has_gann_ce or has_pa_momentum_ce or has_pa_reversal_ce or has_vwap_or_pcr_ce:
                 if has_gann_ce:
-                    setup_name = f"{idx_code}_GANN_{int(res_level if gann_res_breakout_ce else sup_level)}_CE"
+                    setup_name = f"GANN_{int(res_level if gann_res_breakout_ce else sup_level)}_CE"
                     anchor_gann = res_level if gann_res_breakout_ce else sup_level
                     next_barrier = gann["target_ce"] if gann_res_breakout_ce else res_level
                     needs_retest = True
                 elif has_pa_momentum_ce:
-                    setup_name = f"{idx_code}_PA_SWING_MOMENTUM_CE"
-                    anchor_gann = sup_level
-                    next_barrier = res_level
-                    needs_retest = False
+                    setup_name = "PA_MOMENTUM_CE"
+                    anchor_gann, next_barrier, needs_retest = sup_level, res_level, False
                 elif has_pa_reversal_ce:
-                    setup_name = f"{idx_code}_PA_BOTTOM_REVERSAL_CE"
-                    anchor_gann = sup_level
-                    next_barrier = res_level
-                    needs_retest = False
+                    setup_name = "PA_REVERSAL_CE"
+                    anchor_gann, next_barrier, needs_retest = sup_level, res_level, False
                 else:
-                    setup_name = f"{idx_code}_SMC_VWAP_PCR_CE"
-                    anchor_gann = sup_level
-                    next_barrier = res_level
-                    needs_retest = False
+                    setup_name = "VWAP_PCR_CE"
+                    anchor_gann, next_barrier, needs_retest = sup_level, res_level, False
 
                 st["pending_setup"] = {
                     "side": "CE",
@@ -1257,30 +1206,26 @@ class MultiIndexPaperTrader:
                     "atr_5m": atr_val,
                     "armed_time": time.monotonic()
                 }
-                print(f"[!] [{idx_code}] CE Armed: {setup_name} | Trigger @ {st['pending_setup']['trigger_level']}", flush=True)
+                print(f"[!] [{idx_code}] CE Armed: {setup_name} @ {st['pending_setup']['trigger_level']}", flush=True)
 
             # ---------------------- 🔴 PE SETUPS ----------------------
             else:
-                # A. Gann 0.50 Lattice Setup
                 gann_res_reject_pe = is_red and is_body_solid and (spot_high >= res_level - gann_prox_pts) and (spot_close <= res_level + (gann_prox_pts * 0.5))
                 gann_sup_breakdown_pe = is_red and is_body_solid and (float(prev_bar["close"]) >= sup_level) and (spot_close < sup_level)
                 has_gann_pe = (fut_vol_surge or is_range_expansion) and (gann_res_reject_pe or gann_sup_breakdown_pe) and (spot_close < spot_vwap_5m) and below_fut_vwap
 
-                # B. Price Action Swing Momentum Breakdown (10:50 AM सारखा VWAP + EMA20 + 3-Bar Swing Low तुटल्यावर)
                 has_pa_momentum_pe = (
                     is_red and is_body_solid and (adx_val >= MIN_ADX_MOMENTUM)
                     and (spot_close < spot_vwap_5m) and below_fut_vwap and (spot_close < ema20_5m)
                     and (spot_close < swing_3_low) and (fut_vol_surge or is_range_expansion)
                 )
 
-                # C. Price Action Top Rejection Reversal (Intraday High वर मोठी वरची विक + EMA20 खाली क्लोज)
                 near_day_high = (spot_high >= day_high_so_far - (0.35 * atr_val))
                 has_pa_reversal_pe = (
                     is_red and near_day_high and (upper_wick_ratio >= MIN_REJECTION_WICK_RATIO)
                     and (spot_close < ema20_5m) and (delta_pcr <= 1.25 or pcr_slope < 0)
                 )
 
-                # D. SMC VWAP Rejection / Early PCR Velocity
                 touched_vwap_pe = is_red and is_body_solid and (spot_high >= spot_vwap_5m - vwap_band_pts) and (spot_close < spot_vwap_5m) and below_fut_vwap
                 has_vwap_or_pcr_pe = (delta_pcr < 0.85 and touched_vwap_pe) or (
                     is_red and is_body_solid and (pcr_slope <= PCR_SLOPE_BEAR_THRESHOLD) and (float(prev_bar["close"]) >= spot_vwap_5m) and (spot_close < spot_vwap_5m)
@@ -1288,25 +1233,19 @@ class MultiIndexPaperTrader:
 
                 if has_gann_pe or has_pa_momentum_pe or has_pa_reversal_pe or has_vwap_or_pcr_pe:
                     if has_gann_pe:
-                        setup_name = f"{idx_code}_GANN_{int(sup_level if gann_sup_breakdown_pe else res_level)}_PE"
+                        setup_name = f"GANN_{int(sup_level if gann_sup_breakdown_pe else res_level)}_PE"
                         anchor_gann = sup_level if gann_sup_breakdown_pe else res_level
                         next_barrier = gann["target_pe"] if gann_sup_breakdown_pe else sup_level
                         needs_retest = True
                     elif has_pa_momentum_pe:
-                        setup_name = f"{idx_code}_PA_SWING_MOMENTUM_PE"
-                        anchor_gann = res_level
-                        next_barrier = sup_level
-                        needs_retest = False
+                        setup_name = "PA_MOMENTUM_PE"
+                        anchor_gann, next_barrier, needs_retest = res_level, sup_level, False
                     elif has_pa_reversal_pe:
-                        setup_name = f"{idx_code}_PA_TOP_REVERSAL_PE"
-                        anchor_gann = res_level
-                        next_barrier = sup_level
-                        needs_retest = False
+                        setup_name = "PA_REVERSAL_PE"
+                        anchor_gann, next_barrier, needs_retest = res_level, sup_level, False
                     else:
-                        setup_name = f"{idx_code}_SMC_VWAP_PCR_PE"
-                        anchor_gann = res_level
-                        next_barrier = sup_level
-                        needs_retest = False
+                        setup_name = "VWAP_PCR_PE"
+                        anchor_gann, next_barrier, needs_retest = res_level, sup_level, False
 
                     st["pending_setup"] = {
                         "side": "PE",
@@ -1322,7 +1261,7 @@ class MultiIndexPaperTrader:
                         "atr_5m": atr_val,
                         "armed_time": time.monotonic()
                     }
-                    print(f"[!] [{idx_code}] PE Armed: {setup_name} | Trigger @ {st['pending_setup']['trigger_level']}", flush=True)
+                    print(f"[!] [{idx_code}] PE Armed: {setup_name} @ {st['pending_setup']['trigger_level']}", flush=True)
 
         # STAGE 2: TICK TRIGGER CONFIRMATION & LIVE ENTRY
         if st["pending_setup"]:
@@ -1425,7 +1364,7 @@ class MultiIndexPaperTrader:
                 print(f"[-] Scan Error [{idx_code}]: {e}", flush=True)
 
         if latest_bar_time:
-            self.send_consolidated_5m_pulse(latest_bar_time, vix_info)
+            self.send_clean_visual_pulse(latest_bar_time, vix_info)
 
 
 # ========================= MAIN =========================
@@ -1441,15 +1380,12 @@ def main():
     timings = get_live_market_session_timings()
     trader = MultiIndexPaperTrader(api, timings)
 
-    lot_summary = " | ".join([f"{k}:{trader.states[k]['lot_size']}" for k in ACTIVE_INDICES])
     send_telegram(
-        f"🟢 <b>5-INDEX SENIOR ANALYST CONFLUENCE ALGO: सुरू झाले</b>\n"
-        f"तारीख: <code>{TODAY_STR}</code>\n"
-        f"इंडेक्सेस: <b>NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX</b>\n"
-        f"Dynamic Lots: <code>{lot_summary}</code>\n"
-        f"सेटअप्स: <b>Gann 0.50 Lattice + PA Swing Momentum + Bottom/Top Reversal + VWAP/PCR</b>"
+        f"🟢 <b>5-INDEX VISUAL ALGO STARTED</b> ({TODAY_STR})\n"
+        f"📊 NIFTY · BANKNIFTY · FINNIFTY · MIDCPNIFTY · SENSEX\n"
+        f"⏱️ Active: <b>{timings['session_start']} – {timings['entry_end']} IST</b>"
     )
-    print(f"[*] Senior Analyst 5-Index Engine Active ({timings['session_start']} - {timings['entry_end']}) for {TODAY_STR}...", flush=True)
+    print(f"[*] Clean Visual 5-Index Engine Active ({timings['session_start']} - {timings['entry_end']})...", flush=True)
 
     last_strat = 0.0
     try:
@@ -1457,7 +1393,7 @@ def main():
             hhmm = now_ist().strftime("%H:%M")
             if hhmm >= timings["market_end"]:
                 print(f"[*] {hhmm}: Market session संपले. Live Engine थांबवत आहे...", flush=True)
-                send_telegram(f"⏱️ <b>मार्केट सेशन समाप्त ({hhmm}):</b>\nआजचे 5-Index इंजिन सुरक्षित बंद केले आहे.")
+                send_telegram(f"⏱️ <b>SESSION ENDED ({hhmm})</b> | Day PnL: <b>₹{trader.cumulative_pnl:+,.2f}</b>")
                 break
 
             trader.check_all_positions_management()
@@ -1471,7 +1407,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n[!] Manually stopped.", flush=True)
-        send_telegram("⚠️ <b>5-INDEX ALGO इंजिन: मॅन्युअली थांबवले</b>")
+        send_telegram("⚠️ <b>5-INDEX ALGO: Manually Stopped</b>")
 
 
 if __name__ == "__main__":
