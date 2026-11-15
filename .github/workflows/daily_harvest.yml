@@ -2,7 +2,7 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '10 4 * * 1-5'  # Somvar te Shukravar 04:10 UTC (9:40 AM IST)
+    - cron: '35 3 * * 1-5'  # Somvar te Shukravar 03:35 UTC (9:05 AM IST)
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
+    timeout-minutes: 400
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -47,7 +48,7 @@ jobs:
 
       - name: Run Live Paper Trader Engine (Live Greeks + Memory)
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
@@ -68,21 +69,21 @@ jobs:
           python -u live_engine.py
 
       - name: Upload Live Trade Journal Artifact
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: live-trades-journal
           path: live_journal/
 
       - name: Generate Master Journal & Analytics
-        if: always()
+        if: ${{ !cancelled() }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python generate_journal_analytics.py
 
       - name: Commit & Push Journal Updates
-        if: always()
+        if: ${{ !cancelled() }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
