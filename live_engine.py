@@ -99,7 +99,7 @@ INDEX_CONFIGS: Dict[str, dict] = {
 
 ACTIVE_INDICES: List[str] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"]
 
-# ========================= SCALE-INVARIANT PERCENTAGE & STRATEGY PARAMETERS =========================
+# ========================= 100% DYNAMIC SCALE-INVARIANT PARAMETERS =========================
 POLL_INTERVAL = 1.0
 STRATEGY_INTERVAL = 12.0
 POSITION_UPDATE_INTERVAL = 180.0
@@ -112,17 +112,17 @@ MORNING_ENTRY_END     = "12:00"
 AFTERNOON_ENTRY_START = "13:30"
 AFTERNOON_ENTRY_END   = "14:45"
 
-# Gann 0.50 Lattice, VWAP Expansion & Breakout-Retest Parameters
+# Gann 0.50 Lattice, VWAP Expansion & Breakout-Retest Parameters (Pure Ratios)
 GANN_PROXIMITY_PCT = 0.0012
-RETEST_ATR_BUFFER = 0.30           # Breakout नंतर ±0.30 * ATR झोनमध्ये Retest कन्फर्मेशन
+RETEST_ATR_BUFFER = 0.30
 VWAP_TOUCH_BAND_PCT = 0.0008
-VWAP_EXPANSION_PCT = 0.0035        # VWAP Pullback आधी किमान ±0.35% ट्रेंड विस्तार अनिवार्य
+VWAP_EXPANSION_PCT = 0.0035
 ENTRY_BUFFER_PCT = 0.00020
 MIN_REMAINING_FUEL_PCT = 0.0010
 STRIKE_SCAN_RANGE_PCT = 0.020
 
 # Causal 0-100 Momentum Fuel Score Threshold
-MIN_FUEL_SCORE = 70.0              # >= 70/100 असल्यास त्वरित एन्ट्री; < 70 असल्यास Pending + Reclaim प्रतिक्षा
+MIN_FUEL_SCORE = 70.0
 
 # Price Action & Breakout Momentum Thresholds
 MIN_ADX_MOMENTUM = 18.0
@@ -135,29 +135,30 @@ MIN_REJECTION_WICK_RATIO = 0.45
 PCR_SLOPE_BEAR_THRESHOLD = -0.22
 PCR_SLOPE_BULL_THRESHOLD = 0.20
 
-# Option Premium Dynamic Minimum 10 Pts SL & 1 : 1.50 R:R
-ABS_MIN_OPT_SL_PTS = 10.0          # किमान 10 पॉईंट्स Option SL
-MIN_OPT_SL_PCT = 0.10
-MAX_OPT_SL_PCT = 0.22
-MAX_OPT_TRG_PCT = 0.38
+# Pure Percentage Option Premium SL & 1 : 1.50 R:R (Zero Hardcoded Points!)
+MIN_OPT_SL_PCT = 0.12              # किमान 12% Option Premium SL
+MAX_OPT_SL_PCT = 0.22              # कमाल 22% Option Premium SL
+MAX_OPT_TRG_PCT = 0.38             # कमाल 38% Option Premium Target
 REALISTIC_RRR = 1.50
 
-# Institutional Option Quality & Decay Guards
+# Marketable Limit Buffers & Orderbook Liquidity Guards
+LIMIT_BUY_BUFFER_PCT = 0.010       # Ask पेक्षा कमाल +1.0% वर Limit Buy Cap
+LIMIT_SELL_BUFFER_PCT = 0.015      # Bid पेक्षा कमाल -1.5% खाली Limit Sell Floor (Freak Trade Guard)
+MAX_SPREAD_PCT = 1.50              # कमाल 1.50% Bid-Ask Spread
 EXPECTED_HOLD_MINUTES = 20
 MAX_THETA_BURN_RATIO = 0.30
-MAX_SPREAD_PCT = 1.50
 NO_MOMENTUM_BARS = 5
 NO_MOMENTUM_MOVE_ATR = 0.25
 
-# Global Daily Capital Protection
-GLOBAL_DAILY_PROFIT_GOAL = 3500.0
-GLOBAL_DAILY_MAX_LOSS = -2500.0
+# 100% Dynamic Daily Capital Protection (% of Reference 1-Lot Position Value)
+DAILY_PROFIT_GOAL_PCT = 0.35       # 1-Lot ट्रेड कॅपिटलवर +35% नफा झाल्यावर दिवस लॉक
+DAILY_MAX_LOSS_PCT = -0.25         # 1-Lot ट्रेड कॅपिटलवर -25% तोटा झाल्यावर दिवस लॉक
 MAX_CONSECUTIVE_LOSSES = 2
 
-# Live Greeks & OI Safety Guards
+# Live Greeks & Relative OI Safety Guards (Zero Hardcoded OI Numbers!)
 MAX_ALLOWED_IV = 28.0
 MIN_ABS_DELTA = 0.35
-MIN_5M_OI_SHIFT = 250000
+MIN_5M_OI_SHIFT_PCT = 0.03         # एकूण Strike OI च्या किमान 3% बदल
 
 JOURNAL_DIR = Path("live_journal")
 JOURNAL_DIR.mkdir(exist_ok=True)
@@ -233,10 +234,10 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+def round_tick(price: float, tick: float = 0.05) -> float:
+    return round(round(price / tick) * tick, 2)
+
 def is_prime_entry_window(hhmm: str, timings: dict) -> bool:
-    """
-    सकाळी 09:20-12:00 आणि दुपारी 13:30-14:45 या सुवर्ण वेळेतच एन्ट्री (Lunch Chop 12:00-13:30 टाळले)
-    """
     m_start = timings.get("session_start", MORNING_ENTRY_START)
     a_end = min(timings.get("entry_end", AFTERNOON_ENTRY_END), AFTERNOON_ENTRY_END)
     return (m_start <= hhmm <= MORNING_ENTRY_END) or (AFTERNOON_ENTRY_START <= hhmm <= a_end)
@@ -361,10 +362,15 @@ class UpstoxV3Client:
         except Exception:
             return None
 
-    def get_full_quote_and_greeks_v3(self, instrument_key: str) -> dict:
-        info = {
-            "ltp": None, "bid": None, "ask": None, "spread_pct": 0.0,
-            "delta": 0.52, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "iv": 0.0,
+    def get_bid_ask_snapshot(self, instrument_key: str) -> dict:
+        """
+        5-Level Orderbook Depth मधून खरा Bid, Ask, Spread आणि Liquidity तपासतो.
+        जर Bid किंवा Ask शून्य (रिकामी ऑर्डरबुक) असेल तर liquid_book = False देतो.
+        """
+        snap = {
+            "ltp": None, "bid": None, "ask": None,
+            "bid_qty": 0, "ask_qty": 0,
+            "spread_pct": 999.0, "liquid_book": False,
             "oi": 0, "volume": 0
         }
         try:
@@ -375,23 +381,47 @@ class UpstoxV3Client:
             depth = qitem.get("depth") or {}
             buy_list = depth.get("buy") or []
             sell_list = depth.get("sell") or []
+
             bid = safe_float(buy_list[0].get("price")) if buy_list else None
             ask = safe_float(sell_list[0].get("price")) if sell_list else None
+            bid_qty = int(buy_list[0].get("quantity") or 0) if buy_list else 0
+            ask_qty = int(sell_list[0].get("quantity") or 0) if sell_list else 0
 
-            spread_pct = 0.0
-            if bid and ask and ltp and ltp > 0 and ask >= bid:
+            if bid and ask and bid > 0 and ask >= bid and bid_qty > 0 and ask_qty > 0 and ltp and ltp > 0:
                 spread_pct = round(((ask - bid) / ltp) * 100.0, 2)
+                liquid_book = True
+            else:
+                spread_pct = 999.0
+                liquid_book = False
 
-            info.update({
+            snap.update({
                 "ltp": ltp,
                 "bid": bid,
                 "ask": ask,
+                "bid_qty": bid_qty,
+                "ask_qty": ask_qty,
                 "spread_pct": spread_pct,
+                "liquid_book": liquid_book,
                 "oi": int(qitem.get("oi") or 0),
                 "volume": int(qitem.get("volume") or 0)
             })
         except Exception:
             pass
+        return snap
+
+    def get_full_quote_and_greeks_v3(self, instrument_key: str) -> dict:
+        snap = self.get_bid_ask_snapshot(instrument_key)
+        info = {
+            "ltp": snap["ltp"],
+            "bid": snap["bid"],
+            "ask": snap["ask"],
+            "bid_qty": snap["bid_qty"],
+            "ask_qty": snap["ask_qty"],
+            "spread_pct": snap["spread_pct"],
+            "liquid_book": snap["liquid_book"],
+            "delta": 0.52, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "iv": 0.0,
+            "oi": snap["oi"], "volume": snap["volume"]
+        }
 
         try:
             g_res = self.get("/v3/market-quote/option-greek", {"instrument_key": instrument_key})
@@ -416,9 +446,9 @@ class UpstoxV3Client:
             d = res.get("data", {})
             fii_net = safe_float(d.get("fii_net_value") or d.get("fii_net"))
             if fii_net is not None:
-                if fii_net > 500:
+                if fii_net > 0:
                     return f"FII BUY (+₹{fii_net:,.0f}Cr)"
-                elif fii_net < -500:
+                elif fii_net < 0:
                     return f"FII SELL (₹{fii_net:,.0f}Cr)"
                 return "FII NEUTRAL"
         except Exception:
@@ -562,7 +592,8 @@ class UpstoxV3Client:
                 return {"total_charges": round(chg * 2.1, 2)}
         except Exception:
             pass
-        return {"total_charges": round(45.0 + (qty * 0.12), 2)}
+        turnover = qty * buy_price
+        return {"total_charges": round(40.0 + (turnover * 0.0012), 2)}
 
     def get_official_max_pain(self, spot_key: str, expiry: str) -> Optional[float]:
         try:
@@ -752,20 +783,27 @@ def get_15m_ema20_bias(df_5m: pd.DataFrame) -> Optional[float]:
         return None
 
 
-def classify_5m_oi_buildup(is_green: bool, is_red: bool, shift_put_oi: int, shift_call_oi: int) -> Tuple[str, str]:
+def classify_5m_oi_buildup_dynamic(
+    is_green: bool, is_red: bool,
+    shift_put_oi: int, shift_call_oi: int,
+    total_put_oi: int, total_call_oi: int
+) -> Tuple[str, str]:
+    min_put_shift = max(1, int(total_put_oi * MIN_5M_OI_SHIFT_PCT))
+    min_call_shift = max(1, int(total_call_oi * MIN_5M_OI_SHIFT_PCT))
+
     if is_green:
-        if shift_call_oi <= -MIN_5M_OI_SHIFT:
+        if shift_call_oi <= -min_call_shift:
             return "MAJOR_SHORT_COVERING", "SHORT_COVERING"
-        if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= 0:
+        if shift_put_oi >= min_put_shift and shift_call_oi <= 0:
             return "STRONG_PUT_WRITING", "PUT_WRITING"
-        if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= -MIN_5M_OI_SHIFT:
+        if shift_call_oi >= min_call_shift and shift_put_oi <= -min_put_shift:
             return "BULL_TRAP", "BULL_TRAP"
     elif is_red:
-        if shift_put_oi <= -MIN_5M_OI_SHIFT:
+        if shift_put_oi <= -min_put_shift:
             return "MAJOR_PUT_UNWINDING", "PUT_UNWINDING"
-        if shift_call_oi >= MIN_5M_OI_SHIFT and shift_put_oi <= 0:
+        if shift_call_oi >= min_call_shift and shift_put_oi <= 0:
             return "STRONG_CALL_WRITING", "CALL_WRITING"
-        if shift_put_oi >= MIN_5M_OI_SHIFT and shift_call_oi <= -MIN_5M_OI_SHIFT:
+        if shift_put_oi >= min_put_shift and shift_call_oi <= -min_put_shift:
             return "BEAR_TRAP", "BEAR_TRAP"
 
     return "STEADY_TREND_FLOW", "STEADY"
@@ -778,6 +816,7 @@ class MultiIndexPaperTrader:
         self.timings = timings
         self.trade_counter = 0
         self.cumulative_pnl = 0.0
+        self.reference_notional_capital = 0.0
         self.daily_locked = False
         self.consecutive_losses = 0
         self.last_pulse_bar_time = None
@@ -818,7 +857,7 @@ class MultiIndexPaperTrader:
             }
 
         self.load_all_indices_contracts_v3()
-        print(f"[*] Upstox V3 5-Index Engine Ready (Final Production Build) | FII: {self.fii_sentiment}", flush=True)
+        print(f"[*] Upstox V3 5-Index Engine Ready (100% Dynamic + Bid/Ask Liquidity Guard) | FII: {self.fii_sentiment}", flush=True)
 
     def load_all_indices_contracts_v3(self):
         df = pd.DataFrame()
@@ -947,12 +986,14 @@ class MultiIndexPaperTrader:
 
         cur_put_chg = int(mem.get("total_put_chg", 0))
         cur_call_chg = int(mem.get("total_call_chg", 0))
+        tot_put_oi = int(mem.get("total_put_oi", 0))
+        tot_call_oi = int(mem.get("total_call_oi", 0))
 
         if st["prev_5m_oi_snapshot"] is not None:
             st["shift_5m_put_oi"] = cur_put_chg - st["prev_5m_oi_snapshot"]["put_chg"]
             st["shift_5m_call_oi"] = cur_call_chg - st["prev_5m_oi_snapshot"]["call_chg"]
-            st["buildup_code"], st["buildup_label"] = classify_5m_oi_buildup(
-                is_green, is_red, st["shift_5m_put_oi"], st["shift_5m_call_oi"]
+            st["buildup_code"], st["buildup_label"] = classify_5m_oi_buildup_dynamic(
+                is_green, is_red, st["shift_5m_put_oi"], st["shift_5m_call_oi"], tot_put_oi, tot_call_oi
             )
         else:
             st["shift_5m_put_oi"] = 0
@@ -1041,31 +1082,33 @@ class MultiIndexPaperTrader:
         caption = (
             f"🚀 <b>ENTRY #{pos['trade_id']} | BUY {pos['clean_name']}</b> (Qty: {pos['lot_size']})\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💵 <b>Buy:</b> <code>₹{pos['entry_px']:.2f}</code> | 🛑 <b>SL:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pts']:.1f} pts)\n"
-            f"🎯 <b>Target:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pts']:.1f} pts) | 📐 <b>Spot:</b> <code>{pos['spot_px']:.0f}</code>\n"
+            f"💵 <b>Ask Fill:</b> <code>₹{pos['entry_px']:.2f}</code> (Cap: ₹{pos['limit_buy_cap']:.2f}) | 🛑 <b>SL:</b> <code>₹{pos['sl_px']:.2f}</code> (-{pos['opt_sl_pct']:.1f}%)\n"
+            f"🎯 <b>Target:</b> <code>₹{pos['trg_px']:.2f}</code> (+{pos['opt_trg_pct']:.1f}%) | 📊 <b>Spread:</b> <code>{pos['spread_pct']:.2f}%</code>\n"
             f"⛽ <b>Fuel:</b> <code>{pos['fuel_score']:.0f}/100</code> | <b>ΔPCR:</b> <code>{pos['delta_pcr']:.2f}</code> | <b>Δ:</b> <code>{pos['entry_delta']:.2f}</code> | <b>IV:</b> <code>{pos['entry_iv']:.1f}%</code>\n"
             f"⚡ <b>Setup:</b> <code>{pos['setup_type']}</code> | ⏱️ <code>{pos['entry_time'].split(' ')[1]}</code>"
         )
         send_telegram_chart_alert(pos["index_code"], df_5m, pos["gann_level"], pos["spot_sl"], pos["spot_target"], caption)
 
-    def send_periodic_update(self, pos: dict, current_ltp: float):
-        cur_pts = round(current_ltp - pos["entry_px"], 2)
+    def send_periodic_update(self, pos: dict, current_bid: float):
+        cur_pts = round(current_bid - pos["entry_px"], 2)
+        cur_pct = round((cur_pts / max(pos["entry_px"], 0.01)) * 100.0, 1)
         cur_pnl = round(cur_pts * pos["lot_size"], 2)
         icon = "🟢" if cur_pnl >= 0 else "🔴"
 
         msg = (
-            f"⏱️ <b>#{pos['trade_id']} {pos['clean_name']}</b> @ <code>₹{current_ltp:.2f}</code>\n"
+            f"⏱️ <b>#{pos['trade_id']} {pos['clean_name']}</b> (Bid: <code>₹{current_bid:.2f}</code>)\n"
             f"💵 Buy: <code>₹{pos['entry_px']:.2f}</code> | SL: <code>₹{pos['sl_px']:.2f}</code> | "
-            f"{icon} <b>PnL: ₹{cur_pnl:+,.0f}</b> ({cur_pts:+.1f} pts)"
+            f"{icon} <b>PnL: ₹{cur_pnl:+,.0f}</b> ({cur_pct:+.1f}%)"
         )
         send_telegram(msg)
 
     def send_exit_alert(self, pos: dict):
         icon = "🎉" if pos["net_pnl"] > 0 else "⚠️"
+        pts_pct = round((pos["pts"] / max(pos["entry_px"], 0.01)) * 100.0, 1)
         msg = (
             f"{icon} <b>EXIT #{pos['trade_id']} | {pos['clean_name']}</b> ({pos['exit_reason']})\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"💵 <b>₹{pos['entry_px']:.2f} ➡️ ₹{pos['exit_px']:.2f}</b> ({pos['pts']:+.1f} pts)\n"
+            f"💵 <b>₹{pos['entry_px']:.2f} ➡️ ₹{pos['exit_px']:.2f}</b> ({pts_pct:+.1f}%)\n"
             f"💰 <b>Net PnL: ₹{pos['net_pnl']:+,.2f}</b> | 📈 <b>Day Total: ₹{self.cumulative_pnl:+,.2f}</b>"
         )
         send_telegram(msg)
@@ -1074,19 +1117,34 @@ class MultiIndexPaperTrader:
                       spot_px: float, gann_level: float, trigger_level: float, raw_spot_sl: float, gann_barrier: float,
                       atr_5m: float, fuel_info: dict, fuel_score: float, vix_info: dict, delta_pcr: float,
                       max_pain_display: Any, greeks: dict, oi_buildup: str, fut_mem: dict, setup_type: str, df_5m: pd.DataFrame):
-        entry_price = ltp
-        live_abs_delta = max(0.35, min(0.75, abs(float(greeks.get("delta", 0.52)))))
-        gamma_val = abs(float(greeks.get("gamma", 0.0)))
-        theta_val = abs(float(greeks.get("theta", 0.0)))
-        spread_pct = float(greeks.get("spread_pct", 0.0))
+        # 1. Orderbook Liquidity & Bid-Ask Spread Check
+        if not greeks.get("liquid_book", False):
+            st["failed_strikes"][strike] = time.monotonic() + 300
+            print(f"[-] [{st['code']}] Skipped empty/illiquid orderbook on {strike} {side}", flush=True)
+            return
 
+        spread_pct = float(greeks.get("spread_pct", 999.0))
         if spread_pct > MAX_SPREAD_PCT:
+            st["failed_strikes"][strike] = time.monotonic() + 300
             print(f"[-] [{st['code']}] Skipped wide spread: {spread_pct:.2f}% > {MAX_SPREAD_PCT}%", flush=True)
             return
 
+        # 2. Realistic Fill at Ask Price with Marketable Limit Buy Cap (+1.0% Buffer)
+        ask_px = safe_float(greeks.get("ask")) or ltp
+        bid_px = safe_float(greeks.get("bid")) or ltp
+        limit_buy_cap = round_tick(ask_px * (1.0 + LIMIT_BUY_BUFFER_PCT))
+        if ask_px > limit_buy_cap:
+            return
+        entry_price = round_tick(ask_px)
+
+        live_abs_delta = max(0.35, min(0.75, abs(float(greeks.get("delta", 0.52)))))
+        gamma_val = abs(float(greeks.get("gamma", 0.0)))
+        theta_val = abs(float(greeks.get("theta", 0.0)))
+
+        # 3. 100% Pure Percentage Option SL & Target (Works identically at 1k or 1,00,000 Index!)
         atr_opt_sl = atr_5m * 1.2 * live_abs_delta
-        min_opt_sl = max(ABS_MIN_OPT_SL_PTS, entry_price * MIN_OPT_SL_PCT)
-        max_opt_sl = max(ABS_MIN_OPT_SL_PTS + 2.0, entry_price * MAX_OPT_SL_PCT)
+        min_opt_sl = entry_price * MIN_OPT_SL_PCT
+        max_opt_sl = entry_price * MAX_OPT_SL_PCT
         opt_sl_pts = round(min(max_opt_sl, max(min_opt_sl, atr_opt_sl)), 2)
 
         fuel_opt_cap = max(opt_sl_pts * 1.25, (fuel_info["remaining_pts"] * 0.70) * live_abs_delta)
@@ -1106,13 +1164,20 @@ class MultiIndexPaperTrader:
         realistic_spot_sl = round((spot_px - spot_risk) if side == "CE" else (spot_px + spot_risk), 2)
         realistic_spot_target = round((spot_px + spot_reward) if side == "CE" else (spot_px - spot_reward), 2)
 
-        opt_sl_pct = round((opt_sl_pts / entry_price) * 100.0, 1)
-        opt_trg_pct = round((opt_trg_pts / entry_price) * 100.0, 1)
+        opt_sl_pct = round((opt_sl_pts / max(entry_price, 0.01)) * 100.0, 1)
+        opt_trg_pct = round((opt_trg_pts / max(entry_price, 0.01)) * 100.0, 1)
 
-        sl = max(0.05, round(entry_price - opt_sl_pts, 2))
-        trg = round(entry_price + opt_trg_pts, 2)
+        sl = max(0.05, round_tick(entry_price - opt_sl_pts))
+        trg = round_tick(entry_price + opt_trg_pts)
         self.trade_counter += 1
         self.recent_entry_times.append(time.monotonic())
+
+        # Set dynamic daily reference capital from position value
+        pos_notional = entry_price * st["lot_size"]
+        if self.reference_notional_capital <= 0:
+            self.reference_notional_capital = pos_notional
+        else:
+            self.reference_notional_capital = max(self.reference_notional_capital, pos_notional)
 
         clean_name = f"{st['code']} {int(strike)} {side}"
         vix_val = vix_info.get("vix")
@@ -1128,6 +1193,9 @@ class MultiIndexPaperTrader:
             "lot_size": st["lot_size"],
             "entry_time": ts_now(),
             "entry_px": entry_price,
+            "entry_bid": bid_px,
+            "entry_ask": ask_px,
+            "limit_buy_cap": limit_buy_cap,
             "opt_sl_pts": opt_sl_pts,
             "opt_trg_pts": opt_trg_pts,
             "opt_sl_pct": opt_sl_pct,
@@ -1163,7 +1231,7 @@ class MultiIndexPaperTrader:
         }
 
         st["active_position"] = pos
-        print(f"\n[ENTRY] {clean_name} @ ₹{entry_price} | Fuel: {fuel_score:.0f}/100 | SL: ₹{sl} | TRG: ₹{trg}", flush=True)
+        print(f"\n[ENTRY] {clean_name} @ Ask ₹{entry_price} (Spread: {spread_pct:.2f}%) | SL: ₹{sl} (-{opt_sl_pct}%) | TRG: ₹{trg} (+{opt_trg_pct}%)", flush=True)
         self.send_entry_alert(pos, df_5m)
 
     def execute_exit(self, st: dict, exit_price: float, reason: str):
@@ -1198,12 +1266,17 @@ class MultiIndexPaperTrader:
         else:
             self.consecutive_losses = 0
 
-        if self.cumulative_pnl >= GLOBAL_DAILY_PROFIT_GOAL:
+        # Dynamic Daily Profit/Loss Guard (% of Reference Position Value)
+        ref_cap = max(self.reference_notional_capital, pos["entry_px"] * qty, 1.0)
+        dynamic_profit_goal = round(ref_cap * DAILY_PROFIT_GOAL_PCT, 2)
+        dynamic_max_loss = round(ref_cap * DAILY_MAX_LOSS_PCT, 2)
+
+        if self.cumulative_pnl >= dynamic_profit_goal:
             self.daily_locked = True
-            send_telegram(f"🔒 <b>DAILY GOAL HIT!</b> Profit Locked: <b>₹{self.cumulative_pnl:+,.2f}</b>")
-        elif self.cumulative_pnl <= GLOBAL_DAILY_MAX_LOSS:
+            send_telegram(f"🔒 <b>DAILY GOAL HIT (+{DAILY_PROFIT_GOAL_PCT*100:.0f}%)!</b> Profit Locked: <b>₹{self.cumulative_pnl:+,.2f}</b>")
+        elif self.cumulative_pnl <= dynamic_max_loss:
             self.daily_locked = True
-            send_telegram(f"🛑 <b>MAX DAILY LOSS HIT!</b> Stopped for today: <b>₹{self.cumulative_pnl:+,.2f}</b>")
+            send_telegram(f"🛑 <b>MAX DAILY LOSS HIT ({DAILY_MAX_LOSS_PCT*100:.0f}%)!</b> Stopped for today: <b>₹{self.cumulative_pnl:+,.2f}</b>")
         elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
             self.daily_locked = True
             send_telegram("🔒 <b>2 CONSECUTIVE SL LOCK:</b> Trading paused to protect capital.")
@@ -1220,20 +1293,30 @@ class MultiIndexPaperTrader:
             if not pos:
                 continue
 
-            ltp = self.api.get_ltp_v3(pos["instrument_key"])
-            if ltp is None:
+            # खऱ्या Bid किमतीवर एक्झिट व स्टॉप-लॉस तपासणी (Freak Trade Floor सह)
+            snap = self.api.get_bid_ask_snapshot(pos["instrument_key"])
+            ltp = snap.get("ltp")
+            bid = snap.get("bid")
+            bid_qty = snap.get("bid_qty", 0)
+
+            # जर ऑर्डरबुकमध्ये कोणीच Buyer नसेल तर Freak-Trade टाळण्यासाठी थांबा (केवळ Force Exit वेळेतच बाहेर पडा)
+            if (not bid or bid <= 0 or bid_qty <= 0) and hhmm < self.timings["force_exit"]:
                 continue
 
-            pos["peak_price"] = max(pos["peak_price"], ltp)
-            gain = ltp - pos["entry_px"]
+            mark_px = bid if (bid and bid > 0) else ltp
+            if mark_px is None or mark_px <= 0:
+                continue
+
+            pos["peak_price"] = max(pos["peak_price"], mark_px)
+            gain = mark_px - pos["entry_px"]
 
             if gain >= pos["opt_sl_pts"] and not pos["runner_mode"]:
                 pos["runner_mode"] = True
-                pos["sl_px"] = max(pos["sl_px"], pos["entry_px"] + 0.15 * pos["opt_sl_pts"])
+                pos["sl_px"] = max(pos["sl_px"], round_tick(pos["entry_px"] + 0.15 * pos["opt_sl_pts"]))
                 send_telegram(f"🛡️ <b>[{idx_code}] Runner Mode ON:</b> SL trailed to <code>₹{pos['sl_px']:.2f}</code>")
 
             if gain >= (pos["opt_sl_pts"] * 1.5):
-                new_sl = round(ltp - (pos["opt_sl_pts"] * 0.5), 2)
+                new_sl = round_tick(mark_px - (pos["opt_sl_pts"] * 0.5))
                 if new_sl > pos["sl_px"]:
                     pos["sl_px"] = new_sl
 
@@ -1243,21 +1326,26 @@ class MultiIndexPaperTrader:
                 atr_now = safe_float(recent.iloc[-1].get("atr14")) or 0.0
                 if atr_now > 0:
                     spot_move = abs(float(recent.iloc[-1]["close"]) - float(recent.iloc[0]["close"]))
-                    if spot_move < (NO_MOMENTUM_MOVE_ATR * atr_now) and ltp <= pos["entry_px"] * 0.985:
-                        self.execute_exit(st, ltp, "NO_MOMENTUM_EXIT ⏳")
+                    if spot_move < (NO_MOMENTUM_MOVE_ATR * atr_now) and mark_px <= pos["entry_px"] * 0.985:
+                        safe_exit_px = max(round_tick(mark_px * (1.0 - LIMIT_SELL_BUFFER_PCT)), mark_px)
+                        self.execute_exit(st, safe_exit_px, "NO_MOMENTUM_EXIT ⏳")
                         continue
 
             if time.monotonic() - pos["last_periodic_update"] >= POSITION_UPDATE_INTERVAL:
-                self.send_periodic_update(pos, ltp)
+                self.send_periodic_update(pos, mark_px)
                 pos["last_periodic_update"] = time.monotonic()
 
-            if ltp <= pos["sl_px"]:
+            if mark_px <= pos["sl_px"]:
+                # SL Limit Sell Floor: Bid च्या -1.5% पेक्षा खाली कधीच विकले जाणार नाही
+                sl_limit_floor = round_tick(pos["sl_px"] * (1.0 - LIMIT_SELL_BUFFER_PCT))
+                fill_px = max(sl_limit_floor, mark_px)
                 reason = "TRAILED_EXIT ✅" if pos["sl_px"] >= pos["entry_px"] else "OPTION_SL_HIT ❌"
-                self.execute_exit(st, pos["sl_px"], reason)
-            elif ltp >= pos["trg_px"]:
+                self.execute_exit(st, fill_px, reason)
+            elif mark_px >= pos["trg_px"]:
+                # Exact Target Limit Sell
                 self.execute_exit(st, pos["trg_px"], "TARGET_HIT 🎯")
             elif hhmm >= self.timings["force_exit"]:
-                self.execute_exit(st, ltp, "FORCE_EXIT_SESSION ⏱️")
+                self.execute_exit(st, mark_px, "FORCE_EXIT_SESSION ⏱️")
 
     def scan_single_index(self, idx_code: str, hhmm: str, vix_info: dict) -> Optional[str]:
         st = self.states[idx_code]
@@ -1334,7 +1422,6 @@ class MultiIndexPaperTrader:
         if st["active_position"] or self.daily_locked:
             return bar_time_str
 
-        # Prime Entry Time Window Filter (12:00 - 13:30 Lunch Chop Blocked)
         if not is_prime_entry_window(hhmm, self.timings):
             st["pending_setup"] = None
             return bar_time_str
@@ -1619,12 +1706,17 @@ class MultiIndexPaperTrader:
 
                 opt_greeks = {
                     "ltp": v3_opt_data.get("ltp") or chain_opt.get("ltp"),
+                    "bid": v3_opt_data.get("bid"),
+                    "ask": v3_opt_data.get("ask"),
+                    "bid_qty": v3_opt_data.get("bid_qty", 0),
+                    "ask_qty": v3_opt_data.get("ask_qty", 0),
+                    "liquid_book": v3_opt_data.get("liquid_book", False),
+                    "spread_pct": v3_opt_data.get("spread_pct", 999.0),
                     "delta": v3_opt_data.get("delta") or chain_opt.get("delta", 0.52),
                     "gamma": v3_opt_data.get("gamma") or chain_opt.get("gamma", 0.0),
                     "theta": v3_opt_data.get("theta") or chain_opt.get("theta", 0.0),
                     "vega": v3_opt_data.get("vega") or chain_opt.get("vega", 0.0),
                     "iv": v3_opt_data.get("iv") or chain_opt.get("iv", 0.0),
-                    "spread_pct": v3_opt_data.get("spread_pct", 0.0),
                     "oi": v3_opt_data.get("oi") or chain_opt.get("oi", 0),
                     "chg_oi": chain_opt.get("chg_oi", 0)
                 }
@@ -1713,9 +1805,9 @@ def main():
     send_telegram(
         f"🟢 <b>5-INDEX V3 CONFLUENCE ALGO STARTED</b> ({TODAY_STR})\n"
         f"📊 NIFTY · BANKNIFTY · FINNIFTY · MIDCPNIFTY · SENSEX\n"
-        f"⏰ Windows: <b>09:20–12:00 & 13:30–14:45 IST</b> | 🛡️ Breakout-Retest + Min 10pt SL"
+        f"⏰ Windows: <b>09:20–12:00 & 13:30–14:45 IST</b> | 🛡️ 100% Dynamic % + Bid/Ask Guard"
     )
-    print(f"[*] Upstox V3 5-Index Engine Active (Prime Windows: 09:20-12:00 & 13:30-14:45 IST)...", flush=True)
+    print(f"[*] Upstox V3 5-Index Engine Active (100% Scale-Invariant + Bid/Ask Guard)...", flush=True)
 
     last_strat = 0.0
     try:
