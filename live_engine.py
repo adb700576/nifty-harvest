@@ -41,11 +41,12 @@ SL_MIN_PCT = 0.12                # Dynamic SL floor (12%)
 SL_MAX_PCT = 0.22                # Dynamic SL cap (22%)
 RR_RATIO = 1.50                  # 1 : 1.5 Risk-to-Reward
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
+GANN_ZONE_ATR_MULT = 0.40        # Allowed proximity above OR below Gann level (in ATR)
 
 # PCR Filter thresholds (Level OR Dynamic Slope)
 PCR_BULL_LEVEL = 1.05
 PCR_BEAR_LEVEL = 0.95
-PCR_SLOPE_DELTA = 0.08           # Captures fast drop (e.g. 5 -> 4 -> 3 -> 1) even before 0.95
+PCR_SLOPE_DELTA = 0.08           # Captures fast drop/rise (e.g. 5 -> 4 -> 3 -> 1)
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 DAILY_PROFIT_LOCK_PCT = 0.35     # +35% daily profit lock
@@ -185,7 +186,7 @@ def get_nearest_expiry(spot_key: str) -> str:
 
 
 # ==============================================================================
-# 4. INDICATORS, MANDATORY GANN LATTICE & 5M EMA20 + FUEL SCORE (0-100)
+# 4. INDICATORS, GANN LATTICE, CANDLE PATTERNS & FUEL SCORE
 # ==============================================================================
 def compute_gann_levels(price: float, step: int) -> dict:
     """Computes Gann 0.50 Square-of-9 lattice levels around current spot."""
@@ -198,6 +199,65 @@ def compute_gann_levels(price: float, step: int) -> dict:
         "support": supports[-1] if supports else round(price - step, 2),
         "resistance": resistances[0] if resistances else round(price + step, 2),
         "all": levels,
+    }
+
+
+def detect_gann_candle_patterns(curr: pd.Series, prev: pd.Series, gann_levels: list, atr14: float) -> dict:
+    """
+    Checks if price is near (above OR below within GANN_ZONE_ATR_MULT * ATR) a Gann level
+    AND forms a valid Bullish or Bearish candle pattern.
+    """
+    o, h, l, c = float(curr["open"]), float(curr["high"]), float(curr["low"]), float(curr["close"])
+    po, ph, pl, pc = float(prev["open"]), float(prev["high"]), float(prev["low"]), float(prev["close"])
+
+    c_range = max(h - l, 1e-6)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    zone_band = atr14 * GANN_ZONE_ATR_MULT
+
+    # Nearest Gann level touched or within zone_band (above or below)
+    near_gann = None
+    min_dist = float("inf")
+    for lvl in gann_levels:
+        dist = min(abs(c - lvl), abs(l - lvl), abs(h - lvl))
+        if dist <= zone_band and dist < min_dist:
+            min_dist = dist
+            near_gann = lvl
+
+    if near_gann is None:
+        return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
+
+    # --- BULLISH PATTERNS AT/NEAR GANN LEVEL (ABOVE OR BELOW) ---
+    bull_pattern = None
+    is_strong_green = (c > o) and (body / c_range >= 0.50) and (c > pc)
+    is_bull_engulfing = (c > o) and (pc < po) and (c >= po) and (o <= pc)
+    is_bull_hammer = (lower_wick >= 1.5 * max(body, c_range * 0.1)) and ((c - l) / c_range >= 0.60)
+
+    if is_bull_engulfing:
+        bull_pattern = "BULL_ENGULFING"
+    elif is_bull_hammer:
+        bull_pattern = "BULL_HAMMER"
+    elif is_strong_green:
+        bull_pattern = "STRONG_BULL_CANDLE"
+
+    # --- BEARISH PATTERNS AT/NEAR GANN LEVEL (ABOVE OR BELOW) ---
+    bear_pattern = None
+    is_strong_red = (c < o) and (body / c_range >= 0.50) and (c < pc)
+    is_bear_engulfing = (c < o) and (pc > po) and (c <= po) and (o >= pc)
+    is_bear_shooting_star = (upper_wick >= 1.5 * max(body, c_range * 0.1)) and ((h - c) / c_range >= 0.60)
+
+    if is_bear_engulfing:
+        bear_pattern = "BEAR_ENGULFING"
+    elif is_bear_shooting_star:
+        bear_pattern = "BEAR_REJECTION_WICK"
+    elif is_strong_red:
+        bear_pattern = "STRONG_BEAR_CANDLE"
+
+    return {
+        "near_gann": near_gann,
+        "bull_pattern": bull_pattern,
+        "bear_pattern": bear_pattern,
     }
 
 
@@ -325,10 +385,7 @@ class IntradayV3Engine:
         return TRADE_START_TIME <= hhmm <= TRADE_END_TIME
 
     def check_pcr_alignment(self, idx: str, current_pcr: float):
-        """
-        Checks both static PCR level AND dynamic PCR slope (e.g. 5 -> 4 -> 3 -> 1)
-        so rapid institutional shifts trigger immediately without waiting for 0.95.
-        """
+        """Checks static PCR level OR dynamic PCR slope (e.g. 5 -> 4 -> 3 -> 1)."""
         hist = self.pcr_history[idx]
         if not hist or hist[-1] != current_pcr:
             hist.append(current_pcr)
@@ -349,20 +406,23 @@ class IntradayV3Engine:
         df = add_indicators_5m(df)
         curr = df.iloc[-1]
         prev = df.iloc[-2]
-        prev2 = df.iloc[-3]
 
         spot_close = float(curr["close"])
-        spot_open = float(curr["open"])
         ema20_5m = float(curr["ema20_5m"])
         vwap_5m = float(curr["vwap_5m"])
         atr14 = max(float(curr["atr14"]), 1.0)
         fuel = float(curr["fuel"])
 
-        # --- MANDATORY GANN LEVELS ALWAYS ACTIVE ---
+        # --- MANDATORY GANN LEVELS & CANDLE PATTERN AT/NEAR GANN ---
         gann = compute_gann_levels(spot_close, cfg["step"])
-        sup = gann["support"]        # Nearest Gann level at/below current spot
-        res = gann["resistance"]     # Nearest Gann level above current spot
+        sup = gann["support"]
+        res = gann["resistance"]
         gann_levels = gann["all"]
+
+        pat_info = detect_gann_candle_patterns(curr, prev, gann_levels, atr14)
+        near_gann = pat_info["near_gann"]
+        bull_pattern = pat_info["bull_pattern"]
+        bear_pattern = pat_info["bear_pattern"]
 
         # Option Chain PCR + Dynamic Slope Check
         pcr = 1.0
@@ -392,37 +452,31 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # --- MANDATORY GANN + 5M EMA20 + VWAP + PCR SIGNAL DETECTION ---
-        bull_5m_ok = (spot_close > ema20_5m) and (spot_close > vwap_5m) and (spot_close > spot_open)
-        bear_5m_ok = (spot_close < ema20_5m) and (spot_close < vwap_5m) and (spot_close < spot_open)
-
-        # Check if any Gann level was broken within the last 2 candles (so delayed Fuel >= 55 still catches it)
-        crossed_gann_up = [lvl for lvl in gann_levels if min(prev["close"], prev2["close"]) <= lvl < spot_close]
-        crossed_gann_dn = [lvl for lvl in gann_levels if max(prev["close"], prev2["close"]) >= lvl > spot_close]
+        # --- 5M EMA20 + VWAP + GANN CANDLE PATTERN SIGNAL DETECTION ---
+        bull_5m_ok = (spot_close > ema20_5m) and (spot_close > vwap_5m)
+        bear_5m_ok = (spot_close < ema20_5m) and (spot_close < vwap_5m)
 
         new_signal = None
-        if bull_5m_ok and pcr_bull_ok and crossed_gann_up:
-            broken_lvl = crossed_gann_up[-1]
-            # Ensure enough room to next Gann resistance (at least 0.6 ATR)
+        if bull_5m_ok and pcr_bull_ok and near_gann is not None and bull_pattern is not None:
             next_res = next((lvl for lvl in gann_levels if lvl > spot_close), res)
             t1_target = round(max(spot_close + 1.2 * atr14, next_res), 2)
             new_signal = {
                 "side": "CE",
-                "name": f"GANN_{int(broken_lvl)}_CE",
-                "gann_level": broken_lvl,
+                "name": f"GANN_{int(near_gann)}_{bull_pattern}_CE",
+                "gann_level": near_gann,
+                "pattern": bull_pattern,
                 "trigger": round(spot_close, 2),
                 "spot_t1": t1_target,
                 "armed_at": now_ist,
             }
-        elif bear_5m_ok and pcr_bear_ok and crossed_gann_dn:
-            broken_lvl = crossed_gann_dn[0]
-            # Ensure enough room to next Gann support (at least 0.6 ATR)
+        elif bear_5m_ok and pcr_bear_ok and near_gann is not None and bear_pattern is not None:
             next_sup = next((lvl for lvl in reversed(gann_levels) if lvl < spot_close), sup)
             t1_target = round(min(spot_close - 1.2 * atr14, next_sup), 2)
             new_signal = {
                 "side": "PE",
-                "name": f"GANN_{int(broken_lvl)}_PE",
-                "gann_level": broken_lvl,
+                "name": f"GANN_{int(near_gann)}_{bear_pattern}_PE",
+                "gann_level": near_gann,
+                "pattern": bear_pattern,
                 "trigger": round(spot_close, 2),
                 "spot_t1": t1_target,
                 "armed_at": now_ist,
@@ -439,7 +493,7 @@ class IntradayV3Engine:
                     silent=True,
                 )
 
-        # --- EXECUTE ENTRY IF ALL CONDITIONS SATISFIED (GANN + FUEL >= 55 + 5M EMA20 + VWAP + PCR) ---
+        # --- EXECUTE ENTRY IF ALL CONDITIONS SATISFIED (GANN PATTERN + FUEL >= 55 + 5M EMA20 + VWAP + PCR) ---
         if pending and idx not in self.active_positions and self.is_within_trade_window(now_ist):
             dir_confirmed = (
                 (pending["side"] == "CE" and bull_5m_ok and pcr_bull_ok and spot_close >= pending["trigger"])
@@ -521,7 +575,7 @@ class IntradayV3Engine:
                 f"🚀 <b>[{idx}] ENTRY TRIGGERED ({setup['name']})</b>\n"
                 f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
                 f"Entry: ₹{fill:.2f} | SL: ₹{sl_price:.2f} | Target: ₹{tp_price:.2f}\n"
-                f"Spot: {spot_close:.2f} | Gann: {setup['gann_level']} | Fuel: {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
+                f"Spot: {spot_close:.2f} | Gann: {setup['gann_level']} ({setup['pattern']}) | Fuel: {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
             )
 
     def manage_open_positions(self, force_exit: bool = False):
@@ -567,7 +621,7 @@ class IntradayV3Engine:
         self.init_expiries()
         notify(
             f"⚡ <b>V3 ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Mandatory GANN + 5M EMA20 | Fuel ≥{int(MIN_FUEL_SCORE)} | PCR Slope+Level"
+            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | GANN Pattern + 5M EMA20 | Fuel ≥{int(MIN_FUEL_SCORE)} | PCR Slope+Level"
         )
 
         while True:
@@ -602,7 +656,7 @@ class IntradayV3Engine:
                 win_label = "ACTIVE 🟢" if self.is_within_trade_window(now_ist) else "OUTSIDE WINDOW ⏸️"
                 lines = [
                     f"📊 <b>5-INDEX V3 PULSE ({hhmm} IST | {win_label})</b>",
-                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | GANN + Fuel ≥{int(MIN_FUEL_SCORE)} + 5M EMA20",
+                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | GANN Pattern + Fuel ≥{int(MIN_FUEL_SCORE)} + 5M EMA20",
                 ]
                 for s in summaries:
                     lines.append(
