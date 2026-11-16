@@ -27,8 +27,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- STRATEGY PARAMETERS (ONLY YOUR 6 CORE FILTERS) ---
-MIN_FUEL_SCORE = 55.0            # Fuel Score threshold (>= 55)
+# --- STRATEGY PARAMETERS (6 CORE FILTERS + WICK BONUS + 1.2x PREV-20 ATR) ---
+MIN_FUEL_SCORE = 50.0            # Optimized for Hammer / Reverse Hammer & Star reversals
 TRADE_START_TIME = "09:20"       # Continuous window start
 TRADE_END_TIME = "15:10"         # Continuous window end
 FORCE_EXIT_TIME = "15:15"        # Auto square-off at 3:15 PM
@@ -186,10 +186,6 @@ def get_active_future_key(idx: str) -> str:
     sym = symbol_map.get(idx, idx)
     exchange = "BSE" if idx == "SENSEX" else "NSE"
     try:
-        url = "https://api.upstox.com/v2/expired-instruments/future/contract"
-        # Fallback to standard search/contracts endpoint
-        url_search = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={exchange}_FO|{sym}"
-        # Use option/contract underlying lookup or instruments master
         inst_url = f"https://assets.upstox.com/market-quote/instruments/exchange/{exchange}.json.gz"
         df_inst = pd.read_json(inst_url)
         futs = df_inst[
@@ -206,7 +202,7 @@ def get_active_future_key(idx: str) -> str:
 
 
 # ==============================================================================
-# 4. GANN LEVELS, 6 CANDLE PATTERNS & FUTURES-VOLUME FUEL SCORE
+# 4. GANN LEVELS, 6 CANDLE PATTERNS & FUEL SCORE (WICK + 1.2x PREV-20 ATR)
 # ==============================================================================
 def compute_gann_levels(price: float, step: int) -> dict:
     """Computes Gann 0.50 Square-of-9 lattice levels around current spot."""
@@ -251,7 +247,6 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
     if near_gann is None:
         return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
 
-    # Candle metrics
     r1, b1 = max(h1 - l1, 1e-6), abs(cl1 - o1)
     r2, b2 = max(h2 - l2, 1e-6), abs(cl2 - o2)
     r3, b3 = max(h3 - l3, 1e-6), abs(cl3 - o3)
@@ -262,11 +257,8 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
 
     # --- 3 BULLISH PATTERNS (CE) ---
     bull_pattern = None
-    # 1. Bullish Engulfing
     is_bull_engulf = (cl3 > o3) and (cl2 < o2) and (cl3 >= o2) and (o3 <= cl2)
-    # 2. Hammer
     is_hammer = (lower_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (upper_wick3 <= 0.25 * r3) and ((cl3 - l3) / r3 >= 0.60)
-    # 3. Morning Star (3-candle bullish reversal)
     is_morning_star = (
         (cl1 < o1) and (b1 / r1 >= 0.45)
         and (b2 / r2 <= 0.40)
@@ -282,11 +274,8 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
 
     # --- 3 BEARISH PATTERNS (PE) ---
     bear_pattern = None
-    # 1. Bearish Engulfing
     is_bear_engulf = (cl3 < o3) and (cl2 > o2) and (cl3 <= o2) and (o3 >= cl2)
-    # 2. Reverse Hammer / Shooting Star
     is_reverse_hammer = (upper_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (lower_wick3 <= 0.25 * r3) and ((h3 - cl3) / r3 >= 0.60)
-    # 3. Evening Star (3-candle bearish reversal)
     is_evening_star = (
         (cl1 > o1) and (b1 / r1 >= 0.45)
         and (b2 / r2 <= 0.40)
@@ -308,7 +297,12 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
 
 
 def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> pd.DataFrame:
-    """Computes ATR(14) and 0-100 Fuel Score using REAL Futures Volume + Spot Momentum."""
+    """
+    Computes 0-100 Fuel Score using:
+    1. Real Futures Volume Surge (max 40 pts)
+    2. Current Candle TR >= 1.2 * Previous 20-Candle ATR Expansion (max 30 pts)
+    3. Wick Rejection Bonus (Hammer/Reverse Hammer) OR Strong Body (Engulfing) (max 20 pts)
+    """
     if spot_df.empty or len(spot_df) < 10:
         return spot_df
 
@@ -321,8 +315,10 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
         ],
         axis=1,
     ).max(axis=1)
+    spot_df["tr"] = tr
     spot_df["atr14"] = tr.rolling(14, min_periods=1).mean()
-    spot_df["atr3"] = tr.rolling(3, min_periods=1).mean()
+    # Previous 20 candles average ATR (shifted by 1 so current candle is compared against prior 20)
+    spot_df["prev20_atr"] = tr.rolling(20, min_periods=1).mean().shift(1).fillna(tr)
 
     # Merge real Futures volume if available
     if not fut_df.empty and "volume" in fut_df.columns and fut_df["volume"].sum() > 0:
@@ -340,8 +336,8 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
     fuel_scores = []
     for i in range(len(spot_df)):
         row = spot_df.iloc[i]
-        atr14 = max(row["atr14"], 1e-6)
-        atr3 = row["atr3"]
+        prev20_atr = max(row["prev20_atr"], 1e-6)
+        curr_tr = row["tr"]
 
         # 1. Real Futures Volume Surge (max 40 pts)
         if i >= 6 and spot_df["active_vol"].iloc[i - 6 : i].median() > 0:
@@ -349,16 +345,23 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
             vol_ratio = row["active_vol"] / med_vol
             vol_pts = min(40.0, max(0.0, (vol_ratio - 0.75) * 32.0))
         else:
-            vol_pts = min(35.0, max(0.0, ((atr3 / atr14) - 0.7) * 35.0))
+            vol_pts = min(35.0, max(0.0, ((curr_tr / prev20_atr) - 0.7) * 35.0))
 
-        # 2. Range / ATR Expansion (max 30 pts)
-        atr_ratio = atr3 / atr14
-        atr_pts = min(30.0, max(0.0, (atr_ratio - 0.75) * 38.0))
+        # 2. ATR Expansion: Full 30 pts when Current Candle TR >= 1.2 * Previous 20-Candle ATR
+        atr_ratio = curr_tr / prev20_atr
+        if atr_ratio >= 1.2:
+            atr_pts = 30.0
+        else:
+            atr_pts = min(29.0, max(0.0, (atr_ratio / 1.2) * 28.0))
 
-        # 3. Candle Body Efficiency (max 20 pts)
+        # 3. Wick Rejection Bonus (Hammer/Reverse Hammer) OR Strong Body (Engulfing) (max 20 pts)
         c_range = max(row["high"] - row["low"], 1e-6)
-        body_eff = abs(row["close"] - row["open"]) / c_range
-        eff_pts = min(20.0, max(0.0, body_eff * 20.0))
+        body = abs(row["close"] - row["open"])
+        upper_wick = row["high"] - max(row["open"], row["close"])
+        lower_wick = min(row["open"], row["close"]) - row["low"]
+
+        pa_strength = max(body / c_range, max(upper_wick, lower_wick) / c_range)
+        eff_pts = min(20.0, max(0.0, pa_strength * 20.0))
 
         raw_fuel = 10.0 + vol_pts + atr_pts + eff_pts
         fuel_scores.append(round(min(100.0, max(0.0, raw_fuel)), 1))
@@ -442,7 +445,6 @@ class IntradayV3Engine:
         total_ce_oi = sum(float(r.get("call_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
 
-        # 1. PCR Gradual Increase / Decrease check
         hist = self.pcr_history[idx]
         if not hist or hist[-1] != pcr:
             hist.append(pcr)
@@ -451,16 +453,13 @@ class IntradayV3Engine:
         pcr_increasing = (len(hist) >= 2 and hist[-1] > hist[-2]) or (pcr >= 1.05)
         pcr_decreasing = (len(hist) >= 2 and hist[-1] < hist[-2]) or (pcr <= 0.95)
 
-        # 2. Change in OI (Delta Put OI vs Delta Call OI)
         prev_oi = self.oi_history[idx]
         oi_bull_ok = True
         oi_bear_ok = True
         if prev_oi is not None:
             delta_pe_oi = total_pe_oi - prev_oi["pe_oi"]
             delta_ce_oi = total_ce_oi - prev_oi["ce_oi"]
-            # Bullish: Put writers adding more OI than Call writers (or Call unwinding)
             oi_bull_ok = (delta_pe_oi >= delta_ce_oi) or (delta_ce_oi < 0)
-            # Bearish: Call writers adding more OI than Put writers (or Put unwinding)
             oi_bear_ok = (delta_ce_oi >= delta_pe_oi) or (delta_pe_oi < 0)
 
         self.oi_history[idx] = {"pe_oi": total_pe_oi, "ce_oi": total_ce_oi}
@@ -498,7 +497,6 @@ class IntradayV3Engine:
         chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
         pcr, pcr_slope, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
 
-        # Check Pending Setup Expiry
         pending = self.pending_setups.get(idx)
         if pending:
             elapsed = (now_ist - pending["armed_at"]).total_seconds()
@@ -515,8 +513,7 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # --- PURE 6-FACTOR SIGNAL GENERATION (NO EMA20, NO VWAP) ---
-        # Factors: Gann Level + 6 Patterns + Price Change + Change in OI + PCR Slope + Fuel >= 55
+        # --- PURE 6-FACTOR SIGNAL GENERATION ---
         new_signal = None
         if near_gann is not None and bull_pattern is not None and price_change > 0 and oi_pcr_bull_ok:
             next_res = next((lvl for lvl in gann_levels if lvl > spot_close), res)
@@ -554,7 +551,6 @@ class IntradayV3Engine:
                     silent=True,
                 )
 
-        # Execute when Fuel >= 55 + Price Change + OI/PCR aligned
         if pending and idx not in self.active_positions and self.is_within_trade_window(now_ist):
             dir_confirmed = (
                 (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
@@ -637,7 +633,7 @@ class IntradayV3Engine:
                 f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
                 f"Entry: ₹{fill:.2f} | SL: ₹{sl_price:.2f} | Target: ₹{tp_price:.2f}\n"
                 f"Spot: {spot_close:.2f} ({price_change:+.1f}) | Gann: {setup['gann_level']} ({setup['pattern']})\n"
-                f"Fuel (FUT Vol): {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
+                f"Fuel (FUT+Wick+ATR): {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
             )
 
     def manage_open_positions(self, force_exit: bool = False):
@@ -682,8 +678,8 @@ class IntradayV3Engine:
 
         self.init_contracts()
         notify(
-            f"⚡ <b>V3 PURE 6-FACTOR ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Gann + 6 Patterns + FUT Fuel ≥{int(MIN_FUEL_SCORE)} + OI/PCR"
+            f"⚡ <b>V3 ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
+            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Gann + 6 Patterns + Fuel(Wick+1.2xATR) ≥{int(MIN_FUEL_SCORE)} + OI/PCR"
         )
 
         while True:
@@ -718,7 +714,7 @@ class IntradayV3Engine:
                 win_label = "ACTIVE 🟢" if self.is_within_trade_window(now_ist) else "OUTSIDE WINDOW ⏸️"
                 lines = [
                     f"📊 <b>5-INDEX V3 PULSE ({hhmm} IST | {win_label})</b>",
-                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + FUT Fuel ≥{int(MIN_FUEL_SCORE)} + OI/PCR",
+                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + OI/PCR",
                 ]
                 for s in summaries:
                     lines.append(
