@@ -27,54 +27,72 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- STRATEGY PARAMETERS (6 CORE FILTERS + CUMULATIVE PCR + FUEL >= 45) ---
-MIN_FUEL_SCORE = 45.0            # Set to 45 and above as requested
-TRADE_START_TIME = "09:20"       # Continuous window start
-TRADE_END_TIME = "15:10"         # Continuous window end
-FORCE_EXIT_TIME = "15:15"        # Auto square-off at 3:15 PM
+# --- STRATEGY PARAMETERS ---
+MIN_FUEL_SCORE = 45.0            # 45 and above for all instruments
+INDEX_START_TIME = "09:20"
+INDEX_END_TIME = "15:10"
+INDEX_EXIT_TIME = "15:15"
+
+MCX_START_TIME = "09:20"
+MCX_END_TIME = "23:00"
+MCX_EXIT_TIME = "23:15"
 
 GANN_ZONE_ATR_MULT = 0.40        # Allowed proximity above/below Gann level
 MAX_SPREAD_PCT = 1.50            # Bid-Ask spread protection (%)
-SL_MIN_PCT = 0.12                # Dynamic SL floor (12%)
-SL_MAX_PCT = 0.22                # Dynamic SL cap (22%)
+SL_MIN_PCT = 0.12                # Options SL floor (12%)
+SL_MAX_PCT = 0.22                # Options SL cap (22%)
+FUT_SL_ATR_MULT = 1.00           # Crude Oil Futures SL = 1.0 * ATR(14)
 RR_RATIO = 1.50                  # 1 : 1.5 Risk-to-Reward
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
-DAILY_PROFIT_LOCK_PCT = 0.35     # +35% daily profit lock
-DAILY_LOSS_LOCK_PCT = -0.25      # -25% daily loss lock
-MAX_CONSECUTIVE_LOSSES = 2       # Stop trading after 2 consecutive losses
+CRUDEOIL_CAPITAL = float(os.getenv("CRUDEOIL_CAPITAL", "150000"))
+DAILY_PROFIT_LOCK_PCT = 0.35
+DAILY_LOSS_LOCK_PCT = -0.25
+MAX_CONSECUTIVE_LOSSES = 2
 
 INDICES = {
     "NIFTY": {
+        "type": "INDEX_OPT",
         "spot_key": "NSE_INDEX|Nifty 50",
         "step": 50,
         "lot_size": 75,
         "freeze_qty": 1800,
     },
     "BANKNIFTY": {
+        "type": "INDEX_OPT",
         "spot_key": "NSE_INDEX|Nifty Bank",
         "step": 100,
         "lot_size": 30,
         "freeze_qty": 900,
     },
     "FINNIFTY": {
+        "type": "INDEX_OPT",
         "spot_key": "NSE_INDEX|Nifty Fin Service",
         "step": 50,
         "lot_size": 65,
         "freeze_qty": 1800,
     },
     "MIDCPNIFTY": {
+        "type": "INDEX_OPT",
         "spot_key": "NSE_INDEX|NIFTY MID SELECT",
         "step": 25,
         "lot_size": 120,
         "freeze_qty": 2800,
     },
     "SENSEX": {
+        "type": "INDEX_OPT",
         "spot_key": "BSE_INDEX|SENSEX",
         "step": 100,
         "lot_size": 20,
         "freeze_qty": 1000,
+    },
+    "CRUDEOIL": {
+        "type": "MCX_FUT",
+        "spot_key": "",          # Resolved dynamically via /v2/instruments/search
+        "step": 50,
+        "lot_size": 100,
+        "freeze_qty": 10000,
     },
 }
 
@@ -102,13 +120,70 @@ def notify(msg: str, silent: bool = False):
 
 
 # ==============================================================================
-# 3. UPSTOX V3 API HELPERS (SPOT + FUTURES VOLUME + OPTION CHAIN OI)
+# 3. UPSTOX V3 API HELPERS (INSTRUMENT SEARCH + CANDLES + MARGIN + OPTION CHAIN)
 # ==============================================================================
 def upstox_headers():
     return {
         "Accept": "application/json",
         "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
     }
+
+
+def get_active_future_contract(idx: str) -> dict:
+    """
+    Uses Upstox GET /v2/instruments/search API to fetch the exact active
+    current-month Future contract (instrument_key, lot_size, trading_symbol, expiry).
+    """
+    exchange = "BSE" if idx == "SENSEX" else ("MCX" if idx == "CRUDEOIL" else "NSE")
+    url = "https://api.upstox.com/v2/instruments/search"
+
+    for expiry_kw in ("current_month", "next_month"):
+        try:
+            params = {
+                "query": idx,
+                "exchanges": exchange,
+                "segments": "FUT",
+                "expiry": expiry_kw,
+                "page_number": 1,
+                "records": 20,
+            }
+            resp = requests.get(url, headers=upstox_headers(), params=params, timeout=10)
+            res = resp.json()
+            items = res.get("data", [])
+            if not items:
+                continue
+
+            # Filter exact underlying symbol match (avoids CRUDEOILM when searching CRUDEOIL)
+            exact = [
+                it for it in items
+                if str(it.get("instrument_type", "")).upper() == "FUT"
+                and (
+                    str(it.get("underlying_symbol", "")).upper() == idx
+                    or str(it.get("name", "")).upper() == idx
+                    or str(it.get("trading_symbol", "")).upper().startswith(f"{idx} ")
+                )
+            ]
+            candidates = exact if exact else [
+                it for it in items if str(it.get("instrument_type", "")).upper() == "FUT"
+            ]
+            if not candidates:
+                continue
+
+            # Pick nearest expiry contract
+            candidates.sort(key=lambda x: str(x.get("expiry", "9999-12-31")))
+            top = candidates[0]
+            return {
+                "instrument_key": str(top.get("instrument_key", "")),
+                "lot_size": int(top.get("lot_size", 100)),
+                "freeze_quantity": int(top.get("freeze_quantity", 10000)),
+                "trading_symbol": str(top.get("trading_symbol", idx)),
+                "expiry": str(top.get("expiry", "")),
+            }
+        except Exception as e:
+            log.warning(f"[{idx}] Instrument search error ({expiry_kw}): {e}")
+
+    return {}
 
 
 def fetch_intraday_5m(instrument_key: str) -> pd.DataFrame:
@@ -148,7 +223,34 @@ def fetch_ltp_quote(instrument_keys: list) -> dict:
         return {}
 
 
+def fetch_required_margin(instrument_key: str, qty: int, side: str, product: str = "I") -> float:
+    """Calls Upstox POST /v2/charges/margin API to retrieve exact margin for MCX Futures."""
+    try:
+        url = "https://api.upstox.com/v2/charges/margin"
+        payload = {
+            "instruments": [
+                {
+                    "instrument_key": instrument_key,
+                    "quantity": int(qty),
+                    "transaction_type": side,
+                    "product": product,
+                }
+            ]
+        }
+        resp = requests.post(url, headers=upstox_headers(), json=payload, timeout=10)
+        data = resp.json()
+        if data.get("status") == "success":
+            return float(data.get("data", {}).get("required_margin", 0.0))
+        log.warning(f"Margin API warning ({instrument_key}): {data}")
+        return 0.0
+    except Exception as e:
+        log.warning(f"Margin API error ({instrument_key}): {e}")
+        return 0.0
+
+
 def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
+    if not spot_key or not expiry_date:
+        return []
     try:
         url = "https://api.upstox.com/v2/option/chain"
         params = {"instrument_key": spot_key, "expiry_date": expiry_date}
@@ -174,38 +276,11 @@ def get_nearest_expiry(spot_key: str) -> str:
         return ""
 
 
-def get_active_future_key(idx: str) -> str:
-    """Resolves current month active Future instrument_key for real Volume in Fuel Score."""
-    symbol_map = {
-        "NIFTY": "NIFTY",
-        "BANKNIFTY": "BANKNIFTY",
-        "FINNIFTY": "FINNIFTY",
-        "MIDCPNIFTY": "MIDCPNIFTY",
-        "SENSEX": "SENSEX",
-    }
-    sym = symbol_map.get(idx, idx)
-    exchange = "BSE" if idx == "SENSEX" else "NSE"
-    try:
-        inst_url = f"https://assets.upstox.com/market-quote/instruments/exchange/{exchange}.json.gz"
-        df_inst = pd.read_json(inst_url)
-        futs = df_inst[
-            (df_inst["instrument_type"] == "FUT")
-            & (df_inst["name"].str.upper().str.contains(sym, na=False))
-        ].copy()
-        if futs.empty:
-            return ""
-        futs = futs.sort_values("expiry")
-        return str(futs.iloc[0]["instrument_key"])
-    except Exception as e:
-        log.warning(f"[{idx}] Future key lookup fallback ({e})")
-        return ""
-
-
 # ==============================================================================
 # 4. GANN LEVELS, 6 CANDLE PATTERNS & FUEL SCORE (WICK + 1.2x PREV-20 ATR)
 # ==============================================================================
 def compute_gann_levels(price: float, step: int) -> dict:
-    """Computes Gann 0.50 Square-of-9 lattice levels around current spot."""
+    """Computes Gann 0.50 Square-of-9 lattice levels around current price."""
     root = math.sqrt(price)
     base_floor = math.floor(root * 2) / 2.0
     levels = [round((base_floor + k * 0.5) ** 2, 2) for k in range(-3, 5)]
@@ -221,15 +296,15 @@ def compute_gann_levels(price: float, step: int) -> dict:
 def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) -> dict:
     """
     Checks ONLY the 6 requested patterns near Gann levels (above or below within 0.40 ATR):
-    Bullish (CE): Morning Star, Hammer, Bullish Engulfing
-    Bearish (PE): Evening Star, Reverse Hammer (Shooting Star), Bearish Engulfing
+    Bullish (CE / BUY): Morning Star, Hammer, Bullish Engulfing
+    Bearish (PE / SELL): Evening Star, Reverse Hammer (Shooting Star), Bearish Engulfing
     """
     if len(df) < 3:
         return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
 
-    c1 = df.iloc[-3]  # 2 candles ago (for Morning/Evening Star)
-    c2 = df.iloc[-2]  # Previous candle
-    c3 = df.iloc[-1]  # Current candle
+    c1 = df.iloc[-3]
+    c2 = df.iloc[-2]
+    c3 = df.iloc[-1]
 
     o1, h1, l1, cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
     o2, h2, l2, cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
@@ -255,7 +330,7 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
     lower_wick3 = min(o3, cl3) - l3
     mid1 = (o1 + cl1) / 2.0
 
-    # --- 3 BULLISH PATTERNS (CE) ---
+    # --- 3 BULLISH PATTERNS (BUY / CE) ---
     bull_pattern = None
     is_bull_engulf = (cl3 > o3) and (cl2 < o2) and (cl3 >= o2) and (o3 <= cl2)
     is_hammer = (lower_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (upper_wick3 <= 0.25 * r3) and ((cl3 - l3) / r3 >= 0.60)
@@ -272,7 +347,7 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
     elif is_hammer:
         bull_pattern = "HAMMER"
 
-    # --- 3 BEARISH PATTERNS (PE) ---
+    # --- 3 BEARISH PATTERNS (SELL / PE) ---
     bear_pattern = None
     is_bear_engulf = (cl3 < o3) and (cl2 > o2) and (cl3 <= o2) and (o3 >= cl2)
     is_reverse_hammer = (upper_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (lower_wick3 <= 0.25 * r3) and ((h3 - cl3) / r3 >= 0.60)
@@ -372,8 +447,9 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
 # 5. ORDER EXECUTION & POSITION MANAGEMENT
 # ==============================================================================
 def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: float) -> dict:
-    buffer = 1.015 if side == "BUY" else 0.985
-    limit_price = round(ltp * buffer, 1)
+    is_mcx = instrument_key.startswith("MCX_FO")
+    buffer = (1.003 if is_mcx else 1.015) if side == "BUY" else (0.997 if is_mcx else 0.985)
+    limit_price = round(ltp * buffer, 1 if not is_mcx else 0)
 
     if PAPER_MODE:
         log.info(f"[PAPER ORDER] {side} {qty} x {instrument_key} @ ₹{ltp:.2f} (Limit ₹{limit_price})")
@@ -409,9 +485,9 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 class IntradayV3Engine:
     def __init__(self):
         self.expiries = {}
-        self.fut_keys = {}
+        self.fut_contracts = {}
         self.pending_setups = {idx: None for idx in INDICES}
-        self.open_pcr = {idx: None for idx in INDICES}       # Tracks day's starting Open PCR
+        self.open_pcr = {idx: None for idx in INDICES}
         self.pcr_history = {idx: deque(maxlen=5) for idx in INDICES}
         self.oi_history = {idx: None for idx in INDICES}
         self.active_positions = {}
@@ -421,15 +497,37 @@ class IntradayV3Engine:
 
     def init_contracts(self):
         for idx, cfg in INDICES.items():
-            exp = get_nearest_expiry(cfg["spot_key"])
-            fut = get_active_future_key(idx)
-            self.expiries[idx] = exp
-            self.fut_keys[idx] = fut
-            log.info(f"[{idx}] Expiry: {exp} | Future Key: {fut or 'SPOT_FALLBACK'}")
+            fut_info = get_active_future_contract(idx)
+            self.fut_contracts[idx] = fut_info
+            if cfg["type"] == "MCX_FUT":
+                cfg["spot_key"] = fut_info.get("instrument_key", "")
+                if fut_info.get("lot_size"):
+                    cfg["lot_size"] = fut_info["lot_size"]
+                if fut_info.get("freeze_quantity"):
+                    cfg["freeze_qty"] = fut_info["freeze_quantity"]
+                margin_1_lot = (
+                    fetch_required_margin(cfg["spot_key"], cfg["lot_size"], "BUY", "I")
+                    if cfg["spot_key"]
+                    else 0.0
+                )
+                log.info(
+                    f"[{idx}] MCX FUT ONLY | Symbol: {fut_info.get('trading_symbol', 'N/A')} "
+                    f"| Key: {cfg['spot_key']} | Expiry: {fut_info.get('expiry', 'N/A')} "
+                    f"| Lot: {cfg['lot_size']} | 1-Lot Intraday Margin: ₹{margin_1_lot:.2f}"
+                )
+            else:
+                exp = get_nearest_expiry(cfg["spot_key"])
+                self.expiries[idx] = exp
+                log.info(
+                    f"[{idx}] Option Expiry: {exp} | FUT Volume Key: {fut_info.get('instrument_key') or 'SPOT_FALLBACK'} "
+                    f"({fut_info.get('trading_symbol', 'N/A')})"
+                )
 
-    def is_within_trade_window(self, now_ist: datetime) -> bool:
+    def is_within_trade_window(self, idx: str, now_ist: datetime) -> bool:
         hhmm = now_ist.strftime("%H:%M")
-        return TRADE_START_TIME <= hhmm <= TRADE_END_TIME
+        if INDICES[idx]["type"] == "MCX_FUT":
+            return MCX_START_TIME <= hhmm <= MCX_END_TIME
+        return INDEX_START_TIME <= hhmm <= INDEX_END_TIME
 
     def analyze_oi_and_pcr(self, idx: str, chain: list):
         """
@@ -444,25 +542,21 @@ class IntradayV3Engine:
         total_ce_oi = sum(float(r.get("call_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
 
-        # Store Morning Open PCR once at session start
         if self.open_pcr[idx] is None:
             self.open_pcr[idx] = pcr
         open_p = self.open_pcr[idx]
-        cum_pcr_diff = round(pcr - open_p, 2)  # Negative = Overall Day Downside | Positive = Overall Day Upside
+        cum_pcr_diff = round(pcr - open_p, 2)
 
         hist = self.pcr_history[idx]
         if not hist or hist[-1] != pcr:
             hist.append(pcr)
 
-        # Short-term tick direction
         short_rising = (len(hist) >= 2 and hist[-1] >= hist[-2]) or (pcr >= 1.10)
         short_falling = (len(hist) >= 2 and hist[-1] <= hist[-2]) or (pcr <= 0.90)
 
-        # Cumulative Day PCR Trend (from Open PCR to Current PCR)
         cum_bullish = (cum_pcr_diff > 0) or (pcr >= 1.15)
         cum_bearish = (cum_pcr_diff < 0) or (pcr <= 0.85)
 
-        # Change in OI (Delta Put OI vs Delta Call OI)
         prev_oi = self.oi_history[idx]
         oi_bull_ok = True
         oi_bear_ok = True
@@ -478,12 +572,17 @@ class IntradayV3Engine:
         bear_confirmed = cum_bearish and short_falling and oi_bear_ok
         return pcr, open_p, cum_pcr_diff, bull_confirmed, bear_confirmed
 
-    def evaluate_index(self, idx: str, cfg: dict, now_ist: datetime):
+    def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
+        is_mcx = cfg["type"] == "MCX_FUT"
+        if not cfg["spot_key"]:
+            return None
+
         spot_df = fetch_intraday_5m(cfg["spot_key"])
         if spot_df.empty or len(spot_df) < 10:
             return None
 
-        fut_df = fetch_intraday_5m(self.fut_keys.get(idx, ""))
+        fut_key = self.fut_contracts.get(idx, {}).get("instrument_key", "")
+        fut_df = spot_df if is_mcx else fetch_intraday_5m(fut_key)
         df = compute_fuel_with_fut_volume(spot_df, fut_df)
 
         curr = df.iloc[-1]
@@ -506,9 +605,18 @@ class IntradayV3Engine:
         bull_pattern = pat_info["bull_pattern"]
         bear_pattern = pat_info["bear_pattern"]
 
-        # 2. Option Chain: Change in OI + Cumulative PCR (Open -> Now)
-        chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
-        pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
+        # 2. OI & PCR Confirmation
+        chain = []
+        if is_mcx:
+            curr_oi = float(curr["oi"])
+            prev_oi = float(prev["oi"])
+            oi_change = curr_oi - prev_oi
+            oi_pcr_bull_ok = price_change > 0
+            oi_pcr_bear_ok = price_change < 0
+            pcr, open_p, cum_pcr_diff = 0.0, 0.0, round(oi_change, 0)
+        else:
+            chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
+            pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
 
         pending = self.pending_setups.get(idx)
         if pending:
@@ -531,9 +639,11 @@ class IntradayV3Engine:
         if near_gann is not None and bull_pattern is not None and price_change > 0 and oi_pcr_bull_ok:
             next_res = next((lvl for lvl in gann_levels if lvl > spot_close), res)
             t1_target = round(max(spot_close + 1.2 * atr14, next_res), 2)
+            side_label = "BUY" if is_mcx else "CE"
             new_signal = {
                 "side": "CE",
-                "name": f"GANN_{int(near_gann)}_{bull_pattern}_CE",
+                "display_side": side_label,
+                "name": f"GANN_{int(near_gann)}_{bull_pattern}_{side_label}",
                 "gann_level": near_gann,
                 "pattern": bull_pattern,
                 "trigger": round(spot_close, 2),
@@ -543,9 +653,11 @@ class IntradayV3Engine:
         elif near_gann is not None and bear_pattern is not None and price_change < 0 and oi_pcr_bear_ok:
             next_sup = next((lvl for lvl in reversed(gann_levels) if lvl < spot_close), sup)
             t1_target = round(min(spot_close - 1.2 * atr14, next_sup), 2)
+            side_label = "SELL" if is_mcx else "PE"
             new_signal = {
                 "side": "PE",
-                "name": f"GANN_{int(near_gann)}_{bear_pattern}_PE",
+                "display_side": side_label,
+                "name": f"GANN_{int(near_gann)}_{bear_pattern}_{side_label}",
                 "gann_level": near_gann,
                 "pattern": bear_pattern,
                 "trigger": round(spot_close, 2),
@@ -558,25 +670,28 @@ class IntradayV3Engine:
             pending = new_signal
             if fuel < MIN_FUEL_SCORE:
                 notify(
-                    f"[!] [{idx}] {pending['side']} Armed "
+                    f"[!] [{idx}] {pending['display_side']} Armed "
                     f"[LOW_FUEL({int(fuel)}<{int(MIN_FUEL_SCORE)}) WAIT_RECLAIM]: "
-                    f"{pending['name']} @ {pending['trigger']} (Spot T1: {pending['spot_t1']})",
+                    f"{pending['name']} @ {pending['trigger']} (T1: {pending['spot_t1']})",
                     silent=True,
                 )
 
-        if pending and idx not in self.active_positions and self.is_within_trade_window(now_ist):
+        if pending and idx not in self.active_positions and self.is_within_trade_window(idx, now_ist):
             dir_confirmed = (
                 (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
                 or (pending["side"] == "PE" and price_change < 0 and oi_pcr_bear_ok and spot_close <= pending["trigger"])
             )
             if dir_confirmed and fuel >= MIN_FUEL_SCORE:
-                self.try_execute_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14)
+                if is_mcx:
+                    self.try_execute_mcx_fut_entry(idx, cfg, pending, spot_close, price_change, fuel, cum_pcr_diff, atr14)
+                else:
+                    self.try_execute_option_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14)
 
         status_tag = f"WATCHING👀 (Gann {int(sup)}-{int(res)})"
         if idx in self.active_positions:
-            status_tag = f"IN TRADE ({self.active_positions[idx]['side']})🔥"
+            status_tag = f"IN TRADE ({self.active_positions[idx]['display_side']})🔥"
         elif pending:
-            status_tag = f"ARMED {pending['side']} ({pending['pattern']})🎯"
+            status_tag = f"ARMED {pending['display_side']} ({pending['pattern']})🎯"
         elif price_change > 0:
             status_tag = f"PRICE+ ({price_change:+.1f} | Gann {int(sup)}-{int(res)})🟢"
         elif price_change < 0:
@@ -584,6 +699,7 @@ class IntradayV3Engine:
 
         return {
             "idx": idx,
+            "is_mcx": is_mcx,
             "spot": int(round(spot_close)),
             "fuel": int(round(fuel)),
             "pcr": pcr,
@@ -592,7 +708,71 @@ class IntradayV3Engine:
             "status": status_tag,
         }
 
-    def try_execute_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14):
+    def try_execute_mcx_fut_entry(self, idx, cfg, setup, fut_price, price_change, fuel, oi_change, atr14):
+        """Executes ONLY Futures BUY or SELL for CRUDEOIL (No Options) using Upstox Margin API."""
+        inst_key = cfg["spot_key"]
+        lot_size = cfg["lot_size"]
+        tx_side = "BUY" if setup["side"] == "CE" else "SELL"
+
+        quotes = fetch_ltp_quote([inst_key])
+        q_data = quotes.get(inst_key, {})
+        ltp = float(q_data.get("last_price", fut_price))
+        depth = q_data.get("depth", {})
+        best_bid = float(depth.get("buy", [{}])[0].get("price", 0)) if depth.get("buy") else 0.0
+        best_ask = float(depth.get("sell", [{}])[0].get("price", 0)) if depth.get("sell") else 0.0
+
+        if best_bid > 0 and best_ask > 0 and ltp > 0:
+            spread_pct = ((best_ask - best_bid) / ltp) * 100.0
+            if spread_pct > MAX_SPREAD_PCT:
+                log.info(f"[{idx}] Entry skipped due to high spread: {spread_pct:.2f}%")
+                return
+
+        # Fetch exact required margin for 1 lot via POST /v2/charges/margin
+        req_margin_1lot = fetch_required_margin(inst_key, lot_size, tx_side, "I")
+        if req_margin_1lot > 0:
+            lots = max(1, int(CRUDEOIL_CAPITAL // req_margin_1lot))
+        else:
+            lots = 1
+        qty = min(lots * lot_size, cfg["freeze_qty"])
+
+        # ATR-based Stop Loss & 1:1.5 Target for Futures
+        sl_points = round(max(atr14 * FUT_SL_ATR_MULT, 10.0), 0)
+        tp_points = round(sl_points * RR_RATIO, 0)
+
+        if tx_side == "BUY":
+            sl_price = round(ltp - sl_points, 0)
+            tp_price = round(ltp + tp_points, 0)
+        else:
+            sl_price = round(ltp + sl_points, 0)
+            tp_price = round(ltp - tp_points, 0)
+
+        order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp)
+        if order_res.get("status") == "success":
+            fill = order_res["fill_price"]
+            sym = self.fut_contracts.get(idx, {}).get("trading_symbol", "CRUDEOIL FUT")
+            self.active_positions[idx] = {
+                "type": "MCX_FUT",
+                "instrument_key": inst_key,
+                "strike": sym,
+                "side": setup["side"],
+                "tx_side": tx_side,
+                "display_side": tx_side,
+                "qty": qty,
+                "entry_price": fill,
+                "sl": sl_price,
+                "tp": tp_price,
+                "setup_name": setup["name"],
+            }
+            self.pending_setups[idx] = None
+            notify(
+                f"🛢️🚀 <b>[{idx} FUTURES] {tx_side} TRIGGERED ({setup['name']})</b>\n"
+                f"Contract: <b>{sym}</b> | Qty: {qty} ({lots} Lot)\n"
+                f"Entry: ₹{fill:.1f} | SL: ₹{sl_price:.1f} | Target: ₹{tp_price:.1f}\n"
+                f"Margin/Lot: ₹{req_margin_1lot:.0f} | Gann: {setup['gann_level']} ({setup['pattern']})\n"
+                f"Fuel: {fuel} | ΔPrice: {price_change:+.1f} | ΔOI: {oi_change:+.0f}"
+            )
+
+    def try_execute_option_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14):
         if not chain:
             return
         atm_strike = round(spot_close / cfg["step"]) * cfg["step"]
@@ -632,9 +812,12 @@ class IntradayV3Engine:
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
             self.active_positions[idx] = {
+                "type": "INDEX_OPT",
                 "instrument_key": inst_key,
                 "strike": atm_strike,
                 "side": setup["side"],
+                "tx_side": "BUY",
+                "display_side": setup["side"],
                 "qty": qty,
                 "entry_price": fill,
                 "sl": sl_price,
@@ -650,7 +833,7 @@ class IntradayV3Engine:
                 f"Fuel: {fuel} | PCR: {open_p}→{pcr} (Cum {cum_pcr_diff:+.2f})"
             )
 
-    def manage_open_positions(self, force_exit: bool = False):
+    def manage_open_positions(self, hhmm: str):
         if not self.active_positions:
             return
         keys = [p["instrument_key"] for p in self.active_positions.values()]
@@ -660,18 +843,26 @@ class IntradayV3Engine:
             pos = self.active_positions[idx]
             q_data = quotes.get(pos["instrument_key"], {})
             ltp = float(q_data.get("last_price", pos["entry_price"]))
+            is_short = pos["tx_side"] == "SELL"
 
             exit_reason = None
-            if force_exit:
-                exit_reason = "EOD_AUTO_EXIT (15:15)"
-            elif ltp <= pos["sl"]:
+            if pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
+                exit_reason = f"EOD_AUTO_EXIT ({INDEX_EXIT_TIME})"
+            elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
+                exit_reason = f"MCX_AUTO_EXIT ({MCX_EXIT_TIME})"
+            elif not is_short and ltp <= pos["sl"]:
                 exit_reason = "STOP_LOSS_HIT"
-            elif ltp >= pos["tp"]:
+            elif not is_short and ltp >= pos["tp"]:
+                exit_reason = "TARGET_1_HIT"
+            elif is_short and ltp >= pos["sl"]:
+                exit_reason = "STOP_LOSS_HIT"
+            elif is_short and ltp <= pos["tp"]:
                 exit_reason = "TARGET_1_HIT"
 
             if exit_reason:
-                place_marketable_limit_order(pos["instrument_key"], pos["qty"], "SELL", ltp)
-                pnl = (ltp - pos["entry_price"]) * pos["qty"]
+                close_side = "BUY" if is_short else "SELL"
+                place_marketable_limit_order(pos["instrument_key"], pos["qty"], close_side, ltp)
+                pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
                 self.day_pnl += pnl
                 if pnl < 0:
                     self.consecutive_losses += 1
@@ -681,7 +872,7 @@ class IntradayV3Engine:
                 del self.active_positions[idx]
                 notify(
                     f"🏁 <b>[{idx}] EXIT ({exit_reason})</b>\n"
-                    f"Strike: {pos['strike']} {pos['side']} | Exit: ₹{ltp:.2f}\n"
+                    f"Instrument: {pos['strike']} ({pos['display_side']}) | Exit: ₹{ltp:.2f}\n"
                     f"Trade PnL: <b>₹{pnl:+.2f}</b> | Day PnL: <b>₹{self.day_pnl:+.2f}</b>"
                 )
 
@@ -692,19 +883,19 @@ class IntradayV3Engine:
 
         self.init_contracts()
         notify(
-            f"⚡ <b>V3 ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + Cum PCR"
+            f"⚡ <b>V3 ENGINE STARTED (5 INDICES + MCX CRUDEOIL FUT)</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
+            f"Indices: {INDEX_START_TIME}–{INDEX_END_TIME} | Crude Oil FUT: {MCX_START_TIME}–{MCX_END_TIME} IST | Fuel ≥{int(MIN_FUEL_SCORE)}"
         )
 
         while True:
             now_ist = datetime.now(IST)
             hhmm = now_ist.strftime("%H:%M")
 
-            if hhmm >= FORCE_EXIT_TIME:
-                self.manage_open_positions(force_exit=True)
-                if hhmm >= "15:25":
-                    notify(f"🛑 <b>SESSION CLOSED</b> | Final Day PnL: <b>₹{self.day_pnl:+.2f}</b>")
-                    break
+            self.manage_open_positions(hhmm)
+
+            if hhmm >= "23:20":
+                notify(f"🛑 <b>SESSION CLOSED</b> | Final Day PnL: <b>₹{self.day_pnl:+.2f}</b>")
+                break
 
             max_profit = CAPITAL_PER_TRADE * DAILY_PROFIT_LOCK_PCT
             max_loss = CAPITAL_PER_TRADE * DAILY_LOSS_LOCK_PCT
@@ -714,26 +905,30 @@ class IntradayV3Engine:
                 or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES
             )
 
-            self.manage_open_positions(force_exit=False)
-
             summaries = []
             if not risk_locked:
                 for idx, cfg in INDICES.items():
-                    res = self.evaluate_index(idx, cfg, now_ist)
+                    if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
+                        continue
+                    res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
                         summaries.append(res)
 
             if now_ist.minute % 5 == 0 and now_ist.minute != self.last_pulse_min and summaries:
                 self.last_pulse_min = now_ist.minute
-                win_label = "ACTIVE 🟢" if self.is_within_trade_window(now_ist) else "OUTSIDE WINDOW ⏸️"
                 lines = [
-                    f"📊 <b>5-INDEX V3 PULSE ({hhmm} IST | {win_label})</b>",
-                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + Cum PCR",
+                    f"📊 <b>V3 MARKET PULSE ({hhmm} IST)</b>",
+                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)}",
                 ]
                 for s in summaries:
-                    lines.append(
-                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['open_pcr']}→{s['pcr']} ({s['cum_pcr_diff']:+.2f}) | {s['status']}"
-                    )
+                    if s["is_mcx"]:
+                        lines.append(
+                            f"• 🛢️ <b>{s['idx']} FUT</b>: {s['spot']} | Fuel {s['fuel']} | ΔOI {s['cum_pcr_diff']:+.0f} | {s['status']}"
+                        )
+                    else:
+                        lines.append(
+                            f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['open_pcr']}→{s['pcr']} ({s['cum_pcr_diff']:+.2f}) | {s['status']}"
+                        )
                 notify("\n".join(lines), silent=True)
 
             time.sleep(20)
