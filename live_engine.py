@@ -27,8 +27,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- STRATEGY PARAMETERS (6 CORE FILTERS + WICK BONUS + 1.2x PREV-20 ATR) ---
-MIN_FUEL_SCORE = 50.0            # Optimized for Hammer / Reverse Hammer & Star reversals
+# --- STRATEGY PARAMETERS (6 CORE FILTERS + CUMULATIVE PCR + FUEL >= 45) ---
+MIN_FUEL_SCORE = 45.0            # Set to 45 and above as requested
 TRADE_START_TIME = "09:20"       # Continuous window start
 TRADE_END_TIME = "15:10"         # Continuous window end
 FORCE_EXIT_TIME = "15:15"        # Auto square-off at 3:15 PM
@@ -317,10 +317,8 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
     ).max(axis=1)
     spot_df["tr"] = tr
     spot_df["atr14"] = tr.rolling(14, min_periods=1).mean()
-    # Previous 20 candles average ATR (shifted by 1 so current candle is compared against prior 20)
     spot_df["prev20_atr"] = tr.rolling(20, min_periods=1).mean().shift(1).fillna(tr)
 
-    # Merge real Futures volume if available
     if not fut_df.empty and "volume" in fut_df.columns and fut_df["volume"].sum() > 0:
         fut_vol = fut_df[["timestamp", "volume"]].rename(columns={"volume": "fut_vol"})
         spot_df = pd.merge_asof(
@@ -413,6 +411,7 @@ class IntradayV3Engine:
         self.expiries = {}
         self.fut_keys = {}
         self.pending_setups = {idx: None for idx in INDICES}
+        self.open_pcr = {idx: None for idx in INDICES}       # Tracks day's starting Open PCR
         self.pcr_history = {idx: deque(maxlen=5) for idx in INDICES}
         self.oi_history = {idx: None for idx in INDICES}
         self.active_positions = {}
@@ -434,25 +433,36 @@ class IntradayV3Engine:
 
     def analyze_oi_and_pcr(self, idx: str, chain: list):
         """
-        Tracks:
-        1. PCR gradually increasing (CE) or decreasing (PE)
-        2. Change in OI (Put OI build-up for CE vs Call OI build-up for PE)
+        Tracks BOTH:
+        1. Cumulative Day PCR Trend from Open (e.g. 1.45 -> 0.85 Bearish | 0.30 -> 0.75 Bullish)
+        2. Short-term PCR Direction (Rising/Falling) + Change in OI (Put OI vs Call OI)
         """
         if not chain:
-            return 1.0, 0.0, False, False
+            return 1.0, 1.0, 0.0, False, False
 
         total_pe_oi = sum(float(r.get("put_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         total_ce_oi = sum(float(r.get("call_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
 
+        # Store Morning Open PCR once at session start
+        if self.open_pcr[idx] is None:
+            self.open_pcr[idx] = pcr
+        open_p = self.open_pcr[idx]
+        cum_pcr_diff = round(pcr - open_p, 2)  # Negative = Overall Day Downside | Positive = Overall Day Upside
+
         hist = self.pcr_history[idx]
         if not hist or hist[-1] != pcr:
             hist.append(pcr)
 
-        pcr_slope = round(pcr - hist[0], 3) if len(hist) >= 2 else 0.0
-        pcr_increasing = (len(hist) >= 2 and hist[-1] > hist[-2]) or (pcr >= 1.05)
-        pcr_decreasing = (len(hist) >= 2 and hist[-1] < hist[-2]) or (pcr <= 0.95)
+        # Short-term tick direction
+        short_rising = (len(hist) >= 2 and hist[-1] >= hist[-2]) or (pcr >= 1.10)
+        short_falling = (len(hist) >= 2 and hist[-1] <= hist[-2]) or (pcr <= 0.90)
 
+        # Cumulative Day PCR Trend (from Open PCR to Current PCR)
+        cum_bullish = (cum_pcr_diff > 0) or (pcr >= 1.15)
+        cum_bearish = (cum_pcr_diff < 0) or (pcr <= 0.85)
+
+        # Change in OI (Delta Put OI vs Delta Call OI)
         prev_oi = self.oi_history[idx]
         oi_bull_ok = True
         oi_bear_ok = True
@@ -463,7 +473,10 @@ class IntradayV3Engine:
             oi_bear_ok = (delta_ce_oi >= delta_pe_oi) or (delta_pe_oi < 0)
 
         self.oi_history[idx] = {"pe_oi": total_pe_oi, "ce_oi": total_ce_oi}
-        return pcr, pcr_slope, (pcr_increasing and oi_bull_ok), (pcr_decreasing and oi_bear_ok)
+
+        bull_confirmed = cum_bullish and short_rising and oi_bull_ok
+        bear_confirmed = cum_bearish and short_falling and oi_bear_ok
+        return pcr, open_p, cum_pcr_diff, bull_confirmed, bear_confirmed
 
     def evaluate_index(self, idx: str, cfg: dict, now_ist: datetime):
         spot_df = fetch_intraday_5m(cfg["spot_key"])
@@ -493,9 +506,9 @@ class IntradayV3Engine:
         bull_pattern = pat_info["bull_pattern"]
         bear_pattern = pat_info["bear_pattern"]
 
-        # 2. Option Chain: Change in OI + PCR Increase/Decrease
+        # 2. Option Chain: Change in OI + Cumulative PCR (Open -> Now)
         chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
-        pcr, pcr_slope, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
+        pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
 
         pending = self.pending_setups.get(idx)
         if pending:
@@ -557,7 +570,7 @@ class IntradayV3Engine:
                 or (pending["side"] == "PE" and price_change < 0 and oi_pcr_bear_ok and spot_close <= pending["trigger"])
             )
             if dir_confirmed and fuel >= MIN_FUEL_SCORE:
-                self.try_execute_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, pcr_slope, chain, atr14)
+                self.try_execute_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14)
 
         status_tag = f"WATCHING👀 (Gann {int(sup)}-{int(res)})"
         if idx in self.active_positions:
@@ -574,11 +587,12 @@ class IntradayV3Engine:
             "spot": int(round(spot_close)),
             "fuel": int(round(fuel)),
             "pcr": pcr,
-            "pcr_slope": pcr_slope,
+            "open_pcr": open_p,
+            "cum_pcr_diff": cum_pcr_diff,
             "status": status_tag,
         }
 
-    def try_execute_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, pcr_slope, chain, atr14):
+    def try_execute_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14):
         if not chain:
             return
         atm_strike = round(spot_close / cfg["step"]) * cfg["step"]
@@ -633,7 +647,7 @@ class IntradayV3Engine:
                 f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
                 f"Entry: ₹{fill:.2f} | SL: ₹{sl_price:.2f} | Target: ₹{tp_price:.2f}\n"
                 f"Spot: {spot_close:.2f} ({price_change:+.1f}) | Gann: {setup['gann_level']} ({setup['pattern']})\n"
-                f"Fuel (FUT+Wick+ATR): {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
+                f"Fuel: {fuel} | PCR: {open_p}→{pcr} (Cum {cum_pcr_diff:+.2f})"
             )
 
     def manage_open_positions(self, force_exit: bool = False):
@@ -679,7 +693,7 @@ class IntradayV3Engine:
         self.init_contracts()
         notify(
             f"⚡ <b>V3 ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Gann + 6 Patterns + Fuel(Wick+1.2xATR) ≥{int(MIN_FUEL_SCORE)} + OI/PCR"
+            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + Cum PCR"
         )
 
         while True:
@@ -714,11 +728,11 @@ class IntradayV3Engine:
                 win_label = "ACTIVE 🟢" if self.is_within_trade_window(now_ist) else "OUTSIDE WINDOW ⏸️"
                 lines = [
                     f"📊 <b>5-INDEX V3 PULSE ({hhmm} IST | {win_label})</b>",
-                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + OI/PCR",
+                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Gann + 6 Patterns + Fuel ≥{int(MIN_FUEL_SCORE)} + Cum PCR",
                 ]
                 for s in summaries:
                     lines.append(
-                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['pcr']} ({s['pcr_slope']:+.2f}) | {s['status']}"
+                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['open_pcr']}→{s['pcr']} ({s['cum_pcr_diff']:+.2f}) | {s['status']}"
                     )
                 notify("\n".join(lines), silent=True)
 
