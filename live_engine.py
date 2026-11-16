@@ -9,6 +9,7 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 # ==============================================================================
@@ -29,8 +30,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- UPDATED STRATEGY PARAMETERS ---
-MIN_FUEL_SCORE = 55.0            # Updated from 70.0 -> 55.0
+# --- STRATEGY PARAMETERS ---
+MIN_FUEL_SCORE = 55.0            # Minimum Fuel Score gate
 TRADE_START_TIME = "09:20"       # Continuous window start
 TRADE_END_TIME = "15:10"         # Continuous window end (no new entries after 3:10 PM)
 FORCE_EXIT_TIME = "15:15"        # Auto square-off all open positions at 3:15 PM
@@ -40,6 +41,11 @@ SL_MIN_PCT = 0.12                # Dynamic SL floor (12%)
 SL_MAX_PCT = 0.22                # Dynamic SL cap (22%)
 RR_RATIO = 1.50                  # 1 : 1.5 Risk-to-Reward
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
+
+# PCR Filter thresholds (Level OR Dynamic Slope)
+PCR_BULL_LEVEL = 1.05
+PCR_BEAR_LEVEL = 0.95
+PCR_SLOPE_DELTA = 0.08           # Captures fast drop (e.g. 5 -> 4 -> 3 -> 1) even before 0.95
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 DAILY_PROFIT_LOCK_PCT = 0.35     # +35% daily profit lock
@@ -179,13 +185,13 @@ def get_nearest_expiry(spot_key: str) -> str:
 
 
 # ==============================================================================
-# 4. INDICATORS, GANN LATTICE & 5M EMA20 + FUEL SCORE (0-100)
+# 4. INDICATORS, MANDATORY GANN LATTICE & 5M EMA20 + FUEL SCORE (0-100)
 # ==============================================================================
 def compute_gann_levels(price: float, step: int) -> dict:
     """Computes Gann 0.50 Square-of-9 lattice levels around current spot."""
     root = math.sqrt(price)
     base_floor = math.floor(root * 2) / 2.0
-    levels = [round((base_floor + k * 0.5) ** 2, 2) for k in range(-2, 4)]
+    levels = [round((base_floor + k * 0.5) ** 2, 2) for k in range(-3, 5)]
     supports = [lvl for lvl in levels if lvl <= price]
     resistances = [lvl for lvl in levels if lvl > price]
     return {
@@ -200,10 +206,10 @@ def add_indicators_5m(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or len(df) < 15:
         return df
 
-    # 5-Minute 20 EMA (Replaced 15M EMA20 as requested)
+    # 5-Minute 20 EMA
     df["ema20_5m"] = df["close"].ewm(span=20, adjust=False).mean()
 
-    # Session VWAP (uses typical price * volume; fallback to cumulative mean if index vol=0)
+    # Session VWAP
     tp = (df["high"] + df["low"] + df["close"]) / 3.0
     if df["volume"].sum() > 0:
         df["vwap_5m"] = (tp * df["volume"]).cumsum() / df["volume"].replace(0, np.nan).cumsum()
@@ -231,30 +237,24 @@ def add_indicators_5m(df: pd.DataFrame) -> pd.DataFrame:
         atr14 = max(row["atr14"], 1e-6)
         atr3 = row["atr3"]
 
-        # 1. Volume Surge (max 30 pts)
         if i >= 8 and df["volume"].iloc[i - 8 : i].median() > 0:
             med_vol = df["volume"].iloc[i - 8 : i].median()
             vol_ratio = row["volume"] / med_vol
             vol_pts = min(30.0, max(0.0, (vol_ratio - 0.8) * 25.0))
         else:
-            # Index spot without volume gets proportional range-velocity credit
             vol_pts = min(30.0, max(0.0, ((atr3 / atr14) - 0.7) * 35.0))
 
-        # 2. ATR / Range Expansion (max 25 pts)
         atr_ratio = atr3 / atr14
         atr_pts = min(25.0, max(0.0, (atr_ratio - 0.8) * 35.7))
 
-        # 3. 5M EMA20 Slope Velocity (max 20 pts)
         ema_prev = df["ema20_5m"].iloc[max(0, i - 2)]
         slope_ratio = abs(row["ema20_5m"] - ema_prev) / atr14
         slope_pts = min(20.0, max(0.0, slope_ratio * 25.0))
 
-        # 4. Candle Body Efficiency (max 15 pts)
         c_range = max(row["high"] - row["low"], 1e-6)
         body_eff = abs(row["close"] - row["open"]) / c_range
         eff_pts = min(15.0, max(0.0, body_eff * 15.0))
 
-        # 5. Base (+10) & VWAP Over-Extension Penalty (up to -25)
         dist_vwap = abs(row["close"] - row["vwap_5m"]) / atr14
         penalty = min(25.0, max(0.0, (dist_vwap - 1.5) * 15.0))
 
@@ -308,6 +308,7 @@ class IntradayV3Engine:
     def __init__(self):
         self.expiries = {}
         self.pending_setups = {idx: None for idx in INDICES}
+        self.pcr_history = {idx: deque(maxlen=6) for idx in INDICES}
         self.active_positions = {}
         self.day_pnl = 0.0
         self.consecutive_losses = 0
@@ -323,6 +324,23 @@ class IntradayV3Engine:
         hhmm = now_ist.strftime("%H:%M")
         return TRADE_START_TIME <= hhmm <= TRADE_END_TIME
 
+    def check_pcr_alignment(self, idx: str, current_pcr: float):
+        """
+        Checks both static PCR level AND dynamic PCR slope (e.g. 5 -> 4 -> 3 -> 1)
+        so rapid institutional shifts trigger immediately without waiting for 0.95.
+        """
+        hist = self.pcr_history[idx]
+        if not hist or hist[-1] != current_pcr:
+            hist.append(current_pcr)
+
+        pcr_slope = round(current_pcr - hist[0], 3) if len(hist) >= 2 else 0.0
+        strictly_falling = len(hist) >= 3 and (hist[-1] < hist[-2] < hist[-3])
+        strictly_rising = len(hist) >= 3 and (hist[-1] > hist[-2] > hist[-3])
+
+        pcr_bull_ok = (current_pcr >= PCR_BULL_LEVEL) or (pcr_slope >= PCR_SLOPE_DELTA) or strictly_rising
+        pcr_bear_ok = (current_pcr <= PCR_BEAR_LEVEL) or (pcr_slope <= -PCR_SLOPE_DELTA) or strictly_falling
+        return pcr_bull_ok, pcr_bear_ok, pcr_slope
+
     def evaluate_index(self, idx: str, cfg: dict, now_ist: datetime):
         df = fetch_intraday_5m(cfg["spot_key"])
         if df.empty or len(df) < 10:
@@ -331,18 +349,22 @@ class IntradayV3Engine:
         df = add_indicators_5m(df)
         curr = df.iloc[-1]
         prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
 
         spot_close = float(curr["close"])
+        spot_open = float(curr["open"])
         ema20_5m = float(curr["ema20_5m"])
         vwap_5m = float(curr["vwap_5m"])
         atr14 = max(float(curr["atr14"]), 1.0)
         fuel = float(curr["fuel"])
 
+        # --- MANDATORY GANN LEVELS ALWAYS ACTIVE ---
         gann = compute_gann_levels(spot_close, cfg["step"])
-        sup = gann["support"]
-        res = gann["resistance"]
+        sup = gann["support"]        # Nearest Gann level at/below current spot
+        res = gann["resistance"]     # Nearest Gann level above current spot
+        gann_levels = gann["all"]
 
-        # Option Chain PCR
+        # Option Chain PCR + Dynamic Slope Check
         pcr = 1.0
         chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
         if chain:
@@ -350,6 +372,8 @@ class IntradayV3Engine:
             total_ce_oi = sum(row.get("call_options", {}).get("market_data", {}).get("oi", 0) for row in chain)
             if total_ce_oi > 0:
                 pcr = round(total_pe_oi / total_ce_oi, 2)
+
+        pcr_bull_ok, pcr_bear_ok, pcr_slope = self.check_pcr_alignment(idx, pcr)
 
         # --- CHECK PENDING SETUP EXPIRY OR TRIGGER ---
         pending = self.pending_setups.get(idx)
@@ -368,25 +392,39 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # --- 5M EMA20 + VWAP + GANN SIGNAL DETECTION (NO 15M EMA20) ---
-        bull_5m_ok = (spot_close > ema20_5m) and (spot_close > vwap_5m)
-        bear_5m_ok = (spot_close < ema20_5m) and (spot_close < vwap_5m)
+        # --- MANDATORY GANN + 5M EMA20 + VWAP + PCR SIGNAL DETECTION ---
+        bull_5m_ok = (spot_close > ema20_5m) and (spot_close > vwap_5m) and (spot_close > spot_open)
+        bear_5m_ok = (spot_close < ema20_5m) and (spot_close < vwap_5m) and (spot_close < spot_open)
+
+        # Check if any Gann level was broken within the last 2 candles (so delayed Fuel >= 55 still catches it)
+        crossed_gann_up = [lvl for lvl in gann_levels if min(prev["close"], prev2["close"]) <= lvl < spot_close]
+        crossed_gann_dn = [lvl for lvl in gann_levels if max(prev["close"], prev2["close"]) >= lvl > spot_close]
 
         new_signal = None
-        if bull_5m_ok and prev["close"] <= res < spot_close:
+        if bull_5m_ok and pcr_bull_ok and crossed_gann_up:
+            broken_lvl = crossed_gann_up[-1]
+            # Ensure enough room to next Gann resistance (at least 0.6 ATR)
+            next_res = next((lvl for lvl in gann_levels if lvl > spot_close), res)
+            t1_target = round(max(spot_close + 1.2 * atr14, next_res), 2)
             new_signal = {
                 "side": "CE",
-                "name": f"GANN_{int(res)}_CE",
+                "name": f"GANN_{int(broken_lvl)}_CE",
+                "gann_level": broken_lvl,
                 "trigger": round(spot_close, 2),
-                "spot_t1": round(spot_close + 1.5 * atr14, 2),
+                "spot_t1": t1_target,
                 "armed_at": now_ist,
             }
-        elif bear_5m_ok and prev["close"] >= sup > spot_close:
+        elif bear_5m_ok and pcr_bear_ok and crossed_gann_dn:
+            broken_lvl = crossed_gann_dn[0]
+            # Ensure enough room to next Gann support (at least 0.6 ATR)
+            next_sup = next((lvl for lvl in reversed(gann_levels) if lvl < spot_close), sup)
+            t1_target = round(min(spot_close - 1.2 * atr14, next_sup), 2)
             new_signal = {
                 "side": "PE",
-                "name": f"GANN_{int(sup)}_PE",
+                "name": f"GANN_{int(broken_lvl)}_PE",
+                "gann_level": broken_lvl,
                 "trigger": round(spot_close, 2),
-                "spot_t1": round(spot_close - 1.5 * atr14, 2),
+                "spot_t1": t1_target,
                 "armed_at": now_ist,
             }
 
@@ -401,14 +439,14 @@ class IntradayV3Engine:
                     silent=True,
                 )
 
-        # --- EXECUTE ENTRY IF ALL CONDITIONS SATISFIED (INCLUDING FUEL >= 55 & 5M EMA20) ---
+        # --- EXECUTE ENTRY IF ALL CONDITIONS SATISFIED (GANN + FUEL >= 55 + 5M EMA20 + VWAP + PCR) ---
         if pending and idx not in self.active_positions and self.is_within_trade_window(now_ist):
             dir_confirmed = (
-                (pending["side"] == "CE" and bull_5m_ok and spot_close >= pending["trigger"])
-                or (pending["side"] == "PE" and bear_5m_ok and spot_close <= pending["trigger"])
+                (pending["side"] == "CE" and bull_5m_ok and pcr_bull_ok and spot_close >= pending["trigger"])
+                or (pending["side"] == "PE" and bear_5m_ok and pcr_bear_ok and spot_close <= pending["trigger"])
             )
             if dir_confirmed and fuel >= MIN_FUEL_SCORE:
-                self.try_execute_entry(idx, cfg, pending, spot_close, fuel, pcr, chain, atr14)
+                self.try_execute_entry(idx, cfg, pending, spot_close, fuel, pcr, pcr_slope, chain, atr14)
 
         status_tag = "WATCHING👀"
         if idx in self.active_positions:
@@ -416,19 +454,20 @@ class IntradayV3Engine:
         elif pending:
             status_tag = f"ARMED {pending['side']}🎯"
         elif bull_5m_ok:
-            status_tag = "BULLISH🟢"
+            status_tag = f"BULLISH🟢 (Gann {int(sup)}-{int(res)})"
         elif bear_5m_ok:
-            status_tag = "BEARISH🔴"
+            status_tag = f"BEARISH🔴 (Gann {int(sup)}-{int(res)})"
 
         return {
             "idx": idx,
             "spot": int(round(spot_close)),
             "fuel": int(round(fuel)),
             "pcr": pcr,
+            "pcr_slope": pcr_slope,
             "status": status_tag,
         }
 
-    def try_execute_entry(self, idx, cfg, setup, spot_close, fuel, pcr, chain, atr14):
+    def try_execute_entry(self, idx, cfg, setup, spot_close, fuel, pcr, pcr_slope, chain, atr14):
         if not chain:
             return
         atm_strike = round(spot_close / cfg["step"]) * cfg["step"]
@@ -451,7 +490,6 @@ class IntradayV3Engine:
         if ltp <= 5.0:
             return
 
-        # Bid-Ask Spread Protection
         if bid > 0 and ask > 0:
             spread_pct = ((ask - bid) / ltp) * 100.0
             if spread_pct > MAX_SPREAD_PCT:
@@ -461,7 +499,6 @@ class IntradayV3Engine:
         lots = max(1, int(CAPITAL_PER_TRADE // (ltp * cfg["lot_size"])))
         qty = min(lots * cfg["lot_size"], cfg["freeze_qty"])
 
-        # Dynamic SL (12% to 22%) & 1:1.5 Target
         raw_sl_pct = min(SL_MAX_PCT, max(SL_MIN_PCT, (atr14 / spot_close) * 18.0))
         sl_price = round(ltp * (1.0 - raw_sl_pct), 1)
         tp_price = round(ltp * (1.0 + raw_sl_pct * RR_RATIO), 1)
@@ -484,7 +521,7 @@ class IntradayV3Engine:
                 f"🚀 <b>[{idx}] ENTRY TRIGGERED ({setup['name']})</b>\n"
                 f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
                 f"Entry: ₹{fill:.2f} | SL: ₹{sl_price:.2f} | Target: ₹{tp_price:.2f}\n"
-                f"Spot: {spot_close:.2f} | Fuel: {fuel} | PCR: {pcr}"
+                f"Spot: {spot_close:.2f} | Gann: {setup['gann_level']} | Fuel: {fuel} | PCR: {pcr} ({pcr_slope:+.2f})"
             )
 
     def manage_open_positions(self, force_exit: bool = False):
@@ -530,21 +567,19 @@ class IntradayV3Engine:
         self.init_expiries()
         notify(
             f"⚡ <b>V3 ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | 5M EMA20 | Min Fuel: {int(MIN_FUEL_SCORE)}"
+            f"Window: {TRADE_START_TIME}–{TRADE_END_TIME} IST | Mandatory GANN + 5M EMA20 | Fuel ≥{int(MIN_FUEL_SCORE)} | PCR Slope+Level"
         )
 
         while True:
             now_ist = datetime.now(IST)
             hhmm = now_ist.strftime("%H:%M")
 
-            # Force square-off at 15:15 IST and stop engine at 15:25 IST
             if hhmm >= FORCE_EXIT_TIME:
                 self.manage_open_positions(force_exit=True)
                 if hhmm >= "15:25":
                     notify(f"🛑 <b>SESSION CLOSED</b> | Final Day PnL: <b>₹{self.day_pnl:+.2f}</b>")
                     break
 
-            # Daily Risk Locks
             max_profit = CAPITAL_PER_TRADE * DAILY_PROFIT_LOCK_PCT
             max_loss = CAPITAL_PER_TRADE * DAILY_LOSS_LOCK_PCT
             risk_locked = (
@@ -562,17 +597,16 @@ class IntradayV3Engine:
                     if res:
                         summaries.append(res)
 
-            # 5-Minute Heartbeat Pulse
             if now_ist.minute % 5 == 0 and now_ist.minute != self.last_pulse_min and summaries:
                 self.last_pulse_min = now_ist.minute
                 win_label = "ACTIVE 🟢" if self.is_within_trade_window(now_ist) else "OUTSIDE WINDOW ⏸️"
                 lines = [
                     f"📊 <b>5-INDEX V3 PULSE ({hhmm} IST | {win_label})</b>",
-                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | Fuel Gate: ≥{int(MIN_FUEL_SCORE)} (5M EMA20)",
+                    f"💰 Day PnL: <b>₹{self.day_pnl:+.2f}</b> | GANN + Fuel ≥{int(MIN_FUEL_SCORE)} + 5M EMA20",
                 ]
                 for s in summaries:
                     lines.append(
-                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['pcr']} | {s['status']}"
+                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['pcr']} ({s['pcr_slope']:+.2f}) | {s['status']}"
                     )
                 notify("\n".join(lines), silent=True)
 
