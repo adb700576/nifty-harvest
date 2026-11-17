@@ -2,7 +2,7 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '35 3 * * 1-5'  # Somvar te Shukravar 03:35 UTC (9:05 AM IST)
+    - cron: '25 3 * * 1-5'  # Somvar te Shukravar 03:25 UTC (08:55 AM IST)
   workflow_dispatch:
 
 permissions:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl matplotlib
+          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl matplotlib upstox-python-sdk
           playwright install --with-deps chromium
 
       - name: Auto-Generate Fresh Upstox Token
@@ -77,10 +77,14 @@ jobs:
 
       - name: Generate Master Journal & Analytics
         if: ${{ !cancelled() }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python generate_journal_analytics.py
+        run: |
+          if [ -f generate_journal_analytics.py ]; then
+            python generate_journal_analytics.py
+          fi
 
       - name: Commit & Push Journal Updates
         if: ${{ !cancelled() }}
