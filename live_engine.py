@@ -157,7 +157,7 @@ INDICES = {
 }
 
 # ==============================================================================
-# 2. TELEGRAM (ALERTS, LIVE DASHBOARD, ENTRY/EXIT CHARTS) & MASTER JOURNAL
+# 2. DESIGNER TELEGRAM UI, 5M CHARTS & BROKERAGE/TAX BREAKDOWN
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -186,33 +186,50 @@ def notify(msg: str, silent: bool = False):
                 log.warning(f"Telegram send error after retry: {e}")
 
 
+def make_progress_bar(progress_ratio: float, length: int = 8) -> str:
+    clamped = max(0.0, min(1.0, progress_ratio))
+    filled = int(round(clamped * length))
+    return "▰" * filled + "▱" * (length - filled)
+
+
 def send_telegram_chart(df: pd.DataFrame, title: str, caption: str, gann_lvl: float, spot_entry: float, spot_sl: float, spot_trg: float, is_exit: bool = False, spot_exit: float = None):
+    """Generates a sleek, high-contrast dark-accented 5M setup chart and sends to Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or df.empty:
         return
     try:
-        plot_df = df.tail(35).copy()
-        fig, ax = plt.subplots(figsize=(10, 4.8), dpi=130)
+        plot_df = df.tail(36).copy()
+        fig, ax = plt.subplots(figsize=(10.5, 5.0), dpi=140)
+        fig.patch.set_facecolor("#0f172a")
+        ax.set_facecolor("#1e293b")
 
-        ax.plot(plot_df["timestamp"], plot_df["close"], color="#111111", linewidth=1.8, label="Spot / Fut 5M")
-        ax.axhline(gann_lvl, color="#1d4ed8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
-        ax.axhline(spot_sl, color="#dc2626", linestyle=":", linewidth=1.4, label=f"Swing SL: {spot_sl:.1f}")
-        ax.axhline(spot_trg, color="#7e22ce", linestyle=":", linewidth=1.4, label=f"1:2 Target: {spot_trg:.1f}")
+        ax.plot(plot_df["timestamp"], plot_df["close"], color="#f8fafc", linewidth=2.1, label="Price 5M")
+        ax.axhline(gann_lvl, color="#38bdf8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
+        ax.axhline(spot_sl, color="#f43f5e", linestyle=":", linewidth=1.6, label=f"Swing SL: {spot_sl:.1f}")
+        ax.axhline(spot_trg, color="#a855f7", linestyle=":", linewidth=1.6, label=f"1:2 Target: {spot_trg:.1f}")
+
+        # Shaded Risk & Reward zones
+        ax.axhspan(min(spot_entry, spot_sl), max(spot_entry, spot_sl), color="#f43f5e", alpha=0.08)
+        ax.axhspan(min(spot_entry, spot_trg), max(spot_entry, spot_trg), color="#22c55e", alpha=0.08)
 
         entry_ts = plot_df["timestamp"].iloc[-1] if not is_exit else plot_df["timestamp"].iloc[max(0, len(plot_df) - 4)]
-        ax.scatter([entry_ts], [spot_entry], color="#16a34a", s=70, zorder=5, label=f"Entry: {spot_entry:.1f}")
+        ax.scatter([entry_ts], [spot_entry], color="#22c55e", edgecolors="#ffffff", linewidth=1.2, s=85, zorder=5, label=f"Entry: {spot_entry:.1f}")
 
         if is_exit and spot_exit is not None:
             exit_ts = plot_df["timestamp"].iloc[-1]
-            ax.scatter([exit_ts], [spot_exit], color="#ea580c", marker="X", s=85, zorder=6, label=f"Exit: {spot_exit:.1f}")
+            ax.scatter([exit_ts], [spot_exit], color="#f59e0b", edgecolors="#ffffff", linewidth=1.2, marker="X", s=100, zorder=6, label=f"Exit: {spot_exit:.1f}")
 
-        ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
-        ax.grid(True, linestyle="-", alpha=0.25)
+        ax.set_title(title, fontsize=11.5, fontweight="bold", color="#f8fafc", pad=12)
+        ax.tick_params(colors="#cbd5e1", labelsize=8.5)
+        for spine in ax.spines.values():
+            spine.set_color("#334155")
+        ax.grid(True, linestyle="--", color="#334155", alpha=0.55)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %H:%M", tz=IST))
-        ax.legend(loc="upper left", fontsize=8.5, framealpha=0.9)
+        leg = ax.legend(loc="upper left", fontsize=8.5, facecolor="#0f172a", edgecolor="#334155", labelcolor="#f8fafc")
+        leg.get_frame().set_alpha(0.92)
         plt.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format="png")
+        plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
         plt.close(fig)
         buf.seek(0)
 
@@ -274,12 +291,14 @@ def upstox_headers():
     }
 
 
-def fetch_exact_trade_charges(instrument_key: str, entry_price: float, exit_price: float, qty: int, is_mcx: bool) -> float:
+def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, qty: int, is_mcx: bool) -> dict:
     """
-    Fetches exact Upstox BUY + SELL leg charges via Upstox ChargeApi.get_brokerage (SDK)
-    or GET /v2/charges/brokerage (REST), with accurate math fallback.
+    Fetches exact Upstox BUY + SELL leg charges (Brokerage + STT/CTT + Exchange/SEBI/Stamp + GST)
+    via Upstox ChargeApi.get_brokerage (SDK) or GET /v2/charges/brokerage (REST), with fallback.
     """
-    if entry_price > 0 and exit_price > 0 and qty > 0:
+    breakdown = {"brokerage": 0.0, "taxes_other": 0.0, "total": 0.0}
+
+    if buy_price > 0 and sell_price > 0 and qty > 0:
         # 1. Try Upstox Python SDK ChargeApi first
         if HAS_UPSTOX_SDK:
             try:
@@ -287,23 +306,28 @@ def fetch_exact_trade_charges(instrument_key: str, entry_price: float, exit_pric
                 cfg.access_token = UPSTOX_ACCESS_TOKEN
                 charge_api = upstox_client.ChargeApi(upstox_client.ApiClient(cfg))
                 buy_resp = charge_api.get_brokerage(
-                    instrument_key, int(qty), "I", "BUY", round(float(entry_price), 2), "2.0"
+                    instrument_key, int(qty), "I", "BUY", round(float(buy_price), 2), "2.0"
                 )
                 sell_resp = charge_api.get_brokerage(
-                    instrument_key, int(qty), "I", "SELL", round(float(exit_price), 2), "2.0"
+                    instrument_key, int(qty), "I", "SELL", round(float(sell_price), 2), "2.0"
                 )
-                buy_tot = float(buy_resp.data.charges.total or 0.0)
-                sell_tot = float(sell_resp.data.charges.total or 0.0)
-                if (buy_tot + sell_tot) > 0:
-                    return round(buy_tot + sell_tot, 2)
+                b_brk = float(buy_resp.data.charges.brokerage or 0.0)
+                s_brk = float(sell_resp.data.charges.brokerage or 0.0)
+                b_tot = float(buy_resp.data.charges.total or 0.0)
+                s_tot = float(sell_resp.data.charges.total or 0.0)
+                if (b_tot + s_tot) > 0:
+                    tot = round(b_tot + s_tot, 2)
+                    brk = round(b_brk + s_brk, 2)
+                    return {"brokerage": brk, "taxes_other": round(tot - brk, 2), "total": tot}
             except Exception as e:
                 log.debug(f"SDK ChargeApi fallback to REST ({instrument_key}): {e}")
 
         # 2. Try Upstox REST GET /v2/charges/brokerage
         url = "https://api.upstox.com/v2/charges/brokerage"
-        total_charges = 0.0
+        tot_sum = 0.0
+        brk_sum = 0.0
         api_ok = True
-        for tx_type, price in (("BUY", entry_price), ("SELL", exit_price)):
+        for tx_type, price in (("BUY", buy_price), ("SELL", sell_price)):
             params = {
                 "instrument_token": instrument_key,
                 "quantity": int(qty),
@@ -315,7 +339,9 @@ def fetch_exact_trade_charges(instrument_key: str, entry_price: float, exit_pric
                 resp = requests.get(url, headers=upstox_headers(), params=params, timeout=8)
                 res = resp.json()
                 if res.get("status") == "success":
-                    total_charges += float(res.get("data", {}).get("charges", {}).get("total", 0.0))
+                    ch_obj = res.get("data", {}).get("charges", {})
+                    tot_sum += float(ch_obj.get("total", 0.0))
+                    brk_sum += float(ch_obj.get("brokerage", 0.0))
                 else:
                     log.warning(f"Brokerage API warning ({instrument_key} {tx_type}): {res}")
                     api_ok = False
@@ -325,23 +351,26 @@ def fetch_exact_trade_charges(instrument_key: str, entry_price: float, exit_pric
                 api_ok = False
                 break
 
-        if api_ok and total_charges > 0:
-            return round(total_charges, 2)
+        if api_ok and tot_sum > 0:
+            tot = round(tot_sum, 2)
+            brk = round(brk_sum, 2)
+            return {"brokerage": brk, "taxes_other": round(tot - brk, 2), "total": tot}
 
     # 3. Safe fallback calculation if API is unreachable
-    turnover = (entry_price + exit_price) * qty
+    turnover = (buy_price + sell_price) * qty
     brokerage = 40.0
     if is_mcx:
-        stt_ctt = (exit_price * qty) * 0.0001
+        stt_ctt = (sell_price * qty) * 0.0001
         txn_charges = turnover * 0.000021
-        stamp_duty = (entry_price * qty) * 0.00002
+        stamp_duty = (buy_price * qty) * 0.00002
     else:
-        stt_ctt = (exit_price * qty) * 0.000625
+        stt_ctt = (sell_price * qty) * 0.000625
         txn_charges = turnover * 0.0005
-        stamp_duty = (entry_price * qty) * 0.00003
+        stamp_duty = (buy_price * qty) * 0.00003
     sebi_charges = turnover * 0.000001
     gst = (brokerage + txn_charges + sebi_charges) * 0.18
-    return round(brokerage + stt_ctt + txn_charges + stamp_duty + sebi_charges + gst, 2)
+    taxes_other = round(stt_ctt + txn_charges + stamp_duty + sebi_charges + gst, 2)
+    return {"brokerage": brokerage, "taxes_other": taxes_other, "total": round(brokerage + taxes_other, 2)}
 
 
 def record_trade_journal(row: dict):
@@ -363,6 +392,8 @@ def record_trade_journal(row: dict):
         "target",
         "exit_reason",
         "gross_pnl",
+        "brokerage",
+        "taxes_other",
         "charges",
         "pnl",
         "day_pnl",
@@ -399,6 +430,8 @@ def build_master_journal_report(now_ist: datetime) -> str:
                             "year": y_iso,
                             "week": w_iso,
                             "points": float(r.get("points", 0.0)),
+                            "brokerage": float(r.get("brokerage", 0.0)),
+                            "taxes_other": float(r.get("taxes_other", 0.0)),
                             "charges": float(r.get("charges", 0.0)),
                             "pnl": float(r.get("pnl", 0.0)),
                         })
@@ -413,49 +446,49 @@ def build_master_journal_report(now_ist: datetime) -> str:
         losses = sum(1 for x in sub_rows if x["pnl"] <= 0)
         wr = round((wins / total) * 100.0, 1) if total > 0 else 0.0
         pts = round(sum(x["points"] for x in sub_rows), 2)
+        brk = round(sum(x["brokerage"] for x in sub_rows), 2)
+        tax = round(sum(x["taxes_other"] for x in sub_rows), 2)
         chg = round(sum(x["charges"] for x in sub_rows), 2)
         net = round(sum(x["pnl"] for x in sub_rows), 2)
-        return total, wins, losses, wr, pts, chg, net
+        return total, wins, losses, wr, pts, brk, tax, chg, net
 
-    d_tot, d_win, d_loss, d_wr, d_pts, _, d_net = summarize([r for r in rows if r["date"] == today_str])
-    w_tot, _, _, w_wr, _, _, w_net = summarize([r for r in rows if r["year"] == curr_year and r["week"] == curr_week])
+    d_tot, d_win, d_loss, d_wr, d_pts, d_brk, d_tax, d_chg, d_net = summarize([r for r in rows if r["date"] == today_str])
+    w_tot, _, _, w_wr, _, _, _, _, w_net = summarize([r for r in rows if r["year"] == curr_year and r["week"] == curr_week])
 
     month_rows = [r for r in rows if r["date"].startswith(curr_month_prefix)]
-    m_tot, _, _, m_wr, _, _, m_net = summarize(month_rows)
+    m_tot, _, _, m_wr, _, _, _, _, m_net = summarize(month_rows)
 
     weeks_in_month = sorted({r["week"] for r in month_rows})
     week_lines = []
     for idx_w, wk in enumerate(weeks_in_month, start=1):
-        wt, _, _, wwr, _, _, wnet = summarize([r for r in month_rows if r["week"] == wk])
-        week_lines.append(f"• Week {idx_w} (W{wk}): {wt} ट्रेड्स | {wwr:.0f}% Win | ₹ {wnet:+,.2f}")
+        wt, _, _, wwr, _, _, _, _, wnet = summarize([r for r in month_rows if r["week"] == wk])
+        week_lines.append(f"  ├ Week {idx_w} (W{wk}): {wt} ट्रेड्स │ {wwr:.0f}% Win │ <b>₹ {wnet:+,.2f}</b>")
     if not week_lines:
-        week_lines.append(f"• Week 1 (W{curr_week}): 0 ट्रेड्स | 0% Win | ₹ +0.00")
+        week_lines.append(f"  └ Week 1 (W{curr_week}): 0 ट्रेड्स │ 0% Win │ ₹ +0.00")
 
     y_rows = [r for r in rows if r["year"] == curr_year]
-    y_tot, y_win, y_loss, y_wr, _, y_chg, y_net = summarize(y_rows)
+    y_tot, y_win, y_loss, y_wr, _, y_brk, y_tax, y_chg, y_net = summarize(y_rows)
 
     report = [
-        "📊 <b>V3 MULTI-INDEX & MCX ALGO: मास्टर ट्रेड जर्नल रिपोर्ट</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "╔══════════════════════════════╗",
+        "  📊 <b>V3 ALGO • मास्टर ट्रेड जर्नल रिपोर्ट</b>",
+        "╚══════════════════════════════╝",
         f"📅 <b>आजचा निकाल ({today_str})</b>",
-        f"• ट्रेड्स: <b>{d_tot}</b> (🟢 {d_win} | 🔴 {d_loss})",
-        f"• Win Rate: <b>{d_wr:.1f}%</b> | निव्वळ पॉईंट्स: <b>{d_pts:+.2f} pts</b>",
-        f"• निव्वळ PnL (Net): <b>₹ {d_net:+,.2f}</b>",
-        "",
+        f"  • ट्रेड्स: <b>{d_tot}</b> (🟢 {d_win} │ 🔴 {d_loss}) │ Win Rate: <b>{d_wr:.1f}%</b>",
+        f"  • पॉईंट्स: <b>{d_pts:+.2f} pts</b> │ चार्जेस: ₹{d_chg:,.2f} (Brk ₹{d_brk:,.0f} + Tax ₹{d_tax:,.0f})",
+        f"  • आजचा निव्वळ नफा (Net PnL): <b>₹ {d_net:+,.2f}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📈 <b>चालू आठवडा (W{curr_week})</b>",
-        f"• एकूण ट्रेड्स: <b>{w_tot}</b> | Win Rate: <b>{w_wr:.1f}%</b>",
-        f"• आठवड्याचा Net PnL: <b>₹ {w_net:+,.2f}</b>",
-        "",
+        f"  • एकूण ट्रेड्स: <b>{w_tot}</b> │ Win Rate: <b>{w_wr:.1f}%</b> │ Net: <b>₹ {w_net:+,.2f}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"🗓️ <b>चालू महिना ({month_label})</b>",
         *week_lines,
-        f"• महिन्याचा एकूण निकाल: <b>₹ {m_net:+,.2f}</b> (Win Rate: {m_wr:.1f}%)",
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"  └ एकूण महिना: <b>₹ {m_net:+,.2f}</b> (Win Rate: {m_wr:.1f}%)",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"🏆 <b>वार्षिक / ऑल-टाइम निकाल ({curr_year})</b>",
-        f"• एकूण ट्रेड्स: <b>{y_tot}</b> (🟢 {y_win} | 🔴 {y_loss})",
-        f"• एकूण Win Rate: <b>{y_wr:.1f}%</b>",
-        f"• ब्रोकरेज व टॅक्स: <b>₹ {y_chg:,.2f}</b>",
-        f"• एकूण निव्वळ नफा (Net PnL): <b>₹ {y_net:+,.2f}</b>",
+        f"  • एकूण ट्रेड्स: <b>{y_tot}</b> (🟢 {y_win} │ 🔴 {y_loss}) │ Win Rate: <b>{y_wr:.1f}%</b>",
+        f"  • एकूण ब्रोकरेज व टॅक्स: <b>₹ {y_chg:,.2f}</b> (Brk ₹{y_brk:,.0f} + Tax ₹{y_tax:,.0f})",
+        f"  • एकूण निव्वळ नफा (Net PnL): <b>₹ {y_net:+,.2f}</b>",
     ]
     return "\n".join(report)
 
@@ -483,14 +516,11 @@ def get_active_future_contract(idx: str) -> dict:
             if not items:
                 continue
 
+            # Exact base futures symbol match (e.g., 'GOLD FUT ...', 'SILVER FUT ...')
             exact = [
                 it for it in items
                 if str(it.get("instrument_type", "")).upper() == "FUT"
-                and (
-                    str(it.get("underlying_symbol", "")).upper() == idx
-                    or str(it.get("name", "")).upper() == idx
-                    or str(it.get("trading_symbol", "")).upper().startswith(f"{idx} ")
-                )
+                and str(it.get("trading_symbol", "")).upper().startswith(f"{idx} FUT")
             ]
             candidates = exact if exact else [
                 it for it in items if str(it.get("instrument_type", "")).upper() == "FUT"
@@ -799,7 +829,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. MAIN TRADING ENGINE LOOP (WITH TICK-BY-TICK WEBSOCKET V3 STREAMER)
+# 6. MAIN TRADING ENGINE LOOP (ON-DEMAND TICK-BY-TICK WEBSOCKET V3 STREAMER)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -824,9 +854,8 @@ class IntradayV3Engine:
         self.subscribed_keys = set()
 
     def init_websocket_streamer(self):
-        """Starts Upstox MarketDataStreamerV3 (ltpc mode) in background for millisecond tick monitoring."""
-        if not HAS_UPSTOX_SDK:
-            log.warning("upstox-python-sdk not installed; running with 10s REST fallback.")
+        """Connects Upstox MarketDataStreamerV3 (ltpc mode) ONLY when at least one trade is active."""
+        if not HAS_UPSTOX_SDK or self.streamer is not None:
             return
 
         try:
@@ -838,7 +867,7 @@ class IntradayV3Engine:
 
             def on_open():
                 self.ws_connected = True
-                log.info("[WS_V3] Connected to Upstox MarketDataStreamerV3 (Tick-by-Tick active)")
+                log.info("[WS_V3] Connected to Upstox MarketDataStreamerV3 (On-Demand Tick-by-Tick active)")
                 with self.pos_lock:
                     active_keys = [p["instrument_key"] for p in self.active_positions.values()]
                 if active_keys:
@@ -870,7 +899,7 @@ class IntradayV3Engine:
 
             def on_close():
                 self.ws_connected = False
-                log.warning("[WS_V3] Stream closed; auto-reconnect active.")
+                log.info("[WS_V3] Stream closed.")
 
             self.streamer.on("open", on_open)
             self.streamer.on("message", on_message)
@@ -883,21 +912,36 @@ class IntradayV3Engine:
             log.warning(f"[WS_V3] Init failed (using REST fallback): {e}")
 
     def subscribe_tick_instrument(self, instrument_key: str):
-        if self.streamer and self.ws_connected and instrument_key not in self.subscribed_keys:
+        if not HAS_UPSTOX_SDK:
+            return
+        self.subscribed_keys.add(instrument_key)
+        if not self.streamer:
+            self.init_websocket_streamer()
+        elif self.ws_connected:
             try:
                 self.streamer.subscribe([instrument_key], "ltpc")
-                self.subscribed_keys.add(instrument_key)
                 log.info(f"[WS_V3] Subscribed tick-by-tick LTPC: {instrument_key}")
             except Exception as e:
                 log.warning(f"[WS_V3] Subscribe error ({instrument_key}): {e}")
 
     def unsubscribe_tick_instrument(self, instrument_key: str):
-        if self.streamer and self.ws_connected and instrument_key in self.subscribed_keys:
+        self.subscribed_keys.discard(instrument_key)
+        if self.streamer and self.ws_connected:
             try:
                 self.streamer.unsubscribe([instrument_key])
-                self.subscribed_keys.discard(instrument_key)
             except Exception:
                 pass
+
+        with self.pos_lock:
+            no_active = len(self.active_positions) == 0
+        if no_active and self.streamer:
+            try:
+                self.streamer.disconnect()
+            except Exception:
+                pass
+            self.streamer = None
+            self.ws_connected = False
+            log.info("[WS_V3] All trades closed — Tick-by-Tick WebSocket disconnected (Scanning Mode).")
 
     def on_tick_price(self, instrument_key: str, ltp: float):
         """Millisecond tick callback: triggers instant SL / Trail SL / Target exit."""
@@ -1044,61 +1088,83 @@ class IntradayV3Engine:
         return round(total_mtm, 2)
 
     def render_live_dashboard(self, hhmm: str):
+        """Graphic-designed, compact, scannable pinned Telegram Live Dashboard."""
         live_mtm = self.compute_live_mtm()
         net_pnl = round(self.day_pnl + live_mtm, 2)
-        feed_tag = "TICK-WS" if self.ws_connected else "POLL"
+        mode_badge = "🧪 PAPER" if PAPER_MODE else "⚡ LIVE"
+        feed_badge = "📡 TICK-WS" if self.ws_connected else "🔍 SCANNING"
+        net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
         lines = [
-            f"📊 <b>V3 LIVE DASHBOARD ({hhmm} IST)</b> ({'PAPER' if PAPER_MODE else 'LIVE'} | {feed_tag})",
-            f"💰 Realized (Net): <b>₹{self.day_pnl:+.2f}</b> | MTM: <b>₹{live_mtm:+.2f}</b> | Total: <b>₹{net_pnl:+.2f}</b>",
+            f"╔══════════════════════════════╗",
+            f"  ⚡ <b>V3 QUANT DESK</b> │ <code>{hhmm} IST</code> │ {mode_badge}",
+            f"╚══════════════════════════════╝",
+            f"💼 <b>Net PnL:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>  <i>({feed_badge})</i>",
+            f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b>  │  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
         ]
 
+        # 1. Active Positions Card
+        with self.pos_lock:
+            active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
+
+        if active_snap:
+            lines.append("\n🔥 <b>ACTIVE POSITIONS</b>")
+            lines.append("──────────────────────────────")
+            for p_idx, pos in active_snap:
+                ltp = pos.get("last_ltp", pos["entry_price"])
+                is_short = pos["tx_side"] == "SELL"
+                pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
+                curr_gain = (pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])
+                trg_dist = max(abs(pos["tp"] - pos["entry_price"]), 1e-6)
+                prog = curr_gain / trg_dist
+                bar = make_progress_bar(prog, 8)
+                trail_tag = " 🛡️<code>TRAIL</code>" if pos.get("trail_stage") else ""
+                in_t = pos["entry_time"][:5]
+                p_icon = "🟢" if pnl >= 0 else "🔴"
+                lines.append(
+                    f"<b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>{trail_tag}\n"
+                    f"  ├ 🕒 <code>{in_t}</code> │ In <b>₹{pos['entry_price']:.1f}</b> → LTP <b>₹{ltp:.1f}</b>\n"
+                    f"  ├ 🛡️ SL <code>₹{pos['sl']:.1f}</code> │ 🎯 TRG <code>₹{pos['tp']:.1f}</code>\n"
+                    f"  └ {bar} <b>{int(round(prog * 100))}%</b> │ {p_icon} <b>₹{pnl:+,.2f}</b>"
+                )
+
+        # 2. Completed Trades Ledger (#1, #2, #3...)
+        lines.append("\n📒 <b>TODAY'S TRADE LEDGER</b>")
+        lines.append("──────────────────────────────")
         if self.closed_trades:
-            lines.append("\n📒 <b>TODAY'S TRADES:</b>")
             for t in self.closed_trades:
                 icon = "✅" if t["pnl"] >= 0 else "❌"
                 in_t = t["entry_time"][:5]
                 out_t = t["exit_time"][:5]
                 lines.append(
-                    f"#{t['trade_no']} {icon} <b>{t['symbol']} {t['contract']} {t['side']}</b> | "
-                    f"{in_t}→{out_t} | {t['entry_price']:.1f}→{t['exit_price']:.1f} ({t['points']:+.1f}p) | "
-                    f"SL:{t['sl']:.1f} | TRG:{t['target']:.1f} | {t['exit_reason']} | <b>₹{t['pnl']:+.2f}</b>"
+                    f"<b>#{t['trade_no']}</b> {icon} <b>{t['symbol']}</b> <code>{t['contract']} {t['side']}</code>\n"
+                    f"  ├ 🕒 <code>{in_t}→{out_t}</code> │ ₹{t['entry_price']:.1f}→₹{t['exit_price']:.1f} (<b>{t['points']:+.1f}p</b>)\n"
+                    f"  └ SL:<code>{t['sl']:.1f}</code> │ TRG:<code>{t['target']:.1f}</code> │ {t['exit_reason']} │ <b>₹{t['pnl']:+,.2f}</b>"
                 )
+        elif not active_snap:
+            lines.append("  <i>Scanning Gann + Fuel setups across 10 markets...</i>")
 
-        with self.pos_lock:
-            active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
-
-        if active_snap:
-            lines.append("\n🔥 <b>ACTIVE POSITIONS:</b>")
-            for p_idx, pos in active_snap:
-                ltp = pos.get("last_ltp", pos["entry_price"])
-                is_short = pos["tx_side"] == "SELL"
-                pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
-                trail_tag = " [TRAIL]" if pos.get("trail_stage") else ""
-                in_t = pos["entry_time"][:5]
-                lines.append(
-                    f"#{pos['trade_no']} ⏳ <b>{p_idx} {pos['strike']} {pos['display_side']}</b>{trail_tag} | "
-                    f"In {in_t} | {pos['entry_price']:.1f} (LTP:{ltp:.1f}) | "
-                    f"SL:{pos['sl']:.1f} | TRG:{pos['tp']:.1f} | <b>₹{pnl:+.2f}</b>"
-                )
-
-        if not self.closed_trades and not active_snap:
-            lines.append("\n📒 <b>TODAY'S TRADES:</b> <i>No trades yet — scanning setups...</i>")
-
+        # 3. 10-Market Radar (5 Indices + 5 MCX Commodities)
         if self.last_summaries:
-            lines.append("\n📡 <b>MARKET PULSE:</b>")
-            for idx in INDICES:
+            lines.append("\n📡 <b>5 INDICES RADAR</b>")
+            lines.append("──────────────────────────────")
+            for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                 s = self.last_summaries.get(idx)
                 if not s:
                     continue
-                if s["is_mcx"]:
-                    lines.append(
-                        f"• 🛢️ <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | ΔOI {s['cum_pcr_diff']:+.0f} | {s['short_status']}"
-                    )
-                else:
-                    lines.append(
-                        f"• <b>{s['idx']}</b>: {s['spot']} | Fuel {s['fuel']} | PCR {s['pcr']} ({s['cum_pcr_diff']:+.2f}) | {s['short_status']}"
-                    )
+                lines.append(
+                    f"• <b>{s['idx']:<10}</b> <code>{s['spot']}</code> │ Fuel <b>{s['fuel']}</b> │ PCR {s['pcr']} │ {s['short_status']}"
+                )
+
+            lines.append("\n🛢️ <b>5 MCX COMMODITIES RADAR</b>")
+            lines.append("──────────────────────────────")
+            for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
+                s = self.last_summaries.get(idx)
+                if not s:
+                    continue
+                lines.append(
+                    f"• <b>{s['idx']:<10}</b> <code>{s['spot']}</code> │ Fuel <b>{s['fuel']}</b> │ ΔOI {s['cum_pcr_diff']:+.0f} │ {s['short_status']}"
+                )
 
         dashboard_text = "\n".join(lines)
         log.info(f"[DASHBOARD] Realized ₹{self.day_pnl:+.2f} | Live MTM ₹{live_mtm:+.2f} | Closed: {len(self.closed_trades)} | Active: {len(active_snap)}")
@@ -1121,8 +1187,9 @@ class IntradayV3Engine:
 
         buy_px = ltp if is_short else pos["entry_price"]
         sell_px = pos["entry_price"] if is_short else ltp
-        charges = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, pos["qty"], is_mcx)
-        net_pnl = round(gross_pnl - charges, 2)
+        ch_info = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, pos["qty"], is_mcx)
+        total_charges = ch_info["total"]
+        net_pnl = round(gross_pnl - total_charges, 2)
 
         self.day_pnl = round(self.day_pnl + net_pnl, 2)
         if net_pnl < 0:
@@ -1147,7 +1214,9 @@ class IntradayV3Engine:
             "target": pos["tp"],
             "exit_reason": exit_reason,
             "gross_pnl": gross_pnl,
-            "charges": charges,
+            "brokerage": ch_info["brokerage"],
+            "taxes_other": ch_info["taxes_other"],
+            "charges": total_charges,
             "pnl": net_pnl,
             "day_pnl": self.day_pnl,
             "setup": pos["setup_name"],
@@ -1157,10 +1226,14 @@ class IntradayV3Engine:
 
         icon = "✅" if net_pnl >= 0 else "❌"
         exit_caption = (
-            f"🏁 {icon} <b>TRADE #{pos['trade_no']} EXIT — [{idx}] ({exit_reason})</b>\n"
-            f"Contract: <b>{pos['strike']} {pos['display_side']}</b> | {pos['entry_time'][:5]} → {exit_time_str[:5]}\n"
-            f"Entry: ₹{pos['entry_price']:.2f} → Exit: ₹{ltp:.2f} ({pts:+.2f} pts)\n"
-            f"Gross: ₹{gross_pnl:+.2f} | Charges (Upstox): ₹{charges:.2f} | <b>Net PnL: ₹{net_pnl:+.2f}</b>"
+            f"🏁 {icon} <b>TRADE #{pos['trade_no']} CLOSED • {idx}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Contract:</b> <code>{pos['strike']} {pos['display_side']}</code> │ <b>{exit_reason}</b>\n"
+            f"🕒 <b>Time:</b> <code>{pos['entry_time'][:5]} → {exit_time_str[:5]}</code>\n"
+            f"💵 <b>Price:</b> ₹{pos['entry_price']:.2f} → ₹{ltp:.2f} (<b>{pts:+.2f} pts</b>)\n"
+            f"📊 <b>Gross PnL:</b> ₹{gross_pnl:+,.2f}\n"
+            f"🧾 <b>Charges:</b> -₹{total_charges:.2f} <i>(Brk ₹{ch_info['brokerage']:.2f} + Tax/STT ₹{ch_info['taxes_other']:.2f})</i>\n"
+            f"💰 <b>Net PnL:</b> <b>₹{net_pnl:+,.2f}</b>  │  <b>Day Net:</b> <b>₹{self.day_pnl:+,.2f}</b>"
         )
         notify(exit_caption)
 
@@ -1168,7 +1241,7 @@ class IntradayV3Engine:
         spot_now = float(df_plot["close"].iloc[-1]) if not df_plot.empty else pos.get("spot_entry", 0.0)
         send_telegram_chart(
             df_plot,
-            title=f"{idx} 5M Exit | #{pos['trade_no']} {pos['strike']} {pos['display_side']} ({exit_reason})",
+            title=f"{idx} 5M EXIT │ #{pos['trade_no']} {pos['strike']} {pos['display_side']} ({exit_reason})",
             caption=exit_caption,
             gann_lvl=pos.get("gann_level", spot_now),
             spot_entry=pos.get("spot_entry", spot_now),
@@ -1256,8 +1329,11 @@ class IntradayV3Engine:
                     self.active_positions[idx]["sl"] = new_sl
                     self.active_positions[idx]["trail_stage"] = trail_label
             notify(
-                f"🛡️📈 <b>TRADE #{pos['trade_no']} TRAIL SL — [{idx}] ({trail_label})</b>\n"
-                f"Contract: {pos['strike']} | New SL: <b>₹{new_sl:.2f}</b> (LTP: ₹{ltp:.2f} | Target: ₹{tp:.2f})",
+                f"🛡️📈 <b>TRAIL SL LOCKED • TRADE #{pos['trade_no']} [{idx}]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>Stage:</b> {trail_label}\n"
+                f"🎯 <b>Contract:</b> <code>{pos['strike']}</code> │ <b>New SL: ₹{new_sl:.2f}</b>\n"
+                f"📊 <b>LTP:</b> ₹{ltp:.2f} │ <b>Target:</b> ₹{tp:.2f}",
                 silent=False,
             )
 
@@ -1557,15 +1633,17 @@ class IntradayV3Engine:
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
             entry_msg = (
-                f"🛢️🚀 <b>TRADE #{t_no} ENTRY — [{idx}] {tx_side} ({entry_time_str[:5]} IST)</b>\n"
-                f"Contract: <b>{sym}</b> | Qty: {qty} ({lots} Lot)\n"
-                f"Entry: <b>₹{fill:.1f}</b> | Swing SL: <b>₹{sl_price:.1f}</b> (-{sl_points:.1f}p) | Target (1:2): <b>₹{tp_price:.1f}</b> (+{tp_points:.1f}p)\n"
-                f"Setup: {setup['name']} | Fuel: {fuel} | ΔOI: {oi_change:+.0f}"
+                f"🛢️🚀 <b>NEW ENTRY • TRADE #{t_no} [{idx}]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>Contract:</b> <code>{sym}</code> (<b>{tx_side}</b>) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
+                f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.1f}</b>\n"
+                f"🛡️ <b>Swing SL:</b> ₹{sl_price:.1f} (<code>-{sl_points:.1f}p</code>) │ 🎯 <b>Target (1:2):</b> ₹{tp_price:.1f} (<code>+{tp_points:.1f}p</code>)\n"
+                f"📐 <b>Setup:</b> {setup['name']} │ 🔥 <b>Fuel:</b> {fuel} │ 📊 <b>ΔOI:</b> {oi_change:+.0f}"
             )
             notify(entry_msg)
             send_telegram_chart(
                 df,
-                title=f"{idx} 5M Setup | #{t_no} {sym} {tx_side} (RR 1:2)",
+                title=f"{idx} 5M ENTRY │ #{t_no} {sym} {tx_side} (RR 1:2)",
                 caption=entry_msg,
                 gann_lvl=setup["gann_level"],
                 spot_entry=fut_price,
@@ -1655,15 +1733,17 @@ class IntradayV3Engine:
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
             entry_msg = (
-                f"🚀 <b>TRADE #{t_no} ENTRY — [{idx}] ({entry_time_str[:5]} IST)</b>\n"
-                f"Strike: <b>{atm_strike} {setup['side']}</b> ({exp_label}) | Qty: {qty}\n"
-                f"Entry: <b>₹{fill:.2f}</b> | Swing SL: <b>₹{sl_price:.2f}</b> (-{sl_points:.1f}p) | Target (1:2): <b>₹{tp_price:.2f}</b> (+{tp_points:.1f}p)\n"
-                f"Setup: {setup['name']} | Spot SL: {spot_sl_equiv} | Fuel: {fuel} | PCR: {pcr}"
+                f"🚀 <b>NEW ENTRY • TRADE #{t_no} [{idx}]</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>Strike:</b> <code>{atm_strike} {setup['side']}</code> ({exp_label}) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
+                f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.2f}</b>\n"
+                f"🛡️ <b>Swing SL:</b> ₹{sl_price:.2f} (<code>-{sl_points:.1f}p</code>) │ 🎯 <b>Target (1:2):</b> ₹{tp_price:.2f} (<code>+{tp_points:.1f}p</code>)\n"
+                f"📐 <b>Setup:</b> {setup['name']} │ 🔥 <b>Fuel:</b> {fuel} │ 📊 <b>PCR:</b> {pcr}"
             )
             notify(entry_msg)
             send_telegram_chart(
                 df,
-                title=f"{idx} 5M Setup | #{t_no} {atm_strike} {setup['side']} (RR 1:2)",
+                title=f"{idx} 5M ENTRY │ #{t_no} {atm_strike} {setup['side']} (RR 1:2)",
                 caption=entry_msg,
                 gann_lvl=setup["gann_level"],
                 spot_entry=spot_close,
@@ -1716,10 +1796,12 @@ class IntradayV3Engine:
             sys.exit(1)
 
         self.init_contracts()
-        self.init_websocket_streamer()
         notify(
-            f"⚡ <b>V3 TICK-BY-TICK ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"5 Indices ({INDEX_START_TIME}–{INDEX_END_TIME}) + 5 MCX Futures: Crude, NG, Gold, Silver, Copper ({MCX_START_TIME}–{MCX_END_TIME} IST)"
+            f"⚡ <b>V3 QUANT ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📡 <b>5 Indices:</b> {INDEX_START_TIME}–{INDEX_END_TIME} IST\n"
+            f"🛢️ <b>5 MCX Futures:</b> Crude, NG, Gold, Silver, Copper ({MCX_START_TIME}–{MCX_END_TIME} IST)\n"
+            f"🎯 <b>Mode:</b> Scanning → On-Demand Tick-by-Tick WS on Entry │ RR 1:2"
         )
 
         while True:
@@ -1737,8 +1819,8 @@ class IntradayV3Engine:
                 self.render_live_dashboard(hhmm)
                 notify(build_master_journal_report(now_ist))
                 notify(
-                    f"🛑 <b>SESSION CLOSED</b> | Total Trades: {len(self.closed_trades)} | "
-                    f"Final Day Net PnL: <b>₹{self.day_pnl:+.2f}</b>"
+                    f"🛑 <b>SESSION CLOSED</b> │ Total Trades: <b>{len(self.closed_trades)}</b> │ "
+                    f"Final Day Net PnL: <b>₹{self.day_pnl:+,.2f}</b>"
                 )
                 break
 
@@ -1753,6 +1835,19 @@ class IntradayV3Engine:
             if not risk_locked:
                 for idx, cfg in INDICES.items():
                     if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
+                        if idx not in self.last_summaries:
+                            spot_df = fetch_intraday_5m(cfg["spot_key"])
+                            if not spot_df.empty:
+                                last_cl = float(spot_df["close"].iloc[-1])
+                                self.last_summaries[idx] = {
+                                    "idx": idx,
+                                    "is_mcx": False,
+                                    "spot": int(round(last_cl)),
+                                    "fuel": 0,
+                                    "pcr": 0.0,
+                                    "cum_pcr_diff": 0.0,
+                                    "short_status": "CLOSED 🏁",
+                                }
                         continue
                     res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
