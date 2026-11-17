@@ -33,6 +33,7 @@ MIN_FUEL_SCORE = 45.0            # 45 and above for all instruments
 INDEX_START_TIME = "09:20"
 INDEX_END_TIME = "15:10"
 INDEX_EXIT_TIME = "15:15"
+EXPIRY_NEXT_SWITCH_TIME = "13:30"  # Switch to next expiry after 1:30 PM on expiry day
 
 MCX_START_TIME = "09:20"
 MCX_END_TIME = "23:00"
@@ -48,6 +49,17 @@ SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
 PULSE_INTERVAL_SEC = 300         # Guaranteed 5-minute Market Pulse
 POS_ALERT_INTERVAL_SEC = 180     # Guaranteed 3-minute Active Position MTM alert
 JOURNAL_FILE = "trade_journal.csv"
+
+# --- TRAILING SL, FUEL FINISH & THETA FLAT-LTP EXIT PARAMETERS ---
+TRAIL_BE_PROGRESS = 0.45         # Move SL to Cost-to-Cost at 45% of Target
+TRAIL_LOCK_PROGRESS = 0.70       # Activate Swing + 50% Profit Lock at 70% of Target
+TRAIL_PROFIT_FLOOR = 0.50        # Lock at least 50% of target gain once 70% reached
+
+FUEL_FINISH_MIN_PROGRESS = 0.25  # Check Fuel Finish once >= 25% of Target reached
+FUEL_FINISH_THRESHOLD = 22.0     # Fuel drop threshold signaling movement finish
+
+FLAT_LTP_NORMAL_SEC = 900        # 15 mins flat LTP (profit/loss/entry) -> Theta Exit
+FLAT_LTP_EXPIRY_SEC = 600        # 10 mins flat LTP on expiry day -> Fast Theta Exit
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 CRUDEOIL_CAPITAL = float(os.getenv("CRUDEOIL_CAPITAL", "150000"))
@@ -308,7 +320,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
         return []
 
 
-def get_nearest_expiry(spot_key: str) -> str:
+def get_valid_expiries(spot_key: str) -> list:
     try:
         url = "https://api.upstox.com/v2/option/contract"
         params = {"instrument_key": spot_key}
@@ -316,11 +328,10 @@ def get_nearest_expiry(spot_key: str) -> str:
         contracts = resp.json().get("data", [])
         expiries = sorted({c.get("expiry") for c in contracts if c.get("expiry")})
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
-        valid = [e for e in expiries if e >= today_str]
-        return valid[0] if valid else ""
+        return [e for e in expiries if e >= today_str]
     except Exception as e:
         log.error(f"Expiry fetch error ({spot_key}): {e}")
-        return ""
+        return []
 
 
 # ==============================================================================
@@ -551,12 +562,33 @@ class IntradayV3Engine:
                     f"| Lot: {cfg['lot_size']} | 1-Lot Intraday Margin: ₹{margin_1_lot:.2f}"
                 )
             else:
-                exp = get_nearest_expiry(cfg["spot_key"])
-                self.expiries[idx] = exp
+                valid_exps = get_valid_expiries(cfg["spot_key"])
+                self.expiries[idx] = valid_exps
+                exp_display = valid_exps[0] if valid_exps else "N/A"
+                next_display = valid_exps[1] if len(valid_exps) > 1 else exp_display
                 log.info(
-                    f"[{idx}] Option Expiry: {exp} | FUT Volume Key: {fut_info.get('instrument_key') or 'SPOT_FALLBACK'} "
+                    f"[{idx}] Expiries: Current={exp_display}, Next={next_display} "
+                    f"| FUT Volume Key: {fut_info.get('instrument_key') or 'SPOT_FALLBACK'} "
                     f"({fut_info.get('trading_symbol', 'N/A')})"
                 )
+
+    def get_smart_expiry(self, idx: str, now_ist: datetime) -> tuple:
+        """
+        Returns (selected_expiry, is_today_expiry).
+        On Expiry Day after 13:30 IST, switches to Next Expiry to avoid extreme afternoon Theta decay.
+        """
+        valid_exps = self.expiries.get(idx, [])
+        if not valid_exps:
+            return "", False
+
+        today_str = now_ist.strftime("%Y-%m-%d")
+        hhmm = now_ist.strftime("%H:%M")
+        nearest = valid_exps[0]
+        is_today_exp = (nearest == today_str)
+
+        if is_today_exp and hhmm >= EXPIRY_NEXT_SWITCH_TIME and len(valid_exps) > 1:
+            return valid_exps[1], False
+        return nearest, is_today_exp
 
     def is_within_trade_window(self, idx: str, now_ist: datetime) -> bool:
         hhmm = now_ist.strftime("%H:%M")
@@ -617,6 +649,170 @@ class IntradayV3Engine:
             total_mtm += pnl
         return round(total_mtm, 2)
 
+    def close_position_now(self, idx: str, ltp: float, exit_reason: str, now_ist: datetime):
+        """Executes immediate exit order, updates PnL/Journal, and sends Telegram alert."""
+        pos = self.active_positions.get(idx)
+        if not pos:
+            return
+        is_short = pos["tx_side"] == "SELL"
+        close_side = "BUY" if is_short else "SELL"
+        place_marketable_limit_order(pos["instrument_key"], pos["qty"], close_side, ltp)
+
+        pnl = round((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"], 2)
+        self.day_pnl = round(self.day_pnl + pnl, 2)
+        if pnl < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+        journal_entry = {
+            "date": now_ist.strftime("%Y-%m-%d"),
+            "entry_time": pos.get("entry_time", ""),
+            "exit_time": now_ist.strftime("%H:%M:%S"),
+            "symbol": idx,
+            "contract": str(pos["strike"]),
+            "side": pos["display_side"],
+            "qty": pos["qty"],
+            "entry_price": pos["entry_price"],
+            "exit_price": ltp,
+            "sl": pos["sl"],
+            "target": pos["tp"],
+            "exit_reason": exit_reason,
+            "pnl": pnl,
+            "day_pnl": self.day_pnl,
+            "setup": pos["setup_name"],
+        }
+        self.closed_trades.append(journal_entry)
+        record_trade_journal(journal_entry)
+
+        del self.active_positions[idx]
+        notify(
+            f"🏁 <b>[{idx}] EXIT ({exit_reason})</b>\n"
+            f"Instrument: {pos['strike']} ({pos['display_side']}) | Entry: ₹{pos['entry_price']:.2f} → Exit: ₹{ltp:.2f}\n"
+            f"Trade PnL: <b>₹{pnl:+.2f}</b> | Day PnL: <b>₹{self.day_pnl:+.2f}</b>\n"
+            f"📒 Journal Updated ({len(self.closed_trades)} trades today)"
+        )
+
+    def evaluate_active_candle_exits(self, idx: str, df: pd.DataFrame, spot_close: float, price_change: float, fuel: float, atr14: float, now_ist: datetime):
+        """
+        Applies:
+        1. Hybrid Trailing SL (45% Target -> Cost-to-Cost; 70% Target -> Max of 50% Profit Floor OR 3-Candle Swing +/- ATR Buffer)
+        2. Fuel Finish Exit (Movement finished: >=25% Target gain + Fuel < 22 + opposing candle or 2 low-fuel bars)
+        3. Flat-LTP Theta Decay Exit (After entry, slight profit, or slight loss, if LTP stays flat in a tight band for 15 mins — or 10 mins on Expiry Day)
+        """
+        pos = self.active_positions.get(idx)
+        if not pos or len(df) < 4:
+            return
+
+        is_short = pos["tx_side"] == "SELL"
+        is_mcx = pos["type"] == "MCX_FUT"
+        entry = pos["entry_price"]
+        tp = pos["tp"]
+        ltp = pos.get("last_ltp", entry)
+
+        total_target_dist = abs(tp - entry)
+        if total_target_dist <= 0:
+            return
+
+        curr_gain = (entry - ltp) if is_short else (ltp - entry)
+        peak_gain = max(pos.get("peak_gain", 0.0), curr_gain)
+        if peak_gain > pos.get("peak_gain", 0.0):
+            pos["peak_gain"] = peak_gain
+            pos["last_peak_ts"] = time.time()
+
+        progress = peak_gain / total_target_dist
+        curr_progress = curr_gain / total_target_dist
+
+        # --- 1. HYBRID TRAILING SL (45% COST-TO-COST -> 70% SWING + PROFIT FLOOR) ---
+        recent_3 = df.iloc[-4:-1]  # Last 3 completed 5m candles
+        swing_low = float(recent_3["low"].min())
+        swing_high = float(recent_3["high"].max())
+
+        new_sl = pos["sl"]
+        trail_label = None
+
+        if progress >= TRAIL_LOCK_PROGRESS:
+            floor_sl = round(entry - total_target_dist * TRAIL_PROFIT_FLOOR, 1) if is_short else round(entry + total_target_dist * TRAIL_PROFIT_FLOOR, 1)
+
+            if is_mcx:
+                swing_sl = round(swing_high + 0.30 * atr14, 0) if is_short else round(swing_low - 0.30 * atr14, 0)
+                candidate_sl = min(floor_sl, swing_sl) if is_short else max(floor_sl, swing_sl)
+            else:
+                spot_entry = pos.get("spot_entry", spot_close)
+                if pos["side"] == "CE":
+                    spot_swing_buf = swing_low - 0.25 * atr14
+                    delta_spot = spot_swing_buf - spot_entry
+                else:
+                    spot_swing_buf = swing_high + 0.25 * atr14
+                    delta_spot = spot_entry - spot_swing_buf
+                swing_opt_sl = round(entry + delta_spot * 0.50, 1)
+                candidate_sl = max(floor_sl, swing_opt_sl)
+
+            if is_short and candidate_sl < new_sl and candidate_sl > ltp + 1.0:
+                new_sl = candidate_sl
+                trail_label = "70% PROFIT + SWING TRAIL"
+            elif not is_short and candidate_sl > new_sl and candidate_sl < ltp - 1.0:
+                new_sl = candidate_sl
+                trail_label = "70% PROFIT + SWING TRAIL"
+
+        elif progress >= TRAIL_BE_PROGRESS:
+            be_sl = round(entry - 0.5, 1) if is_short else round(entry + 0.5, 1)
+            if is_short and be_sl < new_sl and be_sl > ltp + 1.0:
+                new_sl = be_sl
+                trail_label = "COST-TO-COST (45% TRG)"
+            elif not is_short and be_sl > new_sl and be_sl < ltp - 1.0:
+                new_sl = be_sl
+                trail_label = "COST-TO-COST (45% TRG)"
+
+        if trail_label and new_sl != pos["sl"]:
+            pos["sl"] = new_sl
+            pos["trail_stage"] = trail_label
+            notify(
+                f"🛡️📈 <b>[{idx}] TRAIL SL UPDATED ({trail_label})</b>\n"
+                f"Instrument: {pos['strike']} | New SL: <b>₹{new_sl:.2f}</b> (LTP: ₹{ltp:.2f} | Target: ₹{tp:.2f})",
+                silent=False,
+            )
+
+        # --- 2. FUEL FINISH EXIT (MOVEMENT FINISHED) ---
+        low_fuel_streak = pos.get("low_fuel_streak", 0)
+        if fuel < 25.0:
+            low_fuel_streak += 1
+        else:
+            low_fuel_streak = 0
+        pos["low_fuel_streak"] = low_fuel_streak
+
+        opposing_move = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
+        if curr_progress >= FUEL_FINISH_MIN_PROGRESS and (
+            (fuel < FUEL_FINISH_THRESHOLD and opposing_move) or low_fuel_streak >= 2
+        ):
+            self.close_position_now(idx, ltp, f"FUEL_FINISH_EXIT (Fuel {int(fuel)})", now_ist)
+            return
+
+        # --- 3. FLAT-LTP THETA DECAY EXIT (AFTER ENTRY / SLIGHT PROFIT / SLIGHT LOSS) ---
+        # Tracks rolling LTP range over the last 10 mins (expiry day) or 15 mins (normal day).
+        # If LTP fails to expand by even 25% of target distance during that window, exit to prevent Theta erosion.
+        now_ts = time.time()
+        ltp_hist = pos.setdefault("ltp_window", deque())
+        ltp_hist.append((now_ts, ltp))
+
+        flat_limit_sec = FLAT_LTP_EXPIRY_SEC if pos.get("is_expiry_day", False) else FLAT_LTP_NORMAL_SEC
+        while ltp_hist and (now_ts - ltp_hist[0][0]) > flat_limit_sec:
+            ltp_hist.popleft()
+
+        window_span = now_ts - ltp_hist[0][0] if ltp_hist else 0.0
+        if not is_mcx and window_span >= (flat_limit_sec - 20):
+            prices_in_win = [p for _, p in ltp_hist]
+            win_range = max(prices_in_win) - min(prices_in_win)
+            flat_threshold = max(total_target_dist * 0.25, entry * 0.03)
+            if win_range <= flat_threshold and curr_progress < TRAIL_BE_PROGRESS:
+                mins_stalled = int(round(window_span / 60.0))
+                self.close_position_now(
+                    idx,
+                    ltp,
+                    f"THETA_DECAY_FLAT_EXIT ({mins_stalled}m flat)",
+                    now_ist,
+                )
+
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
         if not cfg["spot_key"]:
@@ -645,6 +841,8 @@ class IntradayV3Engine:
         gann_levels = gann["all"]
 
         chain = []
+        active_expiry = ""
+        is_today_exp = False
         if is_mcx:
             curr_oi = float(curr["oi"])
             prev_oi = float(prev["oi"])
@@ -653,16 +851,21 @@ class IntradayV3Engine:
             oi_pcr_bear_ok = price_change < 0
             pcr, open_p, cum_pcr_diff = 0.0, 0.0, round(oi_change, 0)
         else:
-            chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
+            active_expiry, is_today_exp = self.get_smart_expiry(idx, now_ist)
+            chain = fetch_option_chain(cfg["spot_key"], active_expiry)
             pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
 
         if idx in self.active_positions:
             self.pending_setups[idx] = None
+            self.evaluate_active_candle_exits(idx, df, spot_close, price_change, fuel, atr14, now_ist)
+
+        if idx in self.active_positions:
             pos = self.active_positions[idx]
             ltp_now = pos.get("last_ltp", spot_close if is_mcx else pos["entry_price"])
             is_short = pos["tx_side"] == "SELL"
             pos_mtm = (pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]
-            status_tag = f"IN TRADE ({pos['display_side']} | MTM ₹{pos_mtm:+.0f})🔥"
+            trail_badge = " [TRAIL]" if pos.get("trail_stage") else ""
+            status_tag = f"IN TRADE ({pos['display_side']}{trail_badge} | MTM ₹{pos_mtm:+.0f})🔥"
             return {
                 "idx": idx,
                 "is_mcx": is_mcx,
@@ -745,7 +948,10 @@ class IntradayV3Engine:
                 if is_mcx:
                     self.try_execute_mcx_fut_entry(idx, cfg, pending, spot_close, price_change, fuel, cum_pcr_diff, atr14, now_ist)
                 else:
-                    self.try_execute_option_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14, now_ist)
+                    self.try_execute_option_entry(
+                        idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff,
+                        chain, atr14, now_ist, active_expiry, is_today_exp
+                    )
 
         status_tag = f"WATCHING👀 (Gann {int(sup)}-{int(res)})"
         if idx in self.active_positions:
@@ -808,6 +1014,7 @@ class IntradayV3Engine:
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
             sym = self.fut_contracts.get(idx, {}).get("trading_symbol", "CRUDEOIL FUT")
+            now_ts = time.time()
             self.active_positions[idx] = {
                 "type": "MCX_FUT",
                 "instrument_key": inst_key,
@@ -817,14 +1024,22 @@ class IntradayV3Engine:
                 "display_side": tx_side,
                 "qty": qty,
                 "entry_price": fill,
+                "spot_entry": fut_price,
                 "last_ltp": fill,
                 "sl": sl_price,
                 "tp": tp_price,
+                "peak_gain": 0.0,
+                "entry_ts": now_ts,
+                "last_peak_ts": now_ts,
+                "trail_stage": None,
+                "low_fuel_streak": 0,
+                "is_expiry_day": False,
+                "ltp_window": deque([(now_ts, fill)]),
                 "setup_name": setup["name"],
                 "entry_time": now_ist.strftime("%H:%M:%S"),
             }
             self.pending_setups[idx] = None
-            self.last_pos_alert_ts = time.time()
+            self.last_pos_alert_ts = now_ts
             notify(
                 f"🛢️🚀 <b>[{idx} FUTURES] {tx_side} TRIGGERED ({setup['name']})</b>\n"
                 f"Contract: <b>{sym}</b> | Qty: {qty} ({lots} Lot)\n"
@@ -833,7 +1048,7 @@ class IntradayV3Engine:
                 f"Fuel: {fuel} | ΔPrice: {price_change:+.1f} | ΔOI: {oi_change:+.0f}"
             )
 
-    def try_execute_option_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14, now_ist):
+    def try_execute_option_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14, now_ist, active_expiry, is_today_exp):
         if not chain:
             return
         atm_strike = round(spot_close / cfg["step"]) * cfg["step"]
@@ -872,6 +1087,8 @@ class IntradayV3Engine:
         order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp)
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
+            now_ts = time.time()
+            exp_label = "0DTE" if is_today_exp else active_expiry
             self.active_positions[idx] = {
                 "type": "INDEX_OPT",
                 "instrument_key": inst_key,
@@ -881,17 +1098,25 @@ class IntradayV3Engine:
                 "display_side": setup["side"],
                 "qty": qty,
                 "entry_price": fill,
+                "spot_entry": spot_close,
                 "last_ltp": fill,
                 "sl": sl_price,
                 "tp": tp_price,
+                "peak_gain": 0.0,
+                "entry_ts": now_ts,
+                "last_peak_ts": now_ts,
+                "trail_stage": None,
+                "low_fuel_streak": 0,
+                "is_expiry_day": is_today_exp,
+                "ltp_window": deque([(now_ts, fill)]),
                 "setup_name": setup["name"],
                 "entry_time": now_ist.strftime("%H:%M:%S"),
             }
             self.pending_setups[idx] = None
-            self.last_pos_alert_ts = time.time()
+            self.last_pos_alert_ts = now_ts
             notify(
                 f"🚀 <b>[{idx}] ENTRY TRIGGERED ({setup['name']})</b>\n"
-                f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
+                f"Strike: <b>{atm_strike} {setup['side']}</b> ({exp_label}) | Qty: {qty}\n"
                 f"Entry: ₹{fill:.2f} | SL: ₹{sl_price:.2f} | Target: ₹{tp_price:.2f}\n"
                 f"Spot: {spot_close:.2f} ({price_change:+.1f}) | Gann: {setup['gann_level']} ({setup['pattern']})\n"
                 f"Fuel: {fuel} | PCR: {open_p}→{pcr} (Cum {cum_pcr_diff:+.2f})"
@@ -905,13 +1130,18 @@ class IntradayV3Engine:
         quotes = fetch_ltp_quote(keys)
 
         for idx in list(self.active_positions.keys()):
-            pos = self.active_positions[idx]
+            pos = self.active_positions.get(idx)
+            if not pos:
+                continue
             q_data = quotes.get(pos["instrument_key"], {})
-            if "last_price" not in q_data:
-                log.warning(f"[{idx}] Quote lookup missing for {pos['instrument_key']} (available keys: {list(quotes.keys())})")
             ltp = float(q_data.get("last_price", pos.get("last_ltp", pos["entry_price"])))
             pos["last_ltp"] = ltp
             is_short = pos["tx_side"] == "SELL"
+
+            curr_gain = (pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])
+            if curr_gain > pos.get("peak_gain", 0.0):
+                pos["peak_gain"] = curr_gain
+                pos["last_peak_ts"] = time.time()
 
             exit_reason = None
             if pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
@@ -919,51 +1149,16 @@ class IntradayV3Engine:
             elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
                 exit_reason = f"MCX_AUTO_EXIT ({MCX_EXIT_TIME})"
             elif not is_short and ltp <= pos["sl"]:
-                exit_reason = "STOP_LOSS_HIT"
+                exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
             elif not is_short and ltp >= pos["tp"]:
                 exit_reason = "TARGET_1_HIT"
             elif is_short and ltp >= pos["sl"]:
-                exit_reason = "STOP_LOSS_HIT"
+                exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
             elif is_short and ltp <= pos["tp"]:
                 exit_reason = "TARGET_1_HIT"
 
             if exit_reason:
-                close_side = "BUY" if is_short else "SELL"
-                place_marketable_limit_order(pos["instrument_key"], pos["qty"], close_side, ltp)
-                pnl = round((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"], 2)
-                self.day_pnl = round(self.day_pnl + pnl, 2)
-                if pnl < 0:
-                    self.consecutive_losses += 1
-                else:
-                    self.consecutive_losses = 0
-
-                journal_entry = {
-                    "date": now_ist.strftime("%Y-%m-%d"),
-                    "entry_time": pos.get("entry_time", ""),
-                    "exit_time": now_ist.strftime("%H:%M:%S"),
-                    "symbol": idx,
-                    "contract": str(pos["strike"]),
-                    "side": pos["display_side"],
-                    "qty": pos["qty"],
-                    "entry_price": pos["entry_price"],
-                    "exit_price": ltp,
-                    "sl": pos["sl"],
-                    "target": pos["tp"],
-                    "exit_reason": exit_reason,
-                    "pnl": pnl,
-                    "day_pnl": self.day_pnl,
-                    "setup": pos["setup_name"],
-                }
-                self.closed_trades.append(journal_entry)
-                record_trade_journal(journal_entry)
-
-                del self.active_positions[idx]
-                notify(
-                    f"🏁 <b>[{idx}] EXIT ({exit_reason})</b>\n"
-                    f"Instrument: {pos['strike']} ({pos['display_side']}) | Entry: ₹{pos['entry_price']:.2f} → Exit: ₹{ltp:.2f}\n"
-                    f"Trade PnL: <b>₹{pnl:+.2f}</b> | Day PnL: <b>₹{self.day_pnl:+.2f}</b>\n"
-                    f"📒 Journal Updated ({len(self.closed_trades)} trades today)"
-                )
+                self.close_position_now(idx, ltp, exit_reason, now_ist)
 
     def send_active_position_update(self, hhmm: str):
         """Sends a dedicated Telegram position MTM & SL/Target distance alert every 3 minutes."""
@@ -977,10 +1172,11 @@ class IntradayV3Engine:
             pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
             to_tp = round((ltp - pos["tp"]) if is_short else (pos["tp"] - ltp), 2)
             to_sl = round((pos["sl"] - ltp) if is_short else (ltp - pos["sl"]), 2)
+            trail_tag = f" ({pos['trail_stage']})" if pos.get("trail_stage") else ""
             pos_lines.append(
                 f"• <b>[{p_idx}] {pos['strike']} ({pos['display_side']})</b>\n"
                 f"  Entry: ₹{pos['entry_price']:.2f} | LTP: ₹{ltp:.2f} | MTM: <b>₹{pnl:+.2f}</b>\n"
-                f"  🎯 Target: ₹{pos['tp']:.2f} ({to_tp:+.1f} pts left) | 🛡️ SL: ₹{pos['sl']:.2f} ({to_sl:+.1f} pts buffer)"
+                f"  🎯 Target: ₹{pos['tp']:.2f} ({to_tp:+.1f} pts left) | 🛡️ SL{trail_tag}: ₹{pos['sl']:.2f} ({to_sl:+.1f} pts buffer)"
             )
         pos_lines.append(
             f"💰 Total Live MTM: <b>₹{live_mtm:+.2f}</b> | Realized: <b>₹{self.day_pnl:+.2f}</b>"
