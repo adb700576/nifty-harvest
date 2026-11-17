@@ -44,6 +44,7 @@ SL_MAX_PCT = 0.22                # Options SL cap (22%)
 FUT_SL_ATR_MULT = 1.00           # Crude Oil Futures SL = 1.0 * ATR(14)
 RR_RATIO = 1.50                  # 1 : 1.5 Risk-to-Reward
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
+PULSE_INTERVAL_SEC = 300         # Guaranteed 5-minute Telegram pulse
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 CRUDEOIL_CAPITAL = float(os.getenv("CRUDEOIL_CAPITAL", "150000"))
@@ -138,10 +139,6 @@ def upstox_headers():
 
 
 def get_active_future_contract(idx: str) -> dict:
-    """
-    Uses Upstox GET /v2/instruments/search API to fetch the exact active
-    current-month Future contract (instrument_key, lot_size, trading_symbol, expiry).
-    """
     exchange = "BSE" if idx == "SENSEX" else ("MCX" if idx == "CRUDEOIL" else "NSE")
     url = "https://api.upstox.com/v2/instruments/search"
 
@@ -229,7 +226,6 @@ def fetch_ltp_quote(instrument_keys: list) -> dict:
 
 
 def fetch_required_margin(instrument_key: str, lots_or_qty: int, side: str, product: str = "I") -> float:
-    """Calls Upstox POST /v2/charges/margin API to retrieve exact margin."""
     try:
         url = "https://api.upstox.com/v2/charges/margin"
         payload = {
@@ -285,7 +281,6 @@ def get_nearest_expiry(spot_key: str) -> str:
 # 4. GANN LEVELS, 6 CANDLE PATTERNS & FUEL SCORE (WICK + 1.2x PREV-20 ATR)
 # ==============================================================================
 def compute_gann_levels(price: float, step: int) -> dict:
-    """Computes Gann 0.50 Square-of-9 lattice levels around current price."""
     root = math.sqrt(price)
     base_floor = math.floor(root * 2) / 2.0
     levels = [round((base_floor + k * 0.5) ** 2, 2) for k in range(-3, 5)]
@@ -299,11 +294,6 @@ def compute_gann_levels(price: float, step: int) -> dict:
 
 
 def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) -> dict:
-    """
-    Checks ONLY the 6 requested patterns near Gann levels (above or below within 0.40 ATR):
-    Bullish (CE / BUY): Morning Star, Hammer, Bullish Engulfing
-    Bearish (PE / SELL): Evening Star, Reverse Hammer (Shooting Star), Bearish Engulfing
-    """
     if len(df) < 3:
         return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
 
@@ -377,13 +367,7 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
 
 
 def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Computes 0-100 Fuel Score using:
-    1. Real Futures Volume Surge (max 40 pts)
-    2. Current Candle TR >= 1.2 * Previous 20-Candle ATR Expansion (max 30 pts)
-    3. Wick Rejection Bonus (Hammer/Reverse Hammer) OR Strong Body (Engulfing) (max 20 pts)
-    """
-    if spot_df.empty or len(spot_df) < 10:
+    if spot_df.empty or len(spot_df) < 3:
         return spot_df
 
     prev_close = spot_df["close"].shift(1).fillna(spot_df["open"])
@@ -418,8 +402,9 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
         curr_tr = row["tr"]
 
         # 1. Real Futures Volume Surge (max 40 pts)
-        if i >= 6 and spot_df["active_vol"].iloc[i - 6 : i].median() > 0:
-            med_vol = spot_df["active_vol"].iloc[i - 6 : i].median()
+        lookback = min(i, 6)
+        if lookback >= 1 and spot_df["active_vol"].iloc[i - lookback : i].median() > 0:
+            med_vol = spot_df["active_vol"].iloc[i - lookback : i].median()
             vol_ratio = row["active_vol"] / med_vol
             vol_pts = min(40.0, max(0.0, (vol_ratio - 0.75) * 32.0))
         else:
@@ -498,7 +483,7 @@ class IntradayV3Engine:
         self.active_positions = {}
         self.day_pnl = 0.0
         self.consecutive_losses = 0
-        self.last_pulse_min = -1
+        self.last_pulse_ts = 0.0
 
     def init_contracts(self):
         for idx, cfg in INDICES.items():
@@ -510,7 +495,6 @@ class IntradayV3Engine:
                     cfg["lot_size"] = fut_info["lot_size"]
                 if fut_info.get("freeze_quantity"):
                     cfg["freeze_qty"] = fut_info["freeze_quantity"]
-                # Pass 1 lot to MCX margin check so required_margin reflects 1 lot accurately
                 margin_1_lot = (
                     fetch_required_margin(cfg["spot_key"], 1, "BUY", "I")
                     if cfg["spot_key"]
@@ -536,11 +520,6 @@ class IntradayV3Engine:
         return INDEX_START_TIME <= hhmm <= INDEX_END_TIME
 
     def analyze_oi_and_pcr(self, idx: str, chain: list):
-        """
-        Tracks BOTH:
-        1. Cumulative Day PCR Trend from Open (e.g. 1.45 -> 0.85 Bearish | 0.30 -> 0.75 Bullish)
-        2. Short-term PCR Direction (Rising/Falling) + Change in OI (Put OI vs Call OI)
-        """
         if not chain:
             return 1.0, 1.0, 0.0, False, False
 
@@ -579,7 +558,6 @@ class IntradayV3Engine:
         return pcr, open_p, cum_pcr_diff, bull_confirmed, bear_confirmed
 
     def compute_live_mtm(self) -> float:
-        """Calculates real-time unrealized MTM PnL across all open positions."""
         if not self.active_positions:
             return 0.0
         keys = [p["instrument_key"] for p in self.active_positions.values()]
@@ -600,7 +578,7 @@ class IntradayV3Engine:
             return None
 
         spot_df = fetch_intraday_5m(cfg["spot_key"])
-        if spot_df.empty or len(spot_df) < 10:
+        if spot_df.empty or len(spot_df) < 3:
             return None
 
         fut_key = self.fut_contracts.get(idx, {}).get("instrument_key", "")
@@ -616,13 +594,11 @@ class IntradayV3Engine:
         atr14 = max(float(curr["atr14"]), 1.0)
         fuel = float(curr["fuel"])
 
-        # 1. Gann Levels & 6 Candle Patterns
         gann = compute_gann_levels(spot_close, cfg["step"])
         sup = gann["support"]
         res = gann["resistance"]
         gann_levels = gann["all"]
 
-        # 2. OI & PCR Confirmation
         chain = []
         if is_mcx:
             curr_oi = float(curr["oi"])
@@ -635,7 +611,6 @@ class IntradayV3Engine:
             chain = fetch_option_chain(cfg["spot_key"], self.expiries.get(idx, ""))
             pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
 
-        # FIX: If already IN TRADE for this instrument, clear any pending setup and skip new signal arming
         if idx in self.active_positions:
             self.pending_setups[idx] = None
             pos = self.active_positions[idx]
@@ -675,7 +650,6 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # --- PURE 6-FACTOR SIGNAL GENERATION ---
         new_signal = None
         if near_gann is not None and bull_pattern is not None and price_change > 0 and oi_pcr_bull_ok:
             next_res = next((lvl for lvl in gann_levels if lvl > spot_close), res)
@@ -751,7 +725,6 @@ class IntradayV3Engine:
         }
 
     def try_execute_mcx_fut_entry(self, idx, cfg, setup, fut_price, price_change, fuel, oi_change, atr14):
-        """Executes ONLY Futures BUY or SELL for CRUDEOIL (No Options) using Upstox Margin API."""
         inst_key = cfg["spot_key"]
         lot_size = cfg["lot_size"]
         tx_side = "BUY" if setup["side"] == "CE" else "SELL"
@@ -769,7 +742,6 @@ class IntradayV3Engine:
                 log.info(f"[{idx}] Entry skipped due to high spread: {spread_pct:.2f}%")
                 return
 
-        # Fetch exact required margin for 1 lot via POST /v2/charges/margin
         req_margin_1lot = fetch_required_margin(inst_key, 1, tx_side, "I")
         if req_margin_1lot > 0:
             lots = max(1, int(CRUDEOIL_CAPITAL // req_margin_1lot))
@@ -777,7 +749,6 @@ class IntradayV3Engine:
             lots = 1
         qty = min(lots * lot_size, cfg["freeze_qty"])
 
-        # ATR-based Stop Loss & 1:1.5 Target for Futures
         sl_points = round(max(atr14 * FUT_SL_ATR_MULT, 10.0), 0)
         tp_points = round(sl_points * RR_RATIO, 0)
 
@@ -959,8 +930,9 @@ class IntradayV3Engine:
                     if res:
                         summaries.append(res)
 
-            if now_ist.minute % 5 == 0 and now_ist.minute != self.last_pulse_min and summaries:
-                self.last_pulse_min = now_ist.minute
+            now_ts = time.time()
+            if summaries and (now_ts - self.last_pulse_ts >= PULSE_INTERVAL_SEC):
+                self.last_pulse_ts = now_ts
                 live_mtm = self.compute_live_mtm()
                 net_pnl = round(self.day_pnl + live_mtm, 2)
                 lines = [
@@ -978,7 +950,7 @@ class IntradayV3Engine:
                         )
                 notify("\n".join(lines), silent=True)
 
-            time.sleep(20)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
