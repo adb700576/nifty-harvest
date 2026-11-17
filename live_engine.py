@@ -1,4 +1,5 @@
 import os
+import csv
 import sys
 import time
 import math
@@ -44,7 +45,9 @@ SL_MAX_PCT = 0.22                # Options SL cap (22%)
 FUT_SL_ATR_MULT = 1.00           # Crude Oil Futures SL = 1.0 * ATR(14)
 RR_RATIO = 1.50                  # 1 : 1.5 Risk-to-Reward
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
-PULSE_INTERVAL_SEC = 300         # Guaranteed 5-minute Telegram pulse
+PULSE_INTERVAL_SEC = 300         # Guaranteed 5-minute Market Pulse
+POS_ALERT_INTERVAL_SEC = 180     # Guaranteed 3-minute Active Position MTM alert
+JOURNAL_FILE = "trade_journal.csv"
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 CRUDEOIL_CAPITAL = float(os.getenv("CRUDEOIL_CAPITAL", "150000"))
@@ -98,7 +101,7 @@ INDICES = {
 }
 
 # ==============================================================================
-# 2. TELEGRAM & GITHUB MIRROR LOGGER (WITH 2-ATTEMPT RETRY)
+# 2. TELEGRAM (WITH RETRY), MIRROR LOGGER & TRADE JOURNAL
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -125,6 +128,37 @@ def notify(msg: str, silent: bool = False):
                 time.sleep(0.5)
             else:
                 log.warning(f"Telegram send error after retry: {e}")
+
+
+def record_trade_journal(row: dict):
+    """Appends completed trade details to trade_journal.csv."""
+    file_exists = os.path.isfile(JOURNAL_FILE)
+    fieldnames = [
+        "date",
+        "entry_time",
+        "exit_time",
+        "symbol",
+        "contract",
+        "side",
+        "qty",
+        "entry_price",
+        "exit_price",
+        "sl",
+        "target",
+        "exit_reason",
+        "pnl",
+        "day_pnl",
+        "setup",
+    ]
+    try:
+        with open(JOURNAL_FILE, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        log.info(f"[JOURNAL] Saved trade to {JOURNAL_FILE}: {row['contract']} PnL ₹{row['pnl']:+.2f}")
+    except Exception as e:
+        log.error(f"Journal write error: {e}")
 
 
 # ==============================================================================
@@ -213,13 +247,25 @@ def fetch_intraday_5m(instrument_key: str) -> pd.DataFrame:
 
 
 def fetch_ltp_quote(instrument_keys: list) -> dict:
+    """
+    Fetches live quotes from Upstox V2 and normalizes keys so both
+    'NSE_FO|62461' / 'MCX_FO|573422' (pipe) and ':' (colon) resolve seamlessly.
+    """
     if not instrument_keys:
         return {}
     try:
         url = "https://api.upstox.com/v2/market-quote/quotes"
         params = {"instrument_key": ",".join(instrument_keys)}
         resp = requests.get(url, headers=upstox_headers(), params=params, timeout=10)
-        return resp.json().get("data", {})
+        raw_data = resp.json().get("data", {})
+        normalized = {}
+        for k, v in raw_data.items():
+            normalized[k] = v
+            normalized[k.replace(":", "|")] = v
+            inst_tok = v.get("instrument_token")
+            if inst_tok:
+                normalized[inst_tok] = v
+        return normalized
     except Exception as e:
         log.error(f"Quote fetch error: {e}")
         return {}
@@ -401,7 +447,6 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
         prev20_atr = max(row["prev20_atr"], 1e-6)
         curr_tr = row["tr"]
 
-        # 1. Real Futures Volume Surge (max 40 pts)
         lookback = min(i, 6)
         if lookback >= 1 and spot_df["active_vol"].iloc[i - lookback : i].median() > 0:
             med_vol = spot_df["active_vol"].iloc[i - lookback : i].median()
@@ -410,14 +455,12 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
         else:
             vol_pts = min(35.0, max(0.0, ((curr_tr / prev20_atr) - 0.7) * 35.0))
 
-        # 2. ATR Expansion: Full 30 pts when Current Candle TR >= 1.2 * Previous 20-Candle ATR
         atr_ratio = curr_tr / prev20_atr
         if atr_ratio >= 1.2:
             atr_pts = 30.0
         else:
             atr_pts = min(29.0, max(0.0, (atr_ratio / 1.2) * 28.0))
 
-        # 3. Wick Rejection Bonus (Hammer/Reverse Hammer) OR Strong Body (Engulfing) (max 20 pts)
         c_range = max(row["high"] - row["low"], 1e-6)
         body = abs(row["close"] - row["open"])
         upper_wick = row["high"] - max(row["open"], row["close"])
@@ -481,9 +524,11 @@ class IntradayV3Engine:
         self.pcr_history = {idx: deque(maxlen=5) for idx in INDICES}
         self.oi_history = {idx: None for idx in INDICES}
         self.active_positions = {}
+        self.closed_trades = []
         self.day_pnl = 0.0
         self.consecutive_losses = 0
         self.last_pulse_ts = 0.0
+        self.last_pos_alert_ts = 0.0
 
     def init_contracts(self):
         for idx, cfg in INDICES.items():
@@ -614,7 +659,7 @@ class IntradayV3Engine:
         if idx in self.active_positions:
             self.pending_setups[idx] = None
             pos = self.active_positions[idx]
-            ltp_now = pos.get("last_ltp", pos["entry_price"])
+            ltp_now = pos.get("last_ltp", spot_close if is_mcx else pos["entry_price"])
             is_short = pos["tx_side"] == "SELL"
             pos_mtm = (pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]
             status_tag = f"IN TRADE ({pos['display_side']} | MTM ₹{pos_mtm:+.0f})🔥"
@@ -698,9 +743,9 @@ class IntradayV3Engine:
             )
             if dir_confirmed and fuel >= MIN_FUEL_SCORE:
                 if is_mcx:
-                    self.try_execute_mcx_fut_entry(idx, cfg, pending, spot_close, price_change, fuel, cum_pcr_diff, atr14)
+                    self.try_execute_mcx_fut_entry(idx, cfg, pending, spot_close, price_change, fuel, cum_pcr_diff, atr14, now_ist)
                 else:
-                    self.try_execute_option_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14)
+                    self.try_execute_option_entry(idx, cfg, pending, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14, now_ist)
 
         status_tag = f"WATCHING👀 (Gann {int(sup)}-{int(res)})"
         if idx in self.active_positions:
@@ -724,7 +769,7 @@ class IntradayV3Engine:
             "status": status_tag,
         }
 
-    def try_execute_mcx_fut_entry(self, idx, cfg, setup, fut_price, price_change, fuel, oi_change, atr14):
+    def try_execute_mcx_fut_entry(self, idx, cfg, setup, fut_price, price_change, fuel, oi_change, atr14, now_ist):
         inst_key = cfg["spot_key"]
         lot_size = cfg["lot_size"]
         tx_side = "BUY" if setup["side"] == "CE" else "SELL"
@@ -776,8 +821,10 @@ class IntradayV3Engine:
                 "sl": sl_price,
                 "tp": tp_price,
                 "setup_name": setup["name"],
+                "entry_time": now_ist.strftime("%H:%M:%S"),
             }
             self.pending_setups[idx] = None
+            self.last_pos_alert_ts = time.time()
             notify(
                 f"🛢️🚀 <b>[{idx} FUTURES] {tx_side} TRIGGERED ({setup['name']})</b>\n"
                 f"Contract: <b>{sym}</b> | Qty: {qty} ({lots} Lot)\n"
@@ -786,7 +833,7 @@ class IntradayV3Engine:
                 f"Fuel: {fuel} | ΔPrice: {price_change:+.1f} | ΔOI: {oi_change:+.0f}"
             )
 
-    def try_execute_option_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14):
+    def try_execute_option_entry(self, idx, cfg, setup, spot_close, price_change, fuel, pcr, open_p, cum_pcr_diff, chain, atr14, now_ist):
         if not chain:
             return
         atm_strike = round(spot_close / cfg["step"]) * cfg["step"]
@@ -838,8 +885,10 @@ class IntradayV3Engine:
                 "sl": sl_price,
                 "tp": tp_price,
                 "setup_name": setup["name"],
+                "entry_time": now_ist.strftime("%H:%M:%S"),
             }
             self.pending_setups[idx] = None
+            self.last_pos_alert_ts = time.time()
             notify(
                 f"🚀 <b>[{idx}] ENTRY TRIGGERED ({setup['name']})</b>\n"
                 f"Strike: <b>{atm_strike} {setup['side']}</b> | Qty: {qty}\n"
@@ -848,15 +897,18 @@ class IntradayV3Engine:
                 f"Fuel: {fuel} | PCR: {open_p}→{pcr} (Cum {cum_pcr_diff:+.2f})"
             )
 
-    def manage_open_positions(self, hhmm: str):
+    def manage_open_positions(self, now_ist: datetime):
         if not self.active_positions:
             return
+        hhmm = now_ist.strftime("%H:%M")
         keys = [p["instrument_key"] for p in self.active_positions.values()]
         quotes = fetch_ltp_quote(keys)
 
         for idx in list(self.active_positions.keys()):
             pos = self.active_positions[idx]
             q_data = quotes.get(pos["instrument_key"], {})
+            if "last_price" not in q_data:
+                log.warning(f"[{idx}] Quote lookup missing for {pos['instrument_key']} (available keys: {list(quotes.keys())})")
             ltp = float(q_data.get("last_price", pos.get("last_ltp", pos["entry_price"])))
             pos["last_ltp"] = ltp
             is_short = pos["tx_side"] == "SELL"
@@ -878,19 +930,62 @@ class IntradayV3Engine:
             if exit_reason:
                 close_side = "BUY" if is_short else "SELL"
                 place_marketable_limit_order(pos["instrument_key"], pos["qty"], close_side, ltp)
-                pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
-                self.day_pnl += pnl
+                pnl = round((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"], 2)
+                self.day_pnl = round(self.day_pnl + pnl, 2)
                 if pnl < 0:
                     self.consecutive_losses += 1
                 else:
                     self.consecutive_losses = 0
 
+                journal_entry = {
+                    "date": now_ist.strftime("%Y-%m-%d"),
+                    "entry_time": pos.get("entry_time", ""),
+                    "exit_time": now_ist.strftime("%H:%M:%S"),
+                    "symbol": idx,
+                    "contract": str(pos["strike"]),
+                    "side": pos["display_side"],
+                    "qty": pos["qty"],
+                    "entry_price": pos["entry_price"],
+                    "exit_price": ltp,
+                    "sl": pos["sl"],
+                    "target": pos["tp"],
+                    "exit_reason": exit_reason,
+                    "pnl": pnl,
+                    "day_pnl": self.day_pnl,
+                    "setup": pos["setup_name"],
+                }
+                self.closed_trades.append(journal_entry)
+                record_trade_journal(journal_entry)
+
                 del self.active_positions[idx]
                 notify(
                     f"🏁 <b>[{idx}] EXIT ({exit_reason})</b>\n"
-                    f"Instrument: {pos['strike']} ({pos['display_side']}) | Exit: ₹{ltp:.2f}\n"
-                    f"Trade PnL: <b>₹{pnl:+.2f}</b> | Day PnL: <b>₹{self.day_pnl:+.2f}</b>"
+                    f"Instrument: {pos['strike']} ({pos['display_side']}) | Entry: ₹{pos['entry_price']:.2f} → Exit: ₹{ltp:.2f}\n"
+                    f"Trade PnL: <b>₹{pnl:+.2f}</b> | Day PnL: <b>₹{self.day_pnl:+.2f}</b>\n"
+                    f"📒 Journal Updated ({len(self.closed_trades)} trades today)"
                 )
+
+    def send_active_position_update(self, hhmm: str):
+        """Sends a dedicated Telegram position MTM & SL/Target distance alert every 3 minutes."""
+        if not self.active_positions:
+            return
+        live_mtm = self.compute_live_mtm()
+        pos_lines = [f"⏱️ <b>ACTIVE POSITION UPDATE ({hhmm} IST)</b>"]
+        for p_idx, pos in self.active_positions.items():
+            ltp = pos.get("last_ltp", pos["entry_price"])
+            is_short = pos["tx_side"] == "SELL"
+            pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
+            to_tp = round((ltp - pos["tp"]) if is_short else (pos["tp"] - ltp), 2)
+            to_sl = round((pos["sl"] - ltp) if is_short else (ltp - pos["sl"]), 2)
+            pos_lines.append(
+                f"• <b>[{p_idx}] {pos['strike']} ({pos['display_side']})</b>\n"
+                f"  Entry: ₹{pos['entry_price']:.2f} | LTP: ₹{ltp:.2f} | MTM: <b>₹{pnl:+.2f}</b>\n"
+                f"  🎯 Target: ₹{pos['tp']:.2f} ({to_tp:+.1f} pts left) | 🛡️ SL: ₹{pos['sl']:.2f} ({to_sl:+.1f} pts buffer)"
+            )
+        pos_lines.append(
+            f"💰 Total Live MTM: <b>₹{live_mtm:+.2f}</b> | Realized: <b>₹{self.day_pnl:+.2f}</b>"
+        )
+        notify("\n".join(pos_lines), silent=False)
 
     def run(self):
         if not UPSTOX_ACCESS_TOKEN:
@@ -907,10 +1002,21 @@ class IntradayV3Engine:
             now_ist = datetime.now(IST)
             hhmm = now_ist.strftime("%H:%M")
 
-            self.manage_open_positions(hhmm)
+            # 1. Continuous 10-second Live LTP monitoring & instant SL/Target exit
+            self.manage_open_positions(now_ist)
+
+            now_ts = time.time()
+
+            # 2. Dedicated 3-minute Active Position MTM & SL/Target distance alert
+            if self.active_positions and (now_ts - self.last_pos_alert_ts >= POS_ALERT_INTERVAL_SEC):
+                self.last_pos_alert_ts = now_ts
+                self.send_active_position_update(hhmm)
 
             if hhmm >= "23:20":
-                notify(f"🛑 <b>SESSION CLOSED</b> | Final Day PnL: <b>₹{self.day_pnl:+.2f}</b>")
+                notify(
+                    f"🛑 <b>SESSION CLOSED</b> | Total Trades: {len(self.closed_trades)} | "
+                    f"Final Day PnL: <b>₹{self.day_pnl:+.2f}</b>"
+                )
                 break
 
             max_profit = CAPITAL_PER_TRADE * DAILY_PROFIT_LOCK_PCT
@@ -930,7 +1036,7 @@ class IntradayV3Engine:
                     if res:
                         summaries.append(res)
 
-            now_ts = time.time()
+            # 3. Guaranteed 5-minute Market Pulse
             if summaries and (now_ts - self.last_pulse_ts >= PULSE_INTERVAL_SEC):
                 self.last_pulse_ts = now_ts
                 live_mtm = self.compute_live_mtm()
