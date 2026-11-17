@@ -54,14 +54,14 @@ MCX_EXIT_TIME = "23:15"
 
 GANN_ZONE_ATR_MULT = 0.40        # Allowed proximity above/below Gann level
 MAX_SPREAD_PCT = 1.50            # Bid-Ask spread protection (%)
-SWING_BUFFER_ATR_MULT = 0.25     # Buffer beyond 3-candle Index Swing Low/High
+SWING_BUFFER_ATR_MULT = 0.25     # Buffer beyond 3-candle Index/Fut Swing Low/High
 OPT_ATM_DELTA = 0.50             # ATM Option Delta multiplier
 RR_RATIO = 2.00                  # Fixed 1 : 2.0 Risk-to-Reward Target
 SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
 DASHBOARD_REFRESH_SEC = 30       # Self-updating single Telegram Live Dashboard interval
-JOURNAL_FILE = "trade_journal.csv"
+JOURNAL_FILE = "live_journal/trade_journal.csv"
 
-# --- TRAILING SL, FUEL FINISH & THETA FLAT-LTP EXIT PARAMETERS ---
+# --- TRAILING SL, FUEL FINISH & NO-MOMENTUM EXIT PARAMETERS ---
 TRAIL_BE_PROGRESS = 0.45         # Move SL to Cost-to-Cost at 45% of Target
 TRAIL_LOCK_PROGRESS = 0.70       # Activate Swing + 50% Profit Lock at 70% of Target
 TRAIL_PROFIT_FLOOR = 0.50        # Lock at least 50% of target gain once 70% reached
@@ -69,11 +69,11 @@ TRAIL_PROFIT_FLOOR = 0.50        # Lock at least 50% of target gain once 70% rea
 FUEL_FINISH_MIN_PROGRESS = 0.25  # Check Fuel Finish once >= 25% of Target reached
 FUEL_FINISH_THRESHOLD = 22.0     # Fuel drop threshold signaling movement finish
 
-FLAT_LTP_NORMAL_SEC = 900        # 15 mins flat LTP (profit/loss/entry) -> Theta Exit
-FLAT_LTP_EXPIRY_SEC = 600        # 10 mins flat LTP on expiry day -> Fast Theta Exit
+FLAT_LTP_NORMAL_SEC = 900        # 15 mins flat price -> No-Momentum Exit
+FLAT_LTP_EXPIRY_SEC = 600        # 10 mins flat price on expiry day -> Fast Exit
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
-CRUDEOIL_CAPITAL = float(os.getenv("CRUDEOIL_CAPITAL", "150000"))
+MCX_CAPITAL_PER_TRADE = float(os.getenv("MCX_CAPITAL_PER_TRADE", os.getenv("CRUDEOIL_CAPITAL", "150000")))
 DAILY_PROFIT_LOCK_PCT = 0.35
 DAILY_LOSS_LOCK_PCT = -0.25
 MAX_CONSECUTIVE_LOSSES = 2
@@ -116,10 +116,43 @@ INDICES = {
     },
     "CRUDEOIL": {
         "type": "MCX_FUT",
-        "spot_key": "",          # Resolved dynamically via /v2/instruments/search
+        "spot_key": "",
         "step": 50,
         "lot_size": 100,
+        "min_sl_pts": 10.0,
         "freeze_qty": 10000,
+    },
+    "NATURALGAS": {
+        "type": "MCX_FUT",
+        "spot_key": "",
+        "step": 5,
+        "lot_size": 1250,
+        "min_sl_pts": 1.5,
+        "freeze_qty": 60000,
+    },
+    "GOLD": {
+        "type": "MCX_FUT",
+        "spot_key": "",
+        "step": 500,
+        "lot_size": 100,
+        "min_sl_pts": 120.0,
+        "freeze_qty": 10000,
+    },
+    "SILVER": {
+        "type": "MCX_FUT",
+        "spot_key": "",
+        "step": 500,
+        "lot_size": 30,
+        "min_sl_pts": 180.0,
+        "freeze_qty": 3000,
+    },
+    "COPPER": {
+        "type": "MCX_FUT",
+        "spot_key": "",
+        "step": 5,
+        "lot_size": 2500,
+        "min_sl_pts": 2.5,
+        "freeze_qty": 70000,
     },
 }
 
@@ -162,15 +195,15 @@ def send_telegram_chart(df: pd.DataFrame, title: str, caption: str, gann_lvl: fl
 
         ax.plot(plot_df["timestamp"], plot_df["close"], color="#111111", linewidth=1.8, label="Spot / Fut 5M")
         ax.axhline(gann_lvl, color="#1d4ed8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
-        ax.axhline(spot_sl, color="#dc2626", linestyle=":", linewidth=1.4, label=f"Swing Spot SL: {spot_sl:.1f}")
+        ax.axhline(spot_sl, color="#dc2626", linestyle=":", linewidth=1.4, label=f"Swing SL: {spot_sl:.1f}")
         ax.axhline(spot_trg, color="#7e22ce", linestyle=":", linewidth=1.4, label=f"1:2 Target: {spot_trg:.1f}")
 
         entry_ts = plot_df["timestamp"].iloc[-1] if not is_exit else plot_df["timestamp"].iloc[max(0, len(plot_df) - 4)]
-        ax.scatter([entry_ts], [spot_entry], color="#16a34a", s=70, zorder=5, label=f"Entry Spot: {spot_entry:.1f}")
+        ax.scatter([entry_ts], [spot_entry], color="#16a34a", s=70, zorder=5, label=f"Entry: {spot_entry:.1f}")
 
         if is_exit and spot_exit is not None:
             exit_ts = plot_df["timestamp"].iloc[-1]
-            ax.scatter([exit_ts], [spot_exit], color="#ea580c", marker="X", s=85, zorder=6, label=f"Exit Spot: {spot_exit:.1f}")
+            ax.scatter([exit_ts], [spot_exit], color="#ea580c", marker="X", s=85, zorder=6, label=f"Exit: {spot_exit:.1f}")
 
         ax.set_title(title, fontsize=11, fontweight="bold", pad=10)
         ax.grid(True, linestyle="-", alpha=0.25)
@@ -233,21 +266,86 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
     return message_id
 
 
-def estimate_brokerage_and_taxes(entry_price: float, exit_price: float, qty: int, is_mcx: bool) -> float:
+def upstox_headers():
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def fetch_exact_trade_charges(instrument_key: str, entry_price: float, exit_price: float, qty: int, is_mcx: bool) -> float:
+    """
+    Fetches exact Upstox BUY + SELL leg charges via Upstox ChargeApi.get_brokerage (SDK)
+    or GET /v2/charges/brokerage (REST), with accurate math fallback.
+    """
+    if entry_price > 0 and exit_price > 0 and qty > 0:
+        # 1. Try Upstox Python SDK ChargeApi first
+        if HAS_UPSTOX_SDK:
+            try:
+                cfg = upstox_client.Configuration()
+                cfg.access_token = UPSTOX_ACCESS_TOKEN
+                charge_api = upstox_client.ChargeApi(upstox_client.ApiClient(cfg))
+                buy_resp = charge_api.get_brokerage(
+                    instrument_key, int(qty), "I", "BUY", round(float(entry_price), 2), "2.0"
+                )
+                sell_resp = charge_api.get_brokerage(
+                    instrument_key, int(qty), "I", "SELL", round(float(exit_price), 2), "2.0"
+                )
+                buy_tot = float(buy_resp.data.charges.total or 0.0)
+                sell_tot = float(sell_resp.data.charges.total or 0.0)
+                if (buy_tot + sell_tot) > 0:
+                    return round(buy_tot + sell_tot, 2)
+            except Exception as e:
+                log.debug(f"SDK ChargeApi fallback to REST ({instrument_key}): {e}")
+
+        # 2. Try Upstox REST GET /v2/charges/brokerage
+        url = "https://api.upstox.com/v2/charges/brokerage"
+        total_charges = 0.0
+        api_ok = True
+        for tx_type, price in (("BUY", entry_price), ("SELL", exit_price)):
+            params = {
+                "instrument_token": instrument_key,
+                "quantity": int(qty),
+                "product": "I",
+                "transaction_type": tx_type,
+                "price": round(float(price), 2),
+            }
+            try:
+                resp = requests.get(url, headers=upstox_headers(), params=params, timeout=8)
+                res = resp.json()
+                if res.get("status") == "success":
+                    total_charges += float(res.get("data", {}).get("charges", {}).get("total", 0.0))
+                else:
+                    log.warning(f"Brokerage API warning ({instrument_key} {tx_type}): {res}")
+                    api_ok = False
+                    break
+            except Exception as e:
+                log.warning(f"Brokerage API error ({instrument_key} {tx_type}): {e}")
+                api_ok = False
+                break
+
+        if api_ok and total_charges > 0:
+            return round(total_charges, 2)
+
+    # 3. Safe fallback calculation if API is unreachable
     turnover = (entry_price + exit_price) * qty
     brokerage = 40.0
     if is_mcx:
         stt_ctt = (exit_price * qty) * 0.0001
-        txn_charges = turnover * 0.00026
+        txn_charges = turnover * 0.000021
+        stamp_duty = (entry_price * qty) * 0.00002
     else:
         stt_ctt = (exit_price * qty) * 0.000625
         txn_charges = turnover * 0.0005
-    sebi_stamp = turnover * 0.00003
-    gst = (brokerage + txn_charges) * 0.18
-    return round(brokerage + stt_ctt + txn_charges + sebi_stamp + gst, 2)
+        stamp_duty = (entry_price * qty) * 0.00003
+    sebi_charges = turnover * 0.000001
+    gst = (brokerage + txn_charges + sebi_charges) * 0.18
+    return round(brokerage + stt_ctt + txn_charges + stamp_duty + sebi_charges + gst, 2)
 
 
 def record_trade_journal(row: dict):
+    os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
     file_exists = os.path.isfile(JOURNAL_FILE)
     fieldnames = [
         "trade_no",
@@ -337,7 +435,7 @@ def build_master_journal_report(now_ist: datetime) -> str:
     y_tot, y_win, y_loss, y_wr, _, y_chg, y_net = summarize(y_rows)
 
     report = [
-        "📊 <b>V3 MULTI-INDEX ALGO: मास्टर ट्रेड जर्नल रिपोर्ट</b>",
+        "📊 <b>V3 MULTI-INDEX & MCX ALGO: मास्टर ट्रेड जर्नल रिपोर्ट</b>",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         f"📅 <b>आजचा निकाल ({today_str})</b>",
         f"• ट्रेड्स: <b>{d_tot}</b> (🟢 {d_win} | 🔴 {d_loss})",
@@ -365,16 +463,8 @@ def build_master_journal_report(now_ist: datetime) -> str:
 # ==============================================================================
 # 3. UPSTOX V3 API HELPERS (INSTRUMENT SEARCH + CANDLES + MARGIN + OPTION CHAIN)
 # ==============================================================================
-def upstox_headers():
-    return {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-
 def get_active_future_contract(idx: str) -> dict:
-    exchange = "BSE" if idx == "SENSEX" else ("MCX" if idx == "CRUDEOIL" else "NSE")
+    exchange = "BSE" if idx == "SENSEX" else ("MCX" if INDICES[idx]["type"] == "MCX_FUT" else "NSE")
     url = "https://api.upstox.com/v2/instruments/search"
 
     for expiry_kw in ("current_month", "next_month"):
@@ -385,7 +475,7 @@ def get_active_future_contract(idx: str) -> dict:
                 "segments": "FUT",
                 "expiry": expiry_kw,
                 "page_number": 1,
-                "records": 20,
+                "records": 30,
             }
             resp = requests.get(url, headers=upstox_headers(), params=params, timeout=10)
             res = resp.json()
@@ -412,8 +502,8 @@ def get_active_future_contract(idx: str) -> dict:
             top = candidates[0]
             return {
                 "instrument_key": str(top.get("instrument_key", "")),
-                "lot_size": int(top.get("lot_size", 100)),
-                "freeze_quantity": int(top.get("freeze_quantity", 10000)),
+                "lot_size": int(top.get("lot_size", INDICES[idx]["lot_size"])),
+                "freeze_quantity": int(top.get("freeze_quantity", INDICES[idx]["freeze_qty"])),
                 "trading_symbol": str(top.get("trading_symbol", idx)),
                 "expiry": str(top.get("expiry", "")),
             }
@@ -762,7 +852,11 @@ class IntradayV3Engine:
                     if not feeds:
                         return
                     for inst_key, feed_obj in feeds.items():
-                        ltpc = feed_obj.get("ltpc") or feed_obj.get("fullFeed", {}).get("marketFF", {}).get("ltpc") or feed_obj.get("firstLevelWithGreeks", {}).get("ltpc")
+                        ltpc = (
+                            feed_obj.get("ltpc")
+                            or feed_obj.get("fullFeed", {}).get("marketFF", {}).get("ltpc")
+                            or feed_obj.get("firstLevelWithGreeks", {}).get("ltpc")
+                        )
                         if not ltpc or "ltp" not in ltpc:
                             continue
                         tick_ltp = float(ltpc["ltp"])
@@ -855,9 +949,9 @@ class IntradayV3Engine:
                     else 0.0
                 )
                 log.info(
-                    f"[{idx}] MCX FUT ONLY | Symbol: {fut_info.get('trading_symbol', 'N/A')} "
+                    f"[{idx}] MCX FUT | Symbol: {fut_info.get('trading_symbol', 'N/A')} "
                     f"| Key: {cfg['spot_key']} | Expiry: {fut_info.get('expiry', 'N/A')} "
-                    f"| Lot: {cfg['lot_size']} | 1-Lot Intraday Margin: ₹{margin_1_lot:.2f}"
+                    f"| Lot: {cfg['lot_size']} | 1-Lot Margin: ₹{margin_1_lot:.2f}"
                 )
             else:
                 valid_exps = get_valid_expiries(cfg["spot_key"])
@@ -1024,7 +1118,10 @@ class IntradayV3Engine:
 
         pts = round((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"]), 2)
         gross_pnl = round(pts * pos["qty"], 2)
-        charges = estimate_brokerage_and_taxes(pos["entry_price"], ltp, pos["qty"], is_mcx)
+
+        buy_px = ltp if is_short else pos["entry_price"]
+        sell_px = pos["entry_price"] if is_short else ltp
+        charges = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, pos["qty"], is_mcx)
         net_pnl = round(gross_pnl - charges, 2)
 
         self.day_pnl = round(self.day_pnl + net_pnl, 2)
@@ -1063,7 +1160,7 @@ class IntradayV3Engine:
             f"🏁 {icon} <b>TRADE #{pos['trade_no']} EXIT — [{idx}] ({exit_reason})</b>\n"
             f"Contract: <b>{pos['strike']} {pos['display_side']}</b> | {pos['entry_time'][:5]} → {exit_time_str[:5]}\n"
             f"Entry: ₹{pos['entry_price']:.2f} → Exit: ₹{ltp:.2f} ({pts:+.2f} pts)\n"
-            f"Gross: ₹{gross_pnl:+.2f} | Charges: ₹{charges:.2f} | <b>Net PnL: ₹{net_pnl:+.2f}</b>"
+            f"Gross: ₹{gross_pnl:+.2f} | Charges (Upstox): ₹{charges:.2f} | <b>Net PnL: ₹{net_pnl:+.2f}</b>"
         )
         notify(exit_caption)
 
@@ -1121,7 +1218,7 @@ class IntradayV3Engine:
             floor_sl = round(entry - total_target_dist * TRAIL_PROFIT_FLOOR, 1) if is_short else round(entry + total_target_dist * TRAIL_PROFIT_FLOOR, 1)
 
             if is_mcx:
-                swing_sl = round(swing_high + SWING_BUFFER_ATR_MULT * atr14, 0) if is_short else round(swing_low - SWING_BUFFER_ATR_MULT * atr14, 0)
+                swing_sl = round(swing_high + SWING_BUFFER_ATR_MULT * atr14, 1) if is_short else round(swing_low - SWING_BUFFER_ATR_MULT * atr14, 1)
                 candidate_sl = min(floor_sl, swing_sl) if is_short else max(floor_sl, swing_sl)
             else:
                 spot_entry = pos.get("spot_entry", spot_close)
@@ -1134,19 +1231,22 @@ class IntradayV3Engine:
                 swing_opt_sl = round(entry + delta_spot * OPT_ATM_DELTA, 1)
                 candidate_sl = max(floor_sl, swing_opt_sl)
 
-            if is_short and candidate_sl < new_sl and candidate_sl > ltp + 1.0:
+            min_gap = max(atr14 * 0.15, 0.3) if is_mcx else 1.0
+            if is_short and candidate_sl < new_sl and candidate_sl > ltp + min_gap:
                 new_sl = candidate_sl
                 trail_label = "70% PROFIT + SWING TRAIL"
-            elif not is_short and candidate_sl > new_sl and candidate_sl < ltp - 1.0:
+            elif not is_short and candidate_sl > new_sl and candidate_sl < ltp - min_gap:
                 new_sl = candidate_sl
                 trail_label = "70% PROFIT + SWING TRAIL"
 
         elif progress >= TRAIL_BE_PROGRESS:
-            be_sl = round(entry - 0.5, 1) if is_short else round(entry + 0.5, 1)
-            if is_short and be_sl < new_sl and be_sl > ltp + 1.0:
+            be_offset = max(round(entry * 0.0001, 1), 0.2) if is_mcx else 0.5
+            be_sl = round(entry - be_offset, 1) if is_short else round(entry + be_offset, 1)
+            min_gap = max(atr14 * 0.15, 0.3) if is_mcx else 1.0
+            if is_short and be_sl < new_sl and be_sl > ltp + min_gap:
                 new_sl = be_sl
                 trail_label = "COST-TO-COST (45% TRG)"
-            elif not is_short and be_sl > new_sl and be_sl < ltp - 1.0:
+            elif not is_short and be_sl > new_sl and be_sl < ltp - min_gap:
                 new_sl = be_sl
                 trail_label = "COST-TO-COST (45% TRG)"
 
@@ -1176,7 +1276,7 @@ class IntradayV3Engine:
             self.close_position_now(idx, ltp, f"FUEL_FINISH (Fuel {int(fuel)})", now_ist)
             return
 
-        # --- 3. FLAT-LTP THETA DECAY EXIT ---
+        # --- 3. NO-MOMENTUM / FLAT-PRICE EXIT (ALL OPTIONS + ALL 5 MCX FUTURES) ---
         now_ts = time.time()
         ltp_hist = pos.setdefault("ltp_window", deque())
         ltp_hist.append((now_ts, ltp))
@@ -1186,16 +1286,16 @@ class IntradayV3Engine:
             ltp_hist.popleft()
 
         window_span = now_ts - ltp_hist[0][0] if ltp_hist else 0.0
-        if not is_mcx and window_span >= (flat_limit_sec - 20):
+        if window_span >= (flat_limit_sec - 20):
             prices_in_win = [p for _, p in ltp_hist]
             win_range = max(prices_in_win) - min(prices_in_win)
-            flat_threshold = max(total_target_dist * 0.25, entry * 0.03)
-            if win_range <= flat_threshold and curr_progress < TRAIL_BE_PROGRESS:
+            flat_threshold = max(total_target_dist * 0.25, entry * (0.002 if is_mcx else 0.03))
+            if win_range <= flat_threshold and curr_progress < TRAIL_LOCK_PROGRESS:
                 mins_stalled = int(round(window_span / 60.0))
                 self.close_position_now(
                     idx,
                     ltp,
-                    f"THETA_DECAY_FLAT ({mins_stalled}m)",
+                    f"NO_MOMENTUM_EXIT ({mins_stalled}m)",
                     now_ist,
                 )
 
@@ -1219,7 +1319,7 @@ class IntradayV3Engine:
         spot_close = float(curr["close"])
         prev_close = float(prev["close"])
         price_change = round(spot_close - prev_close, 2)
-        atr14 = max(float(curr["atr14"]), 1.0)
+        atr14 = max(float(curr["atr14"]), 0.2)
         fuel = float(curr["fuel"])
 
         gann = compute_gann_levels(spot_close, cfg["step"])
@@ -1259,7 +1359,7 @@ class IntradayV3Engine:
             return {
                 "idx": idx,
                 "is_mcx": is_mcx,
-                "spot": int(round(spot_close)),
+                "spot": round(spot_close, 1) if spot_close < 1000 else int(round(spot_close)),
                 "fuel": int(round(fuel)),
                 "pcr": pcr,
                 "cum_pcr_diff": cum_pcr_diff,
@@ -1338,7 +1438,7 @@ class IntradayV3Engine:
                         chain, atr14, now_ist, active_expiry, is_today_exp
                     )
 
-        short_status = f"Gann {int(sup)}-{int(res)} 👀"
+        short_status = f"Gann {sup:.1f}-{res:.1f} 👀" if spot_close < 1000 else f"Gann {int(sup)}-{int(res)} 👀"
         with self.pos_lock:
             pos = self.active_positions.get(idx)
         if pos:
@@ -1353,7 +1453,7 @@ class IntradayV3Engine:
         return {
             "idx": idx,
             "is_mcx": is_mcx,
-            "spot": int(round(spot_close)),
+            "spot": round(spot_close, 1) if spot_close < 1000 else int(round(spot_close)),
             "fuel": int(round(fuel)),
             "pcr": pcr,
             "cum_pcr_diff": cum_pcr_diff,
@@ -1401,26 +1501,27 @@ class IntradayV3Engine:
 
         req_margin_1lot = fetch_required_margin(inst_key, 1, tx_side, "I")
         if req_margin_1lot > 0:
-            lots = max(1, int(CRUDEOIL_CAPITAL // req_margin_1lot))
+            lots = max(1, int(MCX_CAPITAL_PER_TRADE // req_margin_1lot))
         else:
             lots = 1
         qty = min(lots * lot_size, cfg["freeze_qty"])
 
         spot_risk, _, _ = self.compute_swing_sl_and_rr(df, setup["side"], ltp, atr14)
-        sl_points = round(max(spot_risk, 10.0), 0)
-        tp_points = round(sl_points * RR_RATIO, 0)
+        min_sl = cfg.get("min_sl_pts", 2.0)
+        sl_points = round(max(spot_risk, min_sl), 1 if ltp < 1000 else 0)
+        tp_points = round(sl_points * RR_RATIO, 1 if ltp < 1000 else 0)
 
         if tx_side == "BUY":
-            sl_price = round(ltp - sl_points, 0)
-            tp_price = round(ltp + tp_points, 0)
+            sl_price = round(ltp - sl_points, 1 if ltp < 1000 else 0)
+            tp_price = round(ltp + tp_points, 1 if ltp < 1000 else 0)
         else:
-            sl_price = round(ltp + sl_points, 0)
-            tp_price = round(ltp - tp_points, 0)
+            sl_price = round(ltp + sl_points, 1 if ltp < 1000 else 0)
+            tp_price = round(ltp - tp_points, 1 if ltp < 1000 else 0)
 
         order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp)
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
-            sym = self.fut_contracts.get(idx, {}).get("trading_symbol", "CRUDEOIL FUT")
+            sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
             now_ts = time.time()
             self.trade_counter += 1
             t_no = self.trade_counter
@@ -1458,7 +1559,7 @@ class IntradayV3Engine:
             entry_msg = (
                 f"🛢️🚀 <b>TRADE #{t_no} ENTRY — [{idx}] {tx_side} ({entry_time_str[:5]} IST)</b>\n"
                 f"Contract: <b>{sym}</b> | Qty: {qty} ({lots} Lot)\n"
-                f"Entry: <b>₹{fill:.1f}</b> | Swing SL: <b>₹{sl_price:.1f}</b> (-{sl_points:.0f}p) | Target (1:2): <b>₹{tp_price:.1f}</b> (+{tp_points:.0f}p)\n"
+                f"Entry: <b>₹{fill:.1f}</b> | Swing SL: <b>₹{sl_price:.1f}</b> (-{sl_points:.1f}p) | Target (1:2): <b>₹{tp_price:.1f}</b> (+{tp_points:.1f}p)\n"
                 f"Setup: {setup['name']} | Fuel: {fuel} | ΔOI: {oi_change:+.0f}"
             )
             notify(entry_msg)
@@ -1572,7 +1673,6 @@ class IntradayV3Engine:
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def manage_open_positions(self, now_ist: datetime):
-        """EOD auto-exit + REST safety backup if WebSocket momentarily disconnects."""
         with self.pos_lock:
             if not self.active_positions:
                 return
@@ -1619,7 +1719,7 @@ class IntradayV3Engine:
         self.init_websocket_streamer()
         notify(
             f"⚡ <b>V3 TICK-BY-TICK ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"Indices: {INDEX_START_TIME}–{INDEX_END_TIME} | Crude Oil: {MCX_START_TIME}–{MCX_END_TIME} IST | Fuel ≥{int(MIN_FUEL_SCORE)} | RR 1:2"
+            f"5 Indices ({INDEX_START_TIME}–{INDEX_END_TIME}) + 5 MCX Futures: Crude, NG, Gold, Silver, Copper ({MCX_START_TIME}–{MCX_END_TIME} IST)"
         )
 
         while True:
