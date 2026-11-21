@@ -2,7 +2,9 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '25 3 * * 1-5'  # Somvar te Shukravar 03:25 UTC (08:55 AM IST)
+    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Morning Indices + MCX)
+    - cron: '20 9 * * 1-5'   # Session 2: 02:50 PM IST (Afternoon Indices Close + Evening MCX)
+    - cron: '15 15 * * 1-5'  # Session 3: 08:45 PM IST (Late Night MCX till 11:20 PM IST)
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +17,7 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 400
+    timeout-minutes: 355
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -63,8 +65,6 @@ jobs:
             fi
           fi
 
-          echo "Token ready for Live Engine. Length: ${#UPSTOX_ACCESS_TOKEN}"
-
           if [ -z "$UPSTOX_ACCESS_TOKEN" ]; then
             echo "❌ Error: Token sapadla nahi!"
             exit 1
@@ -95,10 +95,10 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/*.csv 2>/dev/null)" ]; then
-            git add live_journal/*.csv
-            git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs [skip ci]" && git push)
-            echo "✅ Trade journal successfully committed to repository."
+          if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/ 2>/dev/null)" ]; then
+            git add live_journal/*
+            git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs & active state [skip ci]" && git push)
+            echo "✅ Trade journal and active state successfully committed to repository."
           else
             echo "[-] No trade journal files found to commit today."
           fi
