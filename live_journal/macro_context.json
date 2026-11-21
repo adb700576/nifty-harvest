@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-11-21 15:10:09 IST",
+  "updated_at": "2026-11-21 16:50:18 IST",
   "india_vix": 15.0,
   "vix_chg_pct": 0.0,
   "fii_dii": {
@@ -20,7 +20,5 @@
   "emergency_eject_ce": false,
   "event_caution": true,
   "summary": "Sectors 0G/0R | NiftyImp +0.00% | BNFImp +0.00%",
-  "top_alerts": [
-    "\u26a0\ufe0f Bessent says Iran\u2019s rulers will turn on each other, Pezeshkian warns of hard winter - Iran Inte"
-  ]
+  "top_alerts": []
 }

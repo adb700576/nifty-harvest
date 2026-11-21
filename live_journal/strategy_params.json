@@ -1,5 +1,5 @@
 {
-  "driver_gear": 2,
+  "driver_gear": 1,
   "min_fuel_score": 45.0,
   "mcx_evening_fuel_score": 57.5,
   "mcx_max_risk_inr": 1750.0,
@@ -14,5 +14,5 @@
       "cooldown": false
     }
   },
-  "last_tuned": "2026-11-21 15:11 IST"
+  "last_tuned": "2026-11-21 16:52 IST"
 }
