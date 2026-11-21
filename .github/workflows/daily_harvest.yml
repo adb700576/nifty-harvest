@@ -5,6 +5,10 @@ on:
     - cron: '25 3 * * 1-5'  # Somvar te Shukravar 03:25 UTC (08:55 AM IST)
   workflow_dispatch:
 
+concurrency:
+  group: v3-trading-engine-singleton
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -69,14 +73,14 @@ jobs:
           python -u live_engine.py
 
       - name: Upload Live Trade Journal Artifact
-        if: ${{ !cancelled() }}
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-trades-journal
           path: live_journal/
 
       - name: Generate Master Journal & Analytics
-        if: ${{ !cancelled() }}
+        if: always()
         continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -87,7 +91,7 @@ jobs:
           fi
 
       - name: Commit & Push Journal Updates
-        if: ${{ !cancelled() }}
+        if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
