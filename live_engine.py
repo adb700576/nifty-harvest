@@ -24,6 +24,12 @@ try:
 except ImportError:
     HAS_UPSTOX_SDK = False
 
+try:
+    from macro_news_radar import evaluate_macro_context
+    HAS_MACRO_RADAR = True
+except ImportError:
+    HAS_MACRO_RADAR = False
+
 # ==============================================================================
 # 1. CONFIGURATION, SELF-TUNED PARAMS & GOOGLE SHEETS SYNC
 # ==============================================================================
@@ -43,13 +49,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- STRATEGY & RISK PARAMETERS ---
-MIN_FUEL_SCORE = 45.0             # Base minimum fuel score
-MCX_EVENING_FUEL_SCORE = 55.0     # Stricter fuel filter for volatile evening MCX (>= 15:30 IST)
-MCX_MAX_RISK_INR = 2000.0         # Maximum allowed SL risk (₹) per MCX trade
-MIN_ADX_TREND = 18.0              # Below this ADX = Sideways Market (Sleep Mode)
-MAX_CHOP_INDEX = 61.8             # Above this Choppiness Index = Sideways Market
-SESSION_MAX_RUNTIME_SEC = 21100   # 5h 51m 40s Zero-Gap overlap right up to next cron trigger
+# --- BASE STRATEGY & RISK PARAMETERS (SELF-TUNED OVERRIDES THESE) ---
+MIN_FUEL_SCORE = 45.0
+MCX_EVENING_FUEL_SCORE = 55.0
+MCX_MAX_RISK_INR = 2000.0
+MIN_ADX_TREND = 18.0
+MAX_CHOP_INDEX = 61.8
+SESSION_MAX_RUNTIME_SEC = 21100   # 5h 51m 40s Zero-Gap overlap
 
 INDEX_START_TIME = "09:20"
 INDEX_END_TIME = "15:10"
@@ -61,24 +67,25 @@ MCX_END_TIME = "23:00"
 MCX_EXIT_TIME = "23:15"
 
 GANN_ZONE_ATR_MULT = 0.40
-MAX_SPREAD_PCT = 1.50
-PIVOT_BUFFER_ATR_MULT = 0.12      # Tight buffer beyond true Fractal Swing Low/High
+PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
 DASHBOARD_REFRESH_SEC = 30
+MACRO_REFRESH_SEC = 900           # Re-scan breaking war/election/RBI news every 15 mins
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
 PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
+MACRO_FILE = "live_journal/macro_context.json"
 
-# --- UNCAPPED MOMENTUM RUNNER & TRAILING SL STAGES (1R = Initial SL Risk) ---
-STAGE1_BE_R = 1.5                 # At 1.5R gain -> Move SL to Cost-to-Cost
-STAGE2_LOCK_R = 2.5               # At 2.5R gain -> Lock 1.5R floor + Swing Trail
-STAGE3_TREND_R = 4.0              # At 4.0R gain -> Trail at 70% of Peak Gain
-STAGE4_MOONSHOT_R = 8.0           # At 8.0R+ (e.g. ₹5 -> ₹100/₹400) -> Trail at 80% of Peak Gain
+# --- UNCAPPED HIGHWAY RUNNER STAGES (1R = Initial SL Risk) ---
+STAGE1_BE_R = 1.5
+STAGE2_LOCK_R = 2.5
+STAGE3_TREND_R = 4.0
+STAGE4_MOONSHOT_R = 8.0
 
-FUEL_FINISH_MIN_R = 1.5           # Allow momentum exhaustion exit only after >= 1.5R secured
-FUEL_FINISH_THRESHOLD = 18.0      # Exit only when momentum truly dies (Fuel < 18)
+FUEL_FINISH_MIN_R = 1.5
+FUEL_FINISH_THRESHOLD = 18.0
 
 FLAT_LTP_NORMAL_SEC = 900
 FLAT_LTP_EXPIRY_SEC = 600
@@ -110,13 +117,6 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
-    """
-    Returns True during scheduled GitHub cron handover windows:
-    - Afternoon handover: 14:45 to 14:58 IST
-    - Evening handover:   20:40 to 20:55 IST
-    Allows SIGTERM triggered by the incoming session cron to hand over open positions
-    cleanly instead of treating it as a manual emergency stop.
-    """
     hhmm = now_ist.strftime("%H:%M")
     return ("14:45" <= hhmm <= "14:58") or ("20:40" <= hhmm <= "20:55")
 
@@ -565,7 +565,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. REGIME INTELLIGENCE (ADX + CHOPPINESS), GANN LEVELS, PATTERNS & FUEL SCORE
+# 4. REGIME INTELLIGENCE (HIGHWAY vs CITY TRAFFIC), GANN LEVELS & FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 12:
@@ -597,8 +597,8 @@ def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> 
     breakout_wake = (curr_tr / avg_atr) >= 1.35
 
     is_sideways = (adx < min_adx or chop > max_chop) and not breakout_wake
-    is_strong_trend = (adx >= 25.0 and chop < 52.0)
-    regime = "SIDEWAYS" if is_sideways else ("STRONG_TREND" if is_strong_trend else "MODERATE_TREND")
+    is_strong_trend = (adx >= 24.0 and chop < 54.0)
+    regime = "SIDEWAYS" if is_sideways else ("HIGHWAY_TREND" if is_strong_trend else "MODERATE_TREND")
     return {
         "regime": regime,
         "adx": round(adx, 1),
@@ -746,7 +746,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. UNCAPPED MOMENTUM V3 ENGINE WITH ZERO-GAP HANDOVER & GAP CANDLE FORENSICS
+# 6. SELF-MATURING V3 ENGINE (HIGHWAY RUNNER + CITY SCALP + MACRO SHIELD)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -766,6 +766,7 @@ class IntradayV3Engine:
         self.latest_dfs = {}
         self.dashboard_msg_id = None
         self.last_dashboard_ts = 0.0
+        self.last_macro_ts = 0.0
         self.streamer = None
         self.ws_connected = False
         self.subscribed_keys = set()
@@ -773,14 +774,26 @@ class IntradayV3Engine:
         self.stop_requested = False
 
         self.tuned_params = {
+            "driver_gear": 3,
             "min_fuel_score": MIN_FUEL_SCORE,
             "mcx_evening_fuel_score": MCX_EVENING_FUEL_SCORE,
             "mcx_max_risk_inr": MCX_MAX_RISK_INR,
             "min_adx_trend": MIN_ADX_TREND,
             "max_chop_index": MAX_CHOP_INDEX,
+            "trail_cushion_mult": 1.0,
+            "sl_buffer_mult": PIVOT_BUFFER_ATR_MULT,
+            "scalp_target_r": 1.35,
             "symbol_overrides": {},
         }
         self.market_memory = []
+        self.macro_context = {
+            "threat_level": "NORMAL",
+            "veto_ce": False,
+            "veto_pe": False,
+            "event_caution": False,
+            "india_vix": 15.0,
+            "summary": "Normal Market",
+        }
 
     def load_self_tuned_intelligence(self):
         if os.path.isfile(PARAMS_FILE):
@@ -795,12 +808,43 @@ class IntradayV3Engine:
                     self.market_memory = json.load(f)
             except Exception:
                 pass
+        if os.path.isfile(MACRO_FILE):
+            try:
+                with open(MACRO_FILE, "r", encoding="utf-8") as f:
+                    self.macro_context.update(json.load(f))
+            except Exception:
+                pass
 
-    def consult_market_memory(self, idx: str, regime_info: dict, fuel: float) -> tuple:
+    def refresh_live_macro_news(self, force: bool = False):
+        now_ts = time.time()
+        if not force and (now_ts - self.last_macro_ts) < MACRO_REFRESH_SEC:
+            return
+        self.last_macro_ts = now_ts
+        if HAS_MACRO_RADAR:
+            try:
+                self.macro_context = evaluate_macro_context(notify_user=force)
+                return
+            except Exception:
+                pass
+        if os.path.isfile(MACRO_FILE):
+            try:
+                with open(MACRO_FILE, "r", encoding="utf-8") as f:
+                    self.macro_context.update(json.load(f))
+            except Exception:
+                pass
+
+    def consult_market_memory(self, idx: str, side: str, regime_info: dict, fuel: float) -> tuple:
+        # 1. Macro War / Election / Crash Shield
+        if side == "CE" and self.macro_context.get("veto_ce", False):
+            return False, "MACRO_CRASH_VETO_CE"
+        if side == "PE" and self.macro_context.get("veto_pe", False):
+            return False, "MACRO_VETO_PE"
+
         sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
         if sym_ov.get("cooldown") and fuel < 65.0:
             return False, "COOLDOWN_LOW_FUEL"
 
+        # 2. Episodic Memory Check
         similar = [
             m for m in self.market_memory
             if m.get("symbol") == idx
@@ -808,20 +852,24 @@ class IntradayV3Engine:
             and abs(float(m.get("adx", 20.0)) - regime_info["adx"]) <= 5.0
         ]
         if len(similar) >= 3:
-            traps = sum(1 for m in similar if m.get("outcome") == "SIDEWAYS_TRAP")
-            moonshots = sum(1 for m in similar if m.get("outcome") == "EXTENDED_TREND_MISSED")
-            if (traps / len(similar)) >= 0.65 and fuel < 62.0:
+            bad_entries = sum(1 for m in similar if m.get("outcome") in ("SIDEWAYS_TRAP", "WRONG_ENTRY_AGAINST_TREND"))
+            if (bad_entries / len(similar)) >= 0.65 and fuel < 62.0:
                 return False, "MEMORY_VETO_TRAP"
-            if moonshots >= 1:
-                return True, "MEMORY_MOONSHOT_ZONE"
 
-        return True, ("STRONG_TREND_RUNNER" if regime_info["is_strong_trend"] else "MOMENTUM_RUNNER")
+        gear = int(self.tuned_params.get("driver_gear", 3))
+        if regime_info["is_sideways"]:
+            return True, f"CITY_SCALP_G{gear}"
+        if regime_info["is_strong_trend"] and gear >= 4:
+            return True, f"HIGHWAY_DRIFT_G{gear}"
+        return True, f"RUNNER_G{gear}"
 
     def compute_true_fractal_swing_sl(self, df: pd.DataFrame, side: str, spot_price: float, atr14: float) -> tuple:
         lookback = df.iloc[-10:] if len(df) >= 10 else df
-        buffer = PIVOT_BUFFER_ATR_MULT * atr14
+        # Uses auto-tuned sl_buffer_mult (widens if previous SL hits proved too tight)
+        sl_mult = float(self.tuned_params.get("sl_buffer_mult", PIVOT_BUFFER_ATR_MULT))
+        buffer = sl_mult * atr14
         min_spot_risk = 0.35 * atr14
-        max_spot_risk = 1.25 * atr14
+        max_spot_risk = 1.35 * atr14
 
         if side == "CE":
             lows = lookback["low"].values
@@ -853,13 +901,6 @@ class IntradayV3Engine:
             log.warning(f"Active positions save error: {e}")
 
     def load_active_positions_state(self):
-        """
-        Restores open positions from previous session AND performs Gap Candle Forensics:
-        - Checks 5M candles of the traded instrument since entry_time to detect if price
-          spiked during the handover gap and then reversed.
-        - Retroactively updates peak_gain & Trail SL (1.5R / 2.5R / 4R / 8R+), and if
-          live LTP has already breached the updated Trail SL / SL, closes immediately.
-        """
         if not os.path.isfile(ACTIVE_STATE_FILE):
             return
         try:
@@ -872,6 +913,7 @@ class IntradayV3Engine:
             inst_keys = [pos["instrument_key"] for pos in data.values() if pos.get("instrument_key")]
             live_quotes = fetch_ltp_quote(inst_keys)
             immediate_exits = []
+            cushion = float(self.tuned_params.get("trail_cushion_mult", 1.0))
 
             with self.pos_lock:
                 for idx, pos in data.items():
@@ -883,28 +925,17 @@ class IntradayV3Engine:
                     r_unit = max(float(pos.get("r_unit", 1.0)), 1e-6)
                     entry_time_str = pos.get("entry_time", "09:20:00")
 
-                    # 1. Inspect contract 5M candles since entry_time for handover gap spikes
                     inst_df = fetch_intraday_5m(inst_key)
                     if not inst_df.empty:
                         inst_df["hhmmss"] = inst_df["timestamp"].dt.strftime("%H:%M:%S")
                         since_entry = inst_df[inst_df["hhmmss"] >= entry_time_str]
                         if not since_entry.empty:
-                            if is_short:
-                                best_favorable = float(since_entry["low"].min())
-                                gap_peak_gain = max(0.0, entry - best_favorable)
-                            else:
-                                best_favorable = float(since_entry["high"].max())
-                                gap_peak_gain = max(0.0, best_favorable - entry)
-
+                            best_fav = float(since_entry["low"].min()) if is_short else float(since_entry["high"].max())
+                            gap_peak_gain = max(0.0, (entry - best_fav) if is_short else (best_fav - entry))
                             if gap_peak_gain > pos.get("peak_gain", 0.0):
                                 pos["peak_gain"] = gap_peak_gain
                                 pos["last_peak_ts"] = time.time()
-                                log.info(
-                                    f"[GAP FORENSICS] {idx} reached peak gain ₹{gap_peak_gain:.2f} "
-                                    f"({gap_peak_gain / r_unit:.1f}R) during/before handover!"
-                                )
 
-                    # 2. Check live LTP & retroactively tighten Trail SL based on true peak_gain
                     q_data = live_quotes.get(inst_key, {})
                     curr_ltp = float(q_data.get("last_price", pos.get("last_ltp", entry)))
                     pos["last_ltp"] = curr_ltp
@@ -916,18 +947,22 @@ class IntradayV3Engine:
                     peak_gain = pos.get("peak_gain", 0.0)
                     peak_r = peak_gain / r_unit
 
+                    # Cushion-adjusted trail lock (avoids cutting early on normal pullbacks)
+                    lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
+                    lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
+
                     if peak_r >= STAGE4_MOONSHOT_R:
-                        lock_gain = peak_gain * 0.80
+                        lock_gain = peak_gain * lock_80
                         cand_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = f"GAP_MOONSHOT_80% ({peak_r:.1f}R)"
+                            pos["trail_stage"] = f"GAP_MOONSHOT ({peak_r:.1f}R)"
                     elif peak_r >= STAGE3_TREND_R:
-                        lock_gain = peak_gain * 0.70
+                        lock_gain = peak_gain * lock_70
                         cand_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = f"GAP_TREND_70% ({peak_r:.1f}R)"
+                            pos["trail_stage"] = f"GAP_TREND ({peak_r:.1f}R)"
                     elif peak_r >= STAGE2_LOCK_R:
                         cand_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
@@ -943,20 +978,14 @@ class IntradayV3Engine:
                     self.active_positions[idx] = pos
                     self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)))
 
-                    # 3. If live LTP already breached updated Trail SL / SL during handover, queue immediate exit
                     if (not is_short and curr_ltp <= pos["sl"]) or (is_short and curr_ltp >= pos["sl"]):
                         reason = "GAP_TRAIL_SL_HIT" if pos.get("trail_stage") else "GAP_STOP_LOSS_HIT"
                         immediate_exits.append((idx, curr_ltp, reason))
 
             for idx, pos in list(self.active_positions.items()):
                 self.subscribe_tick_instrument(pos["instrument_key"])
-                log.info(
-                    f"[HANDOVER RESUME] #{pos['trade_no']} {idx} {pos['strike']} | "
-                    f"LTP ₹{pos['last_ltp']:.2f} | Effective SL ₹{pos['sl']:.2f} ({pos.get('trail_stage') or 'INITIAL'})"
-                )
 
             for idx, exit_ltp, reason in immediate_exits:
-                log.warning(f"[GAP EXIT] {idx} breached SL during handover ({reason}) @ ₹{exit_ltp:.2f} -> Closing now!")
                 self.close_position_now(idx, exit_ltp, reason, now_ist)
 
             self.save_active_positions_state()
@@ -1065,6 +1094,7 @@ class IntradayV3Engine:
     def on_tick_price(self, instrument_key: str, ltp: float):
         norm_key = instrument_key.replace(":", "|")
         target_idx, exit_reason = None, None
+        cushion = float(self.tuned_params.get("trail_cushion_mult", 1.0))
 
         with self.pos_lock:
             for idx, pos in self.active_positions.items():
@@ -1077,14 +1107,26 @@ class IntradayV3Engine:
                         pos["last_peak_ts"] = time.time()
 
                     r_unit = max(pos.get("r_unit", 1.0), 1e-6)
+                    curr_r = curr_gain / r_unit
                     peak_r = pos.get("peak_gain", 0.0) / r_unit
                     tick_sz = pos.get("tick_size", 0.05)
+
+                    # 1. City Traffic Scalp Mode: Quick book at scalp_target_r (e.g. 1.35R)
+                    if pos.get("trade_mode") == "SCALP":
+                        scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
+                        if curr_r >= scalp_r:
+                            exit_reason = f"CITY_SCALP_TARGET ({curr_r:.1f}R)"
+                            target_idx = idx
+                            break
+
+                    # 2. Highway Uncapped Runner / Drift Mode
                     if peak_r >= STAGE4_MOONSHOT_R:
-                        lock_gain = pos["peak_gain"] * 0.80
+                        lock_pct = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
+                        lock_gain = pos["peak_gain"] * lock_pct
                         moon_sl = round_to_tick((pos["entry_price"] - lock_gain) if is_short else (pos["entry_price"] + lock_gain), tick_sz)
                         if (is_short and moon_sl < pos["sl"]) or (not is_short and moon_sl > pos["sl"]):
                             pos["sl"] = moon_sl
-                            pos["trail_stage"] = f"MOONSHOT 80% LOCK ({peak_r:.1f}R)"
+                            pos["trail_stage"] = f"MOONSHOT {int(lock_pct*100)}% ({peak_r:.1f}R)"
 
                     if not is_short and ltp <= pos["sl"]:
                         exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
@@ -1186,7 +1228,8 @@ class IntradayV3Engine:
         live_mtm = self.compute_live_mtm()
         net_pnl = round(self.day_pnl + live_mtm, 2)
         mode_badge = "🧪 PAPER" if PAPER_MODE else "⚡ LIVE"
-        feed_badge = "📡 TICK-WS" if self.ws_connected else "🔍 SCANNING"
+        gear = int(self.tuned_params.get("driver_gear", 3))
+        macro_lvl = self.macro_context.get("threat_level", "NORMAL")
         net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
         idx_trades = [t for t in self.closed_trades if t["symbol"] in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
@@ -1197,8 +1240,9 @@ class IntradayV3Engine:
             f"╔══════════════════════════════╗",
             f"  {self.bot_status_text} │ <code>{hhmm} IST</code>",
             f"╚══════════════════════════════╝",
-            f"💼 <b>Day Net:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b> │ {mode_badge} │ <i>{feed_badge}</i>",
+            f"💼 <b>Day Net:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b> │ {mode_badge} │ 🏎️ <b>Gear {gear}/5</b>",
             f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b> │ Live MTM: <b>₹{live_mtm:+,.2f}</b>",
+            f"   ├ Macro: <code>{macro_lvl}</code> (VIX {self.macro_context.get('india_vix', 15.0)})",
             f"   └ Today: <b>{len(self.closed_trades)}</b> ({total_wins}W) │ Index: <b>{len(idx_trades)}</b> │ MCX: <b>{len(mcx_trades)}</b>",
         ]
 
@@ -1206,7 +1250,7 @@ class IntradayV3Engine:
             active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
 
         if active_snap:
-            lines.append("\n🔥 <b>ACTIVE UNCAPPED RUNNERS</b>")
+            lines.append("\n🔥 <b>ACTIVE POSITIONS</b>")
             lines.append("──────────────────────────────")
             for p_idx, pos in active_snap:
                 ltp = pos.get("last_ltp", pos["entry_price"])
@@ -1216,12 +1260,14 @@ class IntradayV3Engine:
                 r_unit = max(pos.get("r_unit", 1.0), 1e-6)
                 curr_r = curr_gain / r_unit
                 bar = make_r_bar(curr_r, 8)
-                trail_tag = f" 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else " 🚀<code>UNCAPPED</code>"
+                t_mode = pos.get("trade_mode", "HIGHWAY")
+                tgt_txt = f"Scalp {self.tuned_params.get('scalp_target_r', 1.35)}R" if t_mode == "SCALP" else "UNCAPPED ∞"
+                trail_tag = f" 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f" 🛣️<code>{t_mode}</code>"
                 p_icon = "🟢" if pnl >= 0 else "🔴"
                 lines.append(
                     f"<b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>{trail_tag}\n"
                     f"  ├ 🕒 <code>{pos['entry_time'][:5]}</code> │ In <b>₹{pos['entry_price']:.2f}</b> → LTP <b>₹{ltp:.2f}</b>\n"
-                    f"  ├ 🛡️ Trail SL <code>₹{pos['sl']:.2f}</code> │ 🎯 Target: <b>UNCAPPED ∞</b>\n"
+                    f"  ├ 🛡️ Trail SL <code>₹{pos['sl']:.2f}</code> │ 🎯 <b>{tgt_txt}</b>\n"
                     f"  └ {bar} <b>{curr_r:+.1f}R</b> │ {p_icon} <b>₹{pnl:+,.2f}</b>"
                 )
 
@@ -1236,7 +1282,7 @@ class IntradayV3Engine:
                     f"  └ SL:<code>{t['sl']:.2f}</code> │ {t['exit_reason']} │ <b>₹{t['pnl']:+,.2f}</b>"
                 )
         elif not active_snap:
-            lines.append("  <i>Monitoring 5M candles, ADX regimes & Gann levels...</i>")
+            lines.append("  <i>Scanning Highway Trends, City Scalps & Gann Levels...</i>")
 
         if self.last_summaries:
             lines.append("\n📡 <b>5 INDICES RADAR</b>")
@@ -1338,6 +1384,7 @@ class IntradayV3Engine:
         tick_sz = pos.get("tick_size", 0.05)
         eff_delta = pos.get("delta", 0.50)
         r_unit = max(pos.get("r_unit", 1.0), 1e-6)
+        cushion = float(self.tuned_params.get("trail_cushion_mult", 1.0))
 
         curr_gain = (entry - ltp) if is_short else (ltp - entry)
         peak_gain = max(pos.get("peak_gain", 0.0), curr_gain)
@@ -1355,28 +1402,32 @@ class IntradayV3Engine:
         new_sl = pos["sl"]
         trail_label = None
 
+        lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
+        lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
+
         if peak_r >= STAGE4_MOONSHOT_R:
-            lock_gain = peak_gain * 0.80
+            lock_gain = peak_gain * lock_80
             candidate_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
             if (is_short and candidate_sl < new_sl and candidate_sl > ltp) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp):
                 new_sl = candidate_sl
-                trail_label = f"MOONSHOT 80% ({peak_r:.1f}R)"
+                trail_label = f"MOONSHOT {int(lock_80*100)}% ({peak_r:.1f}R)"
 
         elif peak_r >= STAGE3_TREND_R:
-            lock_gain = peak_gain * 0.70
+            lock_gain = peak_gain * lock_70
             candidate_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
             if (is_short and candidate_sl < new_sl and candidate_sl > ltp) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp):
                 new_sl = candidate_sl
-                trail_label = f"TREND 70% ({peak_r:.1f}R)"
+                trail_label = f"TREND {int(lock_70*100)}% ({peak_r:.1f}R)"
 
         elif peak_r >= STAGE2_LOCK_R:
             floor_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
+            buf = PIVOT_BUFFER_ATR_MULT * atr14 * cushion
             if is_mcx:
-                swing_sl = round_to_tick((swing_high + PIVOT_BUFFER_ATR_MULT * atr14) if is_short else (swing_low - PIVOT_BUFFER_ATR_MULT * atr14), tick_sz)
+                swing_sl = round_to_tick((swing_high + buf) if is_short else (swing_low - buf), tick_sz)
                 candidate_sl = min(floor_sl, swing_sl) if is_short else max(floor_sl, swing_sl)
             else:
                 spot_entry = pos.get("spot_entry", spot_close)
-                delta_spot = (swing_low - PIVOT_BUFFER_ATR_MULT * atr14 - spot_entry) if pos["side"] == "CE" else (spot_entry - (swing_high + PIVOT_BUFFER_ATR_MULT * atr14))
+                delta_spot = (swing_low - buf - spot_entry) if pos["side"] == "CE" else (spot_entry - (swing_high + buf))
                 candidate_sl = max(floor_sl, round_to_tick(entry + delta_spot * eff_delta, tick_sz))
 
             min_gap = max(atr14 * 0.15, tick_sz * 2) if is_mcx else max(tick_sz * 4, 0.5)
@@ -1486,14 +1537,10 @@ class IntradayV3Engine:
                 "short_status": f"#{pos['trade_no']} RUNNER (₹{pos_mtm:+.0f})🔥",
             }
 
-        if regime_info["is_sideways"]:
-            self.pending_setups[idx] = None
-            return {
-                "idx": idx, "is_mcx": is_mcx,
-                "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
-                "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
-                "short_status": f"SLEEP (ADX {regime_info['adx']:.0f}) 😴",
-            }
+        # Dual-Mode Intelligence:
+        # - Sideways (City Traffic) -> Allows high-precision Gann Scalp Mode (1.35R quick exit)
+        # - Trending (Highway)      -> Full Uncapped Runner Mode
+        trade_mode = "SCALP" if regime_info["is_sideways"] else "HIGHWAY"
 
         pat_info = detect_6_gann_patterns(df, gann_levels, atr14)
         near_gann, bull_pattern, bear_pattern = pat_info["near_gann"], pat_info["bull_pattern"], pat_info["bear_pattern"]
@@ -1531,20 +1578,29 @@ class IntradayV3Engine:
             eve_req_fuel = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
             req_fuel = max(base_req_fuel, eve_req_fuel) if (is_mcx and hhmm_now >= "15:30") else base_req_fuel
 
+            # In City Traffic (Sideways) or Event Volatility, require cleaner Fuel (+8) for scalping
+            if trade_mode == "SCALP" or self.macro_context.get("event_caution", False):
+                req_fuel += 8.0
+
             dir_confirmed = (
                 (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
                 or (pending["side"] == "PE" and price_change < 0 and oi_pcr_bear_ok and spot_close <= pending["trigger"])
             )
             if dir_confirmed and fuel >= req_fuel:
-                mem_ok, mem_tag = self.consult_market_memory(idx, regime_info, fuel)
+                mem_ok, mem_tag = self.consult_market_memory(idx, pending["side"], regime_info, fuel)
                 if not mem_ok:
                     self.pending_setups[idx] = None
                 elif is_mcx:
-                    self.try_execute_mcx_fut_entry(idx, cfg, pending, df, spot_close, fuel, atr14, now_ist, mem_tag)
+                    self.try_execute_mcx_fut_entry(idx, cfg, pending, df, spot_close, fuel, atr14, now_ist, mem_tag, trade_mode)
                 else:
-                    self.try_execute_option_entry(idx, cfg, pending, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag)
+                    self.try_execute_option_entry(idx, cfg, pending, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag, trade_mode)
 
-        short_status = f"TREND (ADX {regime_info['adx']:.0f}) ⚡" if regime_info["is_strong_trend"] else f"Gann {int(sup)}-{int(res)} 👀"
+        if regime_info["is_sideways"]:
+            short_status = f"CITY SCALP (ADX {regime_info['adx']:.0f}) 🚦"
+        elif regime_info["is_strong_trend"]:
+            short_status = f"HIGHWAY (ADX {regime_info['adx']:.0f}) 🛣️"
+        else:
+            short_status = f"Gann {int(sup)}-{int(res)} 👀"
         if pending:
             short_status = f"ARMED {pending['display_side']} 🎯"
 
@@ -1555,7 +1611,7 @@ class IntradayV3Engine:
             "short_status": short_status,
         }
 
-    def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, fuel, atr14, now_ist, mem_tag):
+    def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, fuel, atr14, now_ist, mem_tag, trade_mode):
         inst_key = cfg["spot_key"]
         lot_size = cfg["lot_size"]
         tick_sz = cfg.get("tick_size", 0.05)
@@ -1587,6 +1643,7 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
+            tgt_label = f"SCALP {self.tuned_params.get('scalp_target_r', 1.35)}R" if trade_mode == "SCALP" else "UNCAPPED ∞ (Highway)"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
@@ -1596,6 +1653,7 @@ class IntradayV3Engine:
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": False,
+                    "trade_mode": trade_mode,
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
@@ -1603,17 +1661,17 @@ class IntradayV3Engine:
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
             entry_msg = (
-                f"🛢️🚀 <b>NEW RUNNER • TRADE #{t_no} [{idx}]</b>\n"
+                f"🛢️🚀 <b>NEW TRADE #{t_no} [{idx}] • {trade_mode} MODE</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 <b>Contract:</b> <code>{sym}</code> (<b>{tx_side}</b>) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
                 f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.2f}</b>\n"
-                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>UNCAPPED ∞ (Trail)</b>\n"
+                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>{tgt_label}</b>\n"
                 f"📐 <b>Setup:</b> {setup['name']} │ 🧠 <code>{mem_tag}</code> │ 🔥 <b>Fuel:</b> {fuel}"
             )
             send_trade_alert_with_chart(df, f"{idx} 5M ENTRY │ #{t_no} {sym} {tx_side}", entry_msg, setup["gann_level"], fut_price, sl_price)
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
-    def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag):
+    def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag, trade_mode):
         if not chain:
             return
         step = cfg.get("step", 50)
@@ -1635,7 +1693,10 @@ class IntradayV3Engine:
         raw_delta = abs(float(greeks.get("delta", 0.0)))
         live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else 0.50
 
-        lots = max(1, int(CAPITAL_PER_TRADE // (ltp * cfg["lot_size"])))
+        # Gear-scaled capital allocation (Gear 1-2 = 60% size, Gear 3 = 100%, Gear 4-5 = 100%)
+        gear = int(self.tuned_params.get("driver_gear", 3))
+        eff_cap = CAPITAL_PER_TRADE * (0.65 if gear <= 2 else 1.0)
+        lots = max(1, int(eff_cap // (ltp * cfg["lot_size"])))
         qty = min(lots * cfg["lot_size"], cfg["freeze_qty"])
 
         spot_risk, spot_sl_equiv = self.compute_true_fractal_swing_sl(df, setup["side"], spot_close, atr14)
@@ -1651,6 +1712,7 @@ class IntradayV3Engine:
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
             exp_label = "0DTE" if is_today_exp else active_expiry
+            tgt_label = f"SCALP {self.tuned_params.get('scalp_target_r', 1.35)}R" if trade_mode == "SCALP" else "UNCAPPED ∞ (Highway)"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "INDEX_OPT", "instrument_key": inst_key,
@@ -1661,6 +1723,7 @@ class IntradayV3Engine:
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": is_today_exp,
+                    "trade_mode": trade_mode,
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
@@ -1668,11 +1731,11 @@ class IntradayV3Engine:
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
             entry_msg = (
-                f"🚀 <b>NEW RUNNER • TRADE #{t_no} [{idx}]</b>\n"
+                f"🚀 <b>NEW TRADE #{t_no} [{idx}] • {trade_mode} MODE</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"📌 <b>Strike:</b> <code>{atm_strike} {setup['side']}</code> ({exp_label}) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
                 f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.2f}</b> (Δ {live_delta:.2f})\n"
-                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>UNCAPPED ∞ (Trail)</b>\n"
+                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>{tgt_label}</b>\n"
                 f"📐 <b>Setup:</b> {setup['name']} │ 🧠 <code>{mem_tag}</code> │ 🔥 <b>Fuel:</b> {fuel}"
             )
             send_trade_alert_with_chart(df, f"{idx} 5M ENTRY │ #{t_no} {atm_strike} {setup['side']}", entry_msg, setup["gann_level"], spot_close, spot_sl_equiv)
@@ -1695,8 +1758,13 @@ class IntradayV3Engine:
                 ltp = pos.get("last_ltp", pos["entry_price"])
 
             is_short = pos["tx_side"] == "SELL"
+            r_unit = max(pos.get("r_unit", 1.0), 1e-6)
+            curr_r = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) / r_unit
             exit_reason = None
-            if pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
+
+            if pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
+                exit_reason = f"CITY_SCALP_TARGET ({curr_r:.1f}R)"
+            elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
                 exit_reason = f"EOD_EXIT ({INDEX_EXIT_TIME})"
             elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
                 exit_reason = f"MCX_EXIT ({MCX_EXIT_TIME})"
@@ -1748,6 +1816,7 @@ class IntradayV3Engine:
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, "stop_requested", True))
 
         self.load_self_tuned_intelligence()
+        self.refresh_live_macro_news(force=True)
         self.load_today_state_from_journal()
         self.init_contracts()
         self.load_active_positions_state()
@@ -1757,11 +1826,12 @@ class IntradayV3Engine:
         with self.pos_lock:
             carried_cnt = len(self.active_positions)
 
+        gear = int(self.tuned_params.get("driver_gear", 3))
         notify(
-            f"🟢 <b>V3 UNCAPPED MOMENTUM ENGINE LIVE</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
+            f"🟢 <b>V3 SELF-MATURING QUANT ENGINE LIVE</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🧠 <b>Memory Vault:</b> {len(self.market_memory)} experiences │ <b>ADX Gate:</b> ≥{self.tuned_params['min_adx_trend']}\n"
-            f"🚀 <b>Target Mode:</b> UNCAPPED (Zero-Gap Handover + Gap Forensics) │ Carried: {carried_cnt}"
+            f"🏎️ <b>Driver Gear:</b> <b>{gear}/5</b> │ <b>Trail Cushion:</b> {self.tuned_params.get('trail_cushion_mult', 1.0)}x │ <b>Memory:</b> {len(self.market_memory)}\n"
+            f"🌍 <b>Macro Radar:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> (VIX {self.macro_context.get('india_vix', 15.0)}) │ Carried: {carried_cnt}"
         )
 
         while True:
@@ -1769,7 +1839,6 @@ class IntradayV3Engine:
             hhmm = now_ist.strftime("%H:%M")
 
             if self.stop_requested:
-                # If SIGTERM arrived during scheduled session overlap window, hand over cleanly instead of squaring off!
                 stop_type = "SESSION HANDOVER" if is_scheduled_handover_window(now_ist) else "MANUAL STOP"
                 self.shutdown_cleanly(now_ist, stop_type)
                 break
@@ -1778,6 +1847,7 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
                 break
 
+            self.refresh_live_macro_news(force=False)
             self.manage_open_positions(now_ist)
 
             if hhmm >= "23:20":
