@@ -1,0 +1,26 @@
+{
+  "updated_at": "2026-11-21 15:10:09 IST",
+  "india_vix": 15.0,
+  "vix_chg_pct": 0.0,
+  "fii_dii": {
+    "fii_net_cr": 0.0,
+    "dii_net_cr": 0.0,
+    "flow_regime": "NEUTRAL"
+  },
+  "sector_perf": {},
+  "bnf_heavy_impact": 0.0,
+  "nifty_heavy_impact": 0.0,
+  "sector_verdict": "SECTOR_TUG_OF_WAR_CHOP",
+  "top_pullers": [],
+  "top_draggers": [],
+  "threat_level": "NORMAL",
+  "veto_ce": false,
+  "veto_pe": false,
+  "veto_bnf_ce": false,
+  "emergency_eject_ce": false,
+  "event_caution": true,
+  "summary": "Sectors 0G/0R | NiftyImp +0.00% | BNFImp +0.00%",
+  "top_alerts": [
+    "\u26a0\ufe0f Bessent says Iran\u2019s rulers will turn on each other, Pezeshkian warns of hard winter - Iran Inte"
+  ]
+}
