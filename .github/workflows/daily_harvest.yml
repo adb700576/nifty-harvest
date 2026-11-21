@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Zero-Gap overlap till 02:46 PM IST)
     - cron: '16 9 * * 1-5'   # Session 2: 02:46 PM IST (Zero-Gap overlap till 08:38 PM IST)
-    - cron: '08 15 * * 1-5'  # Session 3: 08:38 PM IST (Runs till 11:20 PM IST + Nightly Auto-Tuner)
+    - cron: '08 15 * * 1-5'  # Session 3: 08:38 PM IST (Runs till 11:20 PM IST + Nightly Forensics)
   workflow_dispatch:
 
 concurrency:
@@ -49,7 +49,7 @@ jobs:
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
           fi
 
-      - name: Run Self-Maturing V3 Live Engine
+      - name: Run Self-Maturing V3 Live Engine (with Pre-Market Macro Radar)
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -64,7 +64,7 @@ jobs:
           fi
           python -u live_engine.py
 
-      - name: Run Nightly Auto-Tuner & Market Memory Correlation
+      - name: Run Nightly Deep Forensics & Driver Skill Coach
         if: always()
         continue-on-error: true
         env:
@@ -90,7 +90,7 @@ jobs:
           name: live-trades-journal
           path: live_journal/
 
-      - name: Commit & Push Journal, Memory & Self-Tuned Params
+      - name: Commit & Push Journal, Macro Context & Self-Tuned Params
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
@@ -98,9 +98,9 @@ jobs:
           if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/ 2>/dev/null)" ]; then
             git add live_journal/*
             if ! git diff --quiet || ! git diff --staged --quiet; then
-              git commit -m "chore(ai-tuner): update trade journal, market memory & strategy params [skip ci]"
+              git commit -m "chore(ai-coach): update trade journal, macro radar, memory & driver gear [skip ci]"
               git pull --rebase origin main || git pull --rebase origin master
               git push
-              echo "✅ Journal, Market Memory & Strategy Params committed."
+              echo "✅ Journal, Macro Context, Memory & Driver Gear committed."
             fi
           fi
