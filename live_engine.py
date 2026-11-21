@@ -44,7 +44,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# --- BASE STRATEGY & RISK PARAMETERS (SELF-TUNED OVERRIDES THESE) ---
+# --- BASE STRATEGY & RISK PARAMETERS (SELF-TUNED OVERRIDES THESE IN BACKGROUND) ---
 MIN_FUEL_SCORE = 45.0
 MCX_EVENING_FUEL_SCORE = 55.0
 MCX_MAX_RISK_INR = 2000.0
@@ -65,7 +65,7 @@ GANN_ZONE_ATR_MULT = 0.40
 PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
 DASHBOARD_PULSE_SEC = 5.0         # Blink Dot + Live LTP + Pinned Board Refresh every 5s
-MACRO_REFRESH_SEC = 180           # Scan 9 Sectors, 24 Heavyweights & Breaking News every 3 mins
+MACRO_REFRESH_SEC = 180           # Background Sector/Heavyweight/News scan every 3 mins
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
@@ -415,7 +415,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. REGIME INTELLIGENCE, GANN LEVELS & FUEL SCORE
+# 4. BACKGROUND REGIME INTELLIGENCE, GANN LEVELS & FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 12:
@@ -596,7 +596,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (SINGLE-WINDOW PINNED TERMINAL + 5S PULSE)
+# 6. SELF-MATURING V3 ENGINE (3 MESSAGES/DAY + 5S BLINKING PINNED MASTER BOARD)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -624,6 +624,7 @@ class IntradayV3Engine:
         self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
 
+        # Background Self-Tuned Params (Silent Reference)
         self.tuned_params = {
             "driver_gear": 3,
             "min_fuel_score": MIN_FUEL_SCORE,
@@ -1132,10 +1133,10 @@ class IntradayV3Engine:
         y_live = round(y_net + live_mtm, 2)
 
         return [
-            f"• <b>Today:</b> <b>₹{d_live:+,.2f}</b> ({d_tot}T | {d_wr}% Win)",
-            f"• <b>This Week:</b> <b>₹{w_live:+,.2f}</b> ({w_tot}T | {w_wr}% Win)",
-            f"• <b>This Month:</b> <b>₹{m_live:+,.2f}</b> ({m_tot}T | {m_wr}% Win)",
-            f"• <b>This Year:</b> <b>₹{y_live:+,.2f}</b> ({y_tot}T | {y_wr}% Win)",
+            f"• <b>Daily:</b> <b>₹{d_live:+,.2f}</b> ({d_tot}T | {d_wr}% Win)",
+            f"• <b>Weekly:</b> <b>₹{w_live:+,.2f}</b> ({w_tot}T | {w_wr}% Win)",
+            f"• <b>Monthly:</b> <b>₹{m_live:+,.2f}</b> ({m_tot}T | {m_wr}% Win)",
+            f"• <b>Yearly:</b> <b>₹{y_live:+,.2f}</b> ({y_tot}T | {y_wr}% Win)",
         ]
 
     def render_live_dashboard(self, hhmm: str):
@@ -1144,7 +1145,6 @@ class IntradayV3Engine:
             live_mtm = self.compute_live_mtm()
             net_pnl = round(self.day_pnl + live_mtm, 2)
             mode_badge = "<code>PAPER</code>" if PAPER_MODE else "<code>LIVE</code>"
-            macro_lvl = self.macro_context.get("threat_level", "NORMAL")
             net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
             self.dashboard_pulse = not self.dashboard_pulse
@@ -1156,15 +1156,17 @@ class IntradayV3Engine:
                 pulse_dot = "🟢" if self.dashboard_pulse else "⚪"
                 status_header = f"{pulse_dot} <b>BOT LIVE</b>"
 
+            tot_closed = len(self.closed_trades)
             total_wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
             total_losses = sum(1 for t in self.closed_trades if t["pnl"] <= 0)
+            day_wr = int(round((total_wins / tot_closed) * 100.0)) if tot_closed > 0 else 0
 
             lines = [
                 f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge}",
                 f"────────────────────────────",
                 f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
                 f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
-                f"• Today: <b>{len(self.closed_trades)} Trades</b> ({total_wins}W / {total_losses}L)  |  Pulse: <code>{macro_lvl}</code>",
+                f"• Trades: <b>{tot_closed}</b> ({total_wins}W / {total_losses}L)  |  Win Rate: <b>{day_wr}%</b>",
             ]
 
             with self.pos_lock:
@@ -1184,7 +1186,7 @@ class IntradayV3Engine:
                     sl_label = f"Locked <b>₹{sl_pnl:+,.0f}</b>" if sl_pnl >= 0 else f"Max Risk <b>₹{abs(sl_pnl):,.0f}</b>"
                     lines.extend([
                         f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>  |  {trail_tag}",
-                        f"  Entry: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
+                        f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
                         f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
                         f"  Live P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
@@ -1198,20 +1200,20 @@ class IntradayV3Engine:
                         f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>  |  ₹{t['entry_price']:.2f}→₹{t['exit_price']:.2f}  |  <i>{t['exit_reason']}</i>"
                     )
             elif not active_snap:
-                lines.append("<i>Scanning 9 Sectors, Heavyweights &amp; Gann Levels...</i>")
+                lines.append("<i>No closed trades yet today.</i>")
 
             if self.last_summaries:
-                lines.append("\n📡 <b>INDICES RADAR</b>")
+                lines.append("\n📡 <b>INDICES LIVE</b>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
-                        lines.append(f"• <b>{s['idx']}</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
+                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX RADAR</b>")
+                lines.append("\n🛢️ <b>MCX LIVE</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
-                        lines.append(f"• <b>{s['idx']}</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
+                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
             lines.append("\n📊 <b>PERFORMANCE SUMMARY (NET ₹)</b>")
             lines.extend(self.get_performance_summary_lines(now_ist, live_mtm))
@@ -1424,7 +1426,7 @@ class IntradayV3Engine:
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
                 "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
-                "short_status": f"#{pos['trade_no']} ACTIVE (₹{pos_mtm:+.0f})",
+                "short_status": f"ACTIVE #{pos['trade_no']} (₹{pos_mtm:+.0f})",
             }
 
         is_sector_chop = (self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP")
@@ -1482,14 +1484,7 @@ class IntradayV3Engine:
                 else:
                     self.try_execute_option_entry(idx, cfg, pending, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode)
 
-        if trade_mode == "SCALP":
-            short_status = "CITY SCALP"
-        elif regime_info["is_strong_trend"]:
-            short_status = "HIGHWAY"
-        else:
-            short_status = f"Gann {int(sup)}-{int(res)}"
-        if pending:
-            short_status = f"ARMED {pending['display_side']}"
+        short_status = f"ARMED {pending['display_side']}" if pending else f"Gann {int(sup)}-{int(res)}"
 
         return {
             "idx": idx, "is_mcx": is_mcx,
@@ -1693,20 +1688,11 @@ class IntradayV3Engine:
         self.bot_status_text = "BOT LIVE"
         session_start_ts = time.time()
 
-        sec_p = self.macro_context.get("sector_perf", {})
-        g_cnt = sum(1 for v in sec_p.values() if v > 0.15)
-        r_cnt = sum(1 for v in sec_p.values() if v < -0.15)
-        pull_s = ", ".join(self.macro_context.get("top_pullers", [])) or "None"
-        drag_s = ", ".join(self.macro_context.get("top_draggers", [])) or "None"
-
         notify(
-            f"🌅 <b>V3 QUANT ENGINE • LIVE</b>\n"
+            f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
-            f"🌍 <b>Market Pulse:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> ({g_cnt}G / {r_cnt}R)\n"
-            f"🟢 <b>Pullers:</b> <code>{pull_s}</code>\n"
-            f"🔴 <b>Draggers:</b> <code>{drag_s}</code>\n"
-            f"🛡️ <b>Focus:</b> <code>{self.macro_context.get('summary', 'Normal Market')}</code>"
+            f"🕒 <b>Session:</b> <code>09:20 AM – 11:20 PM IST</code>"
         )
 
         self.start_heartbeat_thread()
