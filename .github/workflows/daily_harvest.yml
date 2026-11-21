@@ -2,9 +2,9 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Morning Indices + MCX)
-    - cron: '20 9 * * 1-5'   # Session 2: 02:50 PM IST (Afternoon Indices Close + Evening MCX)
-    - cron: '15 15 * * 1-5'  # Session 3: 08:45 PM IST (Late Night MCX till 11:20 PM IST)
+    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Zero-Gap overlap till 02:46 PM IST)
+    - cron: '16 9 * * 1-5'   # Session 2: 02:46 PM IST (Zero-Gap overlap till 08:38 PM IST)
+    - cron: '08 15 * * 1-5'  # Session 3: 08:38 PM IST (Runs till 11:20 PM IST + Nightly Auto-Tuner)
   workflow_dispatch:
 
 concurrency:
@@ -17,7 +17,7 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 358
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -47,16 +47,14 @@ jobs:
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             TOKEN_VAL=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
-            echo "✅ Auto-generated Token written to GITHUB_ENV"
-          else
-            echo "[-] ACCESS_TOKEN.txt empty or missing, fallback to Secrets"
           fi
 
-      - name: Run Live Paper Trader Engine (Live Greeks + Memory)
+      - name: Run Self-Maturing V3 Live Engine
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -64,41 +62,45 @@ jobs:
               export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
             fi
           fi
-
-          if [ -z "$UPSTOX_ACCESS_TOKEN" ]; then
-            echo "❌ Error: Token sapadla nahi!"
-            exit 1
-          fi
-
           python -u live_engine.py
 
-      - name: Upload Live Trade Journal Artifact
+      - name: Run Nightly Auto-Tuner & Market Memory Correlation
+        if: always()
+        continue-on-error: true
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+        run: |
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
+            FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+            if [ -n "$FILE_TOKEN" ]; then
+              export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
+            fi
+          fi
+          if [ -f auto_tuner.py ]; then
+            python -u auto_tuner.py
+          fi
+
+      - name: Upload Live Trade Journal & Memory Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: live-trades-journal
           path: live_journal/
 
-      - name: Generate Master Journal & Analytics
-        if: always()
-        continue-on-error: true
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          if [ -f generate_journal_analytics.py ]; then
-            python generate_journal_analytics.py
-          fi
-
-      - name: Commit & Push Journal Updates
+      - name: Commit & Push Journal, Memory & Self-Tuned Params
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/ 2>/dev/null)" ]; then
             git add live_journal/*
-            git diff --quiet && git diff --staged --quiet || (git commit -m "chore(journal): auto-update trade logs & active state [skip ci]" && git push)
-            echo "✅ Trade journal and active state successfully committed to repository."
-          else
-            echo "[-] No trade journal files found to commit today."
+            if ! git diff --quiet || ! git diff --staged --quiet; then
+              git commit -m "chore(ai-tuner): update trade journal, market memory & strategy params [skip ci]"
+              git pull --rebase origin main || git pull --rebase origin master
+              git push
+              echo "✅ Journal, Market Memory & Strategy Params committed."
+            fi
           fi
