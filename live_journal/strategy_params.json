@@ -1,0 +1,14 @@
+{
+  "min_fuel_score": 45.0,
+  "mcx_evening_fuel_score": 57.5,
+  "mcx_max_risk_inr": 1750.0,
+  "min_adx_trend": 18.0,
+  "max_chop_index": 61.8,
+  "symbol_overrides": {
+    "SILVER": {
+      "min_fuel": 45.0,
+      "cooldown": false
+    }
+  },
+  "last_tuned": "2026-11-21 13:11 IST"
+}
