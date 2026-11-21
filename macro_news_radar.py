@@ -14,7 +14,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MACRO_FILE = "live_journal/macro_context.json"
 
-# 9 Major NSE Sector Indices
 SECTOR_INDICES = {
     "BANK":   "NSE_INDEX|Nifty Bank",
     "FIN":    "NSE_INDEX|Nifty Fin Service",
@@ -27,33 +26,26 @@ SECTOR_INDICES = {
     "PHARMA": "NSE_INDEX|Nifty Pharma",
 }
 
-# Heavyweight Contributors & their approximate Nifty / BankNifty Impact Weights
 HEAVYWEIGHTS = {
-    # Banking & Financial Heavyweights
     "HDFCBANK":   {"sector": "BANK",   "nifty_w": 10.54, "bnf_w": 28.0},
     "ICICIBANK":  {"sector": "BANK",   "nifty_w": 8.81,  "bnf_w": 23.0},
     "SBIN":       {"sector": "BANK",   "nifty_w": 3.79,  "bnf_w": 10.5},
     "AXISBANK":   {"sector": "BANK",   "nifty_w": 3.32,  "bnf_w": 9.5},
     "KOTAKBANK":  {"sector": "BANK",   "nifty_w": 2.84,  "bnf_w": 9.0},
     "BAJFINANCE": {"sector": "FIN",    "nifty_w": 2.53,  "bnf_w": 0.0},
-    # Oil, Gas & Energy Heavyweights
     "RELIANCE":   {"sector": "OILGAS", "nifty_w": 7.52,  "bnf_w": 0.0},
     "ONGC":       {"sector": "OILGAS", "nifty_w": 0.85,  "bnf_w": 0.0},
     "NTPC":       {"sector": "OILGAS", "nifty_w": 1.46,  "bnf_w": 0.0},
-    # IT Heavyweights
     "INFY":       {"sector": "IT",     "nifty_w": 3.41,  "bnf_w": 0.0},
     "TCS":        {"sector": "IT",     "nifty_w": 1.97,  "bnf_w": 0.0},
     "HCLTECH":    {"sector": "IT",     "nifty_w": 1.22,  "bnf_w": 0.0},
-    # Metal & Heavy Metal / Mining Heavyweights
     "TATASTEEL":  {"sector": "METAL",  "nifty_w": 1.48,  "bnf_w": 0.0},
     "HINDALCO":   {"sector": "METAL",  "nifty_w": 1.32,  "bnf_w": 0.0},
     "JSWSTEEL":   {"sector": "METAL",  "nifty_w": 1.17,  "bnf_w": 0.0},
     "COALINDIA":  {"sector": "METAL",  "nifty_w": 0.97,  "bnf_w": 0.0},
-    # Telecom, Media & Infra Heavyweights
     "BHARTIARTL": {"sector": "MEDIA",  "nifty_w": 5.12,  "bnf_w": 0.0},
     "ZEEL":       {"sector": "MEDIA",  "nifty_w": 0.15,  "bnf_w": 0.0},
     "LT":         {"sector": "INFRA",  "nifty_w": 4.17,  "bnf_w": 0.0},
-    # Auto, FMCG & Pharma Heavyweights
     "M&M":        {"sector": "AUTO",   "nifty_w": 2.51,  "bnf_w": 0.0},
     "MARUTI":     {"sector": "AUTO",   "nifty_w": 1.47,  "bnf_w": 0.0},
     "ITC":        {"sector": "FMCG",   "nifty_w": 2.43,  "bnf_w": 0.0},
@@ -80,11 +72,6 @@ EVENT_VOLATILITY_KEYWORDS = [
     "election result", "exit poll", "fed rate", "fomc", "cpi inflation", "quarterly results"
 ]
 
-BULLISH_KEYWORDS = [
-    "rate cut", "repo rate cut", "stimulus", "record high", "fii buying", "gdp surge",
-    "landslide victory", "ceasefire", "peace deal", "normal monsoon", "earnings beat", "tax cut"
-]
-
 
 def upstox_headers():
     return {
@@ -95,9 +82,6 @@ def upstox_headers():
 
 
 def resolve_equity_keys() -> dict:
-    """
-    Resolves NSE_EQ instrument keys for all 24 heavyweight stocks.
-    """
     resolved = {}
     if not UPSTOX_ACCESS_TOKEN:
         return resolved
@@ -118,9 +102,6 @@ def resolve_equity_keys() -> dict:
 
 
 def fetch_sectors_and_heavyweights() -> dict:
-    """
-    Fetches live % change of all 9 Sectors + 24 Heavyweight Stocks + India VIX in a single batch!
-    """
     result = {
         "vix": 15.0,
         "vix_chg_pct": 0.0,
@@ -194,7 +175,6 @@ def fetch_sectors_and_heavyweights() -> dict:
     result["top_pullers"] = [f"{s}({c:+.1f}%)" for s, c, imp in stock_impacts[:3] if imp > 0]
     result["top_draggers"] = [f"{s}({c:+.1f}%)" for s, c, imp in reversed(stock_impacts[-3:]) if imp < 0]
 
-    # Determine Institutional Sector Verdict
     if bnf_weighted_sum <= -0.65 and nifty_weighted_sum >= 0.15:
         result["sector_verdict"] = "SPLIT_BANK_WEAK_NIFTY_STRONG"
     elif bnf_weighted_sum <= -0.65 and nifty_weighted_sum < 0:
@@ -281,7 +261,7 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
         for kw in SEVERE_BEARISH_KEYWORDS:
             if kw in hl:
                 bear_hits.append(kw)
-                matched_alerts.append(f"⚠️ {h[:95]}")
+                matched_alerts.append(h[:95])
                 break
         for kw in EVENT_VOLATILITY_KEYWORDS:
             if kw in hl:
@@ -319,14 +299,6 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
             f"NiftyImp {sec_data['nifty_heavy_impact']:+.2f}% | BNFImp {sec_data['bnf_heavy_impact']:+.2f}%"
         )
 
-    prev_level = "NORMAL"
-    if os.path.isfile(MACRO_FILE):
-        try:
-            with open(MACRO_FILE, "r", encoding="utf-8") as f:
-                prev_level = json.load(f).get("threat_level", "NORMAL")
-        except Exception:
-            pass
-
     context = {
         "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
         "india_vix": vix,
@@ -351,32 +323,9 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
     with open(MACRO_FILE, "w", encoding="utf-8") as f:
         json.dump(context, f, indent=2)
 
-    escalated = (threat_level in ("CRASH_ALERT", "BEARISH_CAUTION") and threat_level != prev_level)
-    if (notify_user or escalated) and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        sec_str = " │ ".join([f"{k}:{v:+.1f}%" for k, v in list(sec_data["sector_perf"].items())[:6]]) or "Market Closed"
-        pull_str = ", ".join(sec_data["top_pullers"]) or "None"
-        drag_str = ", ".join(sec_data["top_draggers"]) or "None"
-        title = "🚨 <b>BREAKING LIVE MARKET SHOCK ALERT!</b>" if escalated else "🌍 <b>9-SECTOR & HEAVYWEIGHT BREADTH RADAR</b>"
-        msg = (
-            f"{title}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 <b>Regime:</b> <code>{threat_level}</code> │ <b>Verdict:</b> <code>{sec_data['sector_verdict']}</code>\n"
-            f"📊 <b>Sectors ({sec_data['green_sectors']}G/{sec_data['red_sectors']}R):</b> <code>{sec_str}</code>\n"
-            f"🟢 <b>Pullers:</b> {pull_str} │ 🔴 <b>Draggers:</b> {drag_str}\n"
-            f"🏦 <b>BNF Heavy Impact:</b> <code>{sec_data['bnf_heavy_impact']:+.2f}%</code> │ <b>Nifty Impact:</b> <code>{sec_data['nifty_heavy_impact']:+.2f}%</code>\n"
-            f"🛡️ <b>Action:</b> {summary_reason}"
-        )
-        try:
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
-                timeout=8,
-            )
-        except Exception:
-            pass
-
+    log.info(f"[RADAR] {threat_level} | {sec_data['sector_verdict']} | {summary_reason}")
     return context
 
 
 if __name__ == "__main__":
-    evaluate_macro_context(notify_user=True)
+    evaluate_macro_context(notify_user=False)
