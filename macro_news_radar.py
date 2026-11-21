@@ -10,8 +10,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [MACRO_SECTOR_RADAR]
 log = logging.getLogger("MACRO_SECTOR_RADAR")
 
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 MACRO_FILE = "live_journal/macro_context.json"
 
 SECTOR_INDICES = {
