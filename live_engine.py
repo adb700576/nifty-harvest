@@ -70,7 +70,7 @@ GANN_ZONE_ATR_MULT = 0.40
 PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
 DASHBOARD_REFRESH_SEC = 30
-MACRO_REFRESH_SEC = 900           # Re-scan breaking war/election/RBI news every 15 mins
+MACRO_REFRESH_SEC = 180           # Scan 9 Sectors, 24 Heavyweights & Breaking News every 3 mins
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
@@ -746,7 +746,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (HIGHWAY RUNNER + CITY SCALP + MACRO SHIELD)
+# 6. SELF-MATURING V3 ENGINE (HIGHWAY RUNNER + CITY SCALP + 9-SECTOR SHIELD)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -788,8 +788,11 @@ class IntradayV3Engine:
         self.market_memory = []
         self.macro_context = {
             "threat_level": "NORMAL",
+            "sector_verdict": "BALANCED",
             "veto_ce": False,
             "veto_pe": False,
+            "veto_bnf_ce": False,
+            "emergency_eject_ce": False,
             "event_caution": False,
             "india_vix": 15.0,
             "summary": "Normal Market",
@@ -834,17 +837,21 @@ class IntradayV3Engine:
                 pass
 
     def consult_market_memory(self, idx: str, side: str, regime_info: dict, fuel: float) -> tuple:
-        # 1. Macro War / Election / Crash Shield
+        # 1. Global Macro War / Election / Crash Shield
         if side == "CE" and self.macro_context.get("veto_ce", False):
             return False, "MACRO_CRASH_VETO_CE"
         if side == "PE" and self.macro_context.get("veto_pe", False):
             return False, "MACRO_VETO_PE"
 
+        # 2. 9-Sector & Heavyweight Drag Shield (e.g., HDFC + ICICI + SBI down -> Block BankNifty/FinNifty CE)
+        if side == "CE" and idx in ("BANKNIFTY", "FINNIFTY") and self.macro_context.get("veto_bnf_ce", False):
+            return False, "BNF_HEAVYWEIGHT_DRAG_VETO_CE"
+
         sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
         if sym_ov.get("cooldown") and fuel < 65.0:
             return False, "COOLDOWN_LOW_FUEL"
 
-        # 2. Episodic Memory Check
+        # 3. Episodic Memory Check
         similar = [
             m for m in self.market_memory
             if m.get("symbol") == idx
@@ -857,7 +864,7 @@ class IntradayV3Engine:
                 return False, "MEMORY_VETO_TRAP"
 
         gear = int(self.tuned_params.get("driver_gear", 3))
-        if regime_info["is_sideways"]:
+        if regime_info["is_sideways"] or self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP":
             return True, f"CITY_SCALP_G{gear}"
         if regime_info["is_strong_trend"] and gear >= 4:
             return True, f"HIGHWAY_DRIFT_G{gear}"
@@ -865,7 +872,6 @@ class IntradayV3Engine:
 
     def compute_true_fractal_swing_sl(self, df: pd.DataFrame, side: str, spot_price: float, atr14: float) -> tuple:
         lookback = df.iloc[-10:] if len(df) >= 10 else df
-        # Uses auto-tuned sl_buffer_mult (widens if previous SL hits proved too tight)
         sl_mult = float(self.tuned_params.get("sl_buffer_mult", PIVOT_BUFFER_ATR_MULT))
         buffer = sl_mult * atr14
         min_spot_risk = 0.35 * atr14
@@ -947,7 +953,6 @@ class IntradayV3Engine:
                     peak_gain = pos.get("peak_gain", 0.0)
                     peak_r = peak_gain / r_unit
 
-                    # Cushion-adjusted trail lock (avoids cutting early on normal pullbacks)
                     lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
                     lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
 
@@ -1111,7 +1116,13 @@ class IntradayV3Engine:
                     peak_r = pos.get("peak_gain", 0.0) / r_unit
                     tick_sz = pos.get("tick_size", 0.05)
 
-                    # 1. City Traffic Scalp Mode: Quick book at scalp_target_r (e.g. 1.35R)
+                    # 1. Breaking News / War / Crash Emergency CE Ejector
+                    if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
+                        exit_reason = "BREAKING_NEWS_CE_EJECT"
+                        target_idx = idx
+                        break
+
+                    # 2. City Traffic Scalp Mode: Quick book at scalp_target_r (e.g. 1.35R)
                     if pos.get("trade_mode") == "SCALP":
                         scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
                         if curr_r >= scalp_r:
@@ -1119,7 +1130,7 @@ class IntradayV3Engine:
                             target_idx = idx
                             break
 
-                    # 2. Highway Uncapped Runner / Drift Mode
+                    # 3. Highway Uncapped Runner / Drift Mode
                     if peak_r >= STAGE4_MOONSHOT_R:
                         lock_pct = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
                         lock_gain = pos["peak_gain"] * lock_pct
@@ -1230,6 +1241,7 @@ class IntradayV3Engine:
         mode_badge = "🧪 PAPER" if PAPER_MODE else "⚡ LIVE"
         gear = int(self.tuned_params.get("driver_gear", 3))
         macro_lvl = self.macro_context.get("threat_level", "NORMAL")
+        sec_verd = self.macro_context.get("sector_verdict", "BALANCED")
         net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
         idx_trades = [t for t in self.closed_trades if t["symbol"] in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
@@ -1242,7 +1254,7 @@ class IntradayV3Engine:
             f"╚══════════════════════════════╝",
             f"💼 <b>Day Net:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b> │ {mode_badge} │ 🏎️ <b>Gear {gear}/5</b>",
             f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b> │ Live MTM: <b>₹{live_mtm:+,.2f}</b>",
-            f"   ├ Macro: <code>{macro_lvl}</code> (VIX {self.macro_context.get('india_vix', 15.0)})",
+            f"   ├ Radar: <code>{macro_lvl}</code> │ Sectors: <code>{sec_verd}</code>",
             f"   └ Today: <b>{len(self.closed_trades)}</b> ({total_wins}W) │ Index: <b>{len(idx_trades)}</b> │ MCX: <b>{len(mcx_trades)}</b>",
         ]
 
@@ -1282,7 +1294,7 @@ class IntradayV3Engine:
                     f"  └ SL:<code>{t['sl']:.2f}</code> │ {t['exit_reason']} │ <b>₹{t['pnl']:+,.2f}</b>"
                 )
         elif not active_snap:
-            lines.append("  <i>Scanning Highway Trends, City Scalps & Gann Levels...</i>")
+            lines.append("  <i>Scanning 9 Sectors, Heavyweights & Gann Levels...</i>")
 
         if self.last_summaries:
             lines.append("\n📡 <b>5 INDICES RADAR</b>")
@@ -1537,10 +1549,8 @@ class IntradayV3Engine:
                 "short_status": f"#{pos['trade_no']} RUNNER (₹{pos_mtm:+.0f})🔥",
             }
 
-        # Dual-Mode Intelligence:
-        # - Sideways (City Traffic) -> Allows high-precision Gann Scalp Mode (1.35R quick exit)
-        # - Trending (Highway)      -> Full Uncapped Runner Mode
-        trade_mode = "SCALP" if regime_info["is_sideways"] else "HIGHWAY"
+        is_sector_chop = (self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP")
+        trade_mode = "SCALP" if (regime_info["is_sideways"] or is_sector_chop) else "HIGHWAY"
 
         pat_info = detect_6_gann_patterns(df, gann_levels, atr14)
         near_gann, bull_pattern, bear_pattern = pat_info["near_gann"], pat_info["bull_pattern"], pat_info["bear_pattern"]
@@ -1578,7 +1588,6 @@ class IntradayV3Engine:
             eve_req_fuel = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
             req_fuel = max(base_req_fuel, eve_req_fuel) if (is_mcx and hhmm_now >= "15:30") else base_req_fuel
 
-            # In City Traffic (Sideways) or Event Volatility, require cleaner Fuel (+8) for scalping
             if trade_mode == "SCALP" or self.macro_context.get("event_caution", False):
                 req_fuel += 8.0
 
@@ -1595,7 +1604,7 @@ class IntradayV3Engine:
                 else:
                     self.try_execute_option_entry(idx, cfg, pending, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag, trade_mode)
 
-        if regime_info["is_sideways"]:
+        if trade_mode == "SCALP":
             short_status = f"CITY SCALP (ADX {regime_info['adx']:.0f}) 🚦"
         elif regime_info["is_strong_trend"]:
             short_status = f"HIGHWAY (ADX {regime_info['adx']:.0f}) 🛣️"
@@ -1693,7 +1702,6 @@ class IntradayV3Engine:
         raw_delta = abs(float(greeks.get("delta", 0.0)))
         live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else 0.50
 
-        # Gear-scaled capital allocation (Gear 1-2 = 60% size, Gear 3 = 100%, Gear 4-5 = 100%)
         gear = int(self.tuned_params.get("driver_gear", 3))
         eff_cap = CAPITAL_PER_TRADE * (0.65 if gear <= 2 else 1.0)
         lots = max(1, int(eff_cap // (ltp * cfg["lot_size"])))
@@ -1762,7 +1770,9 @@ class IntradayV3Engine:
             curr_r = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) / r_unit
             exit_reason = None
 
-            if pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
+            if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
+                exit_reason = "BREAKING_NEWS_CE_EJECT"
+            elif pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
                 exit_reason = f"CITY_SCALP_TARGET ({curr_r:.1f}R)"
             elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
                 exit_reason = f"EOD_EXIT ({INDEX_EXIT_TIME})"
@@ -1831,7 +1841,7 @@ class IntradayV3Engine:
             f"🟢 <b>V3 SELF-MATURING QUANT ENGINE LIVE</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🏎️ <b>Driver Gear:</b> <b>{gear}/5</b> │ <b>Trail Cushion:</b> {self.tuned_params.get('trail_cushion_mult', 1.0)}x │ <b>Memory:</b> {len(self.market_memory)}\n"
-            f"🌍 <b>Macro Radar:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> (VIX {self.macro_context.get('india_vix', 15.0)}) │ Carried: {carried_cnt}"
+            f"🌍 <b>Macro/Sector:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> ({self.macro_context.get('sector_verdict', 'BALANCED')}) │ Carried: {carried_cnt}"
         )
 
         while True:
