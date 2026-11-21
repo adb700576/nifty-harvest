@@ -1,5 +1,4 @@
 import os
-import io
 import csv
 import sys
 import json
@@ -11,10 +10,6 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -69,7 +64,7 @@ MCX_EXIT_TIME = "23:15"
 GANN_ZONE_ATR_MULT = 0.40
 PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
-DASHBOARD_REFRESH_SEC = 30
+DASHBOARD_PULSE_SEC = 5.0         # Blink Dot + Live LTP + Pinned Board Refresh every 5s
 MACRO_REFRESH_SEC = 180           # Scan 9 Sectors, 24 Heavyweights & Breaking News every 3 mins
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
@@ -78,7 +73,7 @@ PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
 MACRO_FILE = "live_journal/macro_context.json"
 
-# --- UNCAPPED HIGHWAY RUNNER STAGES (1R = Initial SL Risk) ---
+# --- UNCAPPED HIGHWAY RUNNER STAGES (1R = Dynamic Pivot SL Risk) ---
 STAGE1_BE_R = 1.5
 STAGE2_LOCK_R = 2.5
 STAGE3_TREND_R = 4.0
@@ -136,7 +131,7 @@ def push_trade_to_google_sheet(trade_row: dict):
 
 
 # ==============================================================================
-# 2. TELEGRAM UI, CHARTS & CHARGES
+# 2. TELEGRAM UI & AUTO-CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -156,72 +151,6 @@ def notify(msg: str, silent: bool = False):
                 time.sleep(0.5)
             else:
                 log.warning(f"Telegram send error after retry: {e}")
-
-
-def make_r_bar(r_mult: float, length: int = 8) -> str:
-    clamped = max(0.0, min(1.0, r_mult / 8.0))
-    filled = int(round(clamped * length))
-    return "▰" * filled + "▱" * (length - filled)
-
-
-def send_trade_alert_with_chart(df: pd.DataFrame, title: str, caption: str, gann_lvl: float, spot_entry: float, spot_sl: float, is_exit: bool = False, spot_exit: float = None):
-    clean_lines = [line.strip() for line in caption.splitlines() if line.strip()]
-    log.info(f"[MIRROR] {' | '.join(clean_lines)}")
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    if not df.empty:
-        try:
-            plot_df = df.tail(36).copy()
-            fig, ax = plt.subplots(figsize=(10.5, 5.0), dpi=140)
-            fig.patch.set_facecolor("#0f172a")
-            ax.set_facecolor("#1e293b")
-
-            ax.plot(plot_df["timestamp"], plot_df["close"], color="#f8fafc", linewidth=2.1, label="Price 5M")
-            ax.axhline(gann_lvl, color="#38bdf8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
-            ax.axhline(spot_sl, color="#f43f5e", linestyle=":", linewidth=1.6, label=f"Pivot Swing SL: {spot_sl:.1f}")
-            ax.axhspan(min(spot_entry, spot_sl), max(spot_entry, spot_sl), color="#f43f5e", alpha=0.08)
-
-            entry_ts = plot_df["timestamp"].iloc[-1] if not is_exit else plot_df["timestamp"].iloc[max(0, len(plot_df) - 4)]
-            ax.scatter([entry_ts], [spot_entry], color="#22c55e", edgecolors="#ffffff", linewidth=1.2, s=85, zorder=5, label=f"Entry: {spot_entry:.1f}")
-
-            if is_exit and spot_exit is not None:
-                exit_ts = plot_df["timestamp"].iloc[-1]
-                ax.scatter([exit_ts], [spot_exit], color="#f59e0b", edgecolors="#ffffff", linewidth=1.2, marker="X", s=100, zorder=6, label=f"Exit: {spot_exit:.1f}")
-
-            ax.set_title(title, fontsize=11.5, fontweight="bold", color="#f8fafc", pad=12)
-            ax.tick_params(colors="#cbd5e1", labelsize=8.5)
-            for spine in ax.spines.values():
-                spine.set_color("#334155")
-            ax.grid(True, linestyle="--", color="#334155", alpha=0.55)
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %H:%M", tz=IST))
-            leg = ax.legend(loc="upper left", fontsize=8.5, facecolor="#0f172a", edgecolor="#334155", labelcolor="#f8fafc")
-            leg.get_frame().set_alpha(0.92)
-            plt.tight_layout()
-
-            buf = io.BytesIO()
-            plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
-            plt.close(fig)
-            buf.seek(0)
-
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-            files = {"photo": ("setup_chart.png", buf, "image/png")}
-            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-            resp = requests.post(url, data=data, files=files, timeout=12).json()
-            if resp.get("ok"):
-                return
-        except Exception as e:
-            log.warning(f"Chart send failed, falling back to text alert: {e}")
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": caption, "parse_mode": "HTML"},
-            timeout=8,
-        )
-    except Exception as e:
-        log.warning(f"Text alert fallback error: {e}")
 
 
 def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
@@ -346,85 +275,6 @@ def record_trade_journal(row: dict):
         log.error(f"Journal write error: {e}")
 
     push_trade_to_google_sheet(row)
-
-
-def build_master_journal_report(now_ist: datetime) -> str:
-    today_str = now_ist.strftime("%Y-%m-%d")
-    curr_year, curr_week, _ = now_ist.isocalendar()
-    curr_month_prefix = now_ist.strftime("%Y-%m")
-    month_label = now_ist.strftime("%B %Y")
-
-    rows = []
-    if os.path.isfile(JOURNAL_FILE):
-        try:
-            with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    try:
-                        d_obj = datetime.strptime(r["date"], "%Y-%m-%d")
-                        y_iso, w_iso, _ = d_obj.isocalendar()
-                        rows.append({
-                            "date": r["date"], "year": y_iso, "week": w_iso,
-                            "points": float(r.get("points", 0.0)),
-                            "brokerage": float(r.get("brokerage", 0.0)),
-                            "taxes_other": float(r.get("taxes_other", 0.0)),
-                            "charges": float(r.get("charges", 0.0)),
-                            "pnl": float(r.get("pnl", 0.0)),
-                        })
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    def summarize(sub_rows):
-        total = len(sub_rows)
-        wins = sum(1 for x in sub_rows if x["pnl"] > 0)
-        losses = sum(1 for x in sub_rows if x["pnl"] <= 0)
-        wr = round((wins / total) * 100.0, 1) if total > 0 else 0.0
-        pts = round(sum(x["points"] for x in sub_rows), 2)
-        brk = round(sum(x["brokerage"] for x in sub_rows), 2)
-        tax = round(sum(x["taxes_other"] for x in sub_rows), 2)
-        chg = round(sum(x["charges"] for x in sub_rows), 2)
-        net = round(sum(x["pnl"] for x in sub_rows), 2)
-        return total, wins, losses, wr, pts, brk, tax, chg, net
-
-    d_tot, d_win, d_loss, d_wr, d_pts, d_brk, d_tax, d_chg, d_net = summarize([r for r in rows if r["date"] == today_str])
-    w_tot, _, _, w_wr, _, _, _, _, w_net = summarize([r for r in rows if r["year"] == curr_year and r["week"] == curr_week])
-
-    month_rows = [r for r in rows if r["date"].startswith(curr_month_prefix)]
-    m_tot, _, _, m_wr, _, _, _, _, m_net = summarize(month_rows)
-
-    weeks_in_month = sorted({r["week"] for r in month_rows})
-    week_lines = []
-    for idx_w, wk in enumerate(weeks_in_month, start=1):
-        wt, _, _, wwr, _, _, _, _, wnet = summarize([r for r in month_rows if r["week"] == wk])
-        week_lines.append(f"  ├ Week {idx_w} (W{wk}): {wt} ट्रेड्स │ {wwr:.0f}% Win │ <b>₹ {wnet:+,.2f}</b>")
-    if not week_lines:
-        week_lines.append(f"  └ Week 1 (W{curr_week}): 0 ट्रेड्स │ 0% Win │ ₹ +0.00")
-
-    y_rows = [r for r in rows if r["year"] == curr_year]
-    y_tot, y_win, y_loss, y_wr, _, y_brk, y_tax, y_chg, y_net = summarize(y_rows)
-
-    return "\n".join([
-        "╔══════════════════════════════╗",
-        "  📊 <b>V3 ALGO • मास्टर ट्रेड जर्नल रिपोर्ट</b>",
-        "╚══════════════════════════════╝",
-        f"📅 <b>आजचा निकाल ({today_str})</b>",
-        f"  • ट्रेड्स: <b>{d_tot}</b> (🟢 {d_win} │ 🔴 {d_loss}) │ Win Rate: <b>{d_wr:.1f}%</b>",
-        f"  • पॉईंट्स: <b>{d_pts:+.2f} pts</b> │ चार्जेस: ₹{d_chg:,.2f} (Brk ₹{d_brk:,.0f} + Tax ₹{d_tax:,.0f})",
-        f"  • आजचा निव्वळ नफा (Net PnL): <b>₹ {d_net:+,.2f}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📈 <b>चालू आठवडा (W{curr_week})</b>",
-        f"  • एकूण ट्रेड्स: <b>{w_tot}</b> │ Win Rate: <b>{w_wr:.1f}%</b> │ Net: <b>₹ {w_net:+,.2f}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🗓️ <b>चालू महिना ({month_label})</b>",
-        *week_lines,
-        f"  └ एकूण महिना: <b>₹ {m_net:+,.2f}</b> (Win Rate: {m_wr:.1f}%)",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🏆 <b>वार्षिक / ऑल-टाइम निकाल ({curr_year})</b>",
-        f"  • एकूण ट्रेड्स: <b>{y_tot}</b> (🟢 {y_win} │ 🔴 {y_loss}) │ Win Rate: <b>{y_wr:.1f}%</b>",
-        f"  • एकूण ब्रोकरेज व टॅक्स: <b>₹ {y_chg:,.2f}</b> (Brk ₹{y_brk:,.0f} + Tax ₹{y_tax:,.0f})",
-        f"  • एकूण निव्वळ नफा (Net PnL): <b>₹ {y_net:+,.2f}</b>",
-    ])
 
 
 # ==============================================================================
@@ -565,7 +415,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. REGIME INTELLIGENCE (HIGHWAY vs CITY TRAFFIC), GANN LEVELS & FUEL SCORE
+# 4. REGIME INTELLIGENCE, GANN LEVELS & FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 12:
@@ -746,7 +596,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (HIGHWAY RUNNER + CITY SCALP + 9-SECTOR SHIELD)
+# 6. SELF-MATURING V3 ENGINE (SINGLE-WINDOW PINNED TERMINAL + 5S PULSE)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -765,12 +615,13 @@ class IntradayV3Engine:
         self.last_summaries = {}
         self.latest_dfs = {}
         self.dashboard_msg_id = None
-        self.last_dashboard_ts = 0.0
+        self.dashboard_pulse = False
+        self.dashboard_lock = threading.Lock()
         self.last_macro_ts = 0.0
         self.streamer = None
         self.ws_connected = False
         self.subscribed_keys = set()
-        self.bot_status_text = "🟢 BOT LIVE • RUNNING"
+        self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
 
         self.tuned_params = {
@@ -825,7 +676,7 @@ class IntradayV3Engine:
         self.last_macro_ts = now_ts
         if HAS_MACRO_RADAR:
             try:
-                self.macro_context = evaluate_macro_context(notify_user=force)
+                self.macro_context = evaluate_macro_context(notify_user=False)
                 return
             except Exception:
                 pass
@@ -837,13 +688,10 @@ class IntradayV3Engine:
                 pass
 
     def consult_market_memory(self, idx: str, side: str, regime_info: dict, fuel: float) -> tuple:
-        # 1. Global Macro War / Election / Crash Shield
         if side == "CE" and self.macro_context.get("veto_ce", False):
             return False, "MACRO_CRASH_VETO_CE"
         if side == "PE" and self.macro_context.get("veto_pe", False):
             return False, "MACRO_VETO_PE"
-
-        # 2. 9-Sector & Heavyweight Drag Shield (e.g., HDFC + ICICI + SBI down -> Block BankNifty/FinNifty CE)
         if side == "CE" and idx in ("BANKNIFTY", "FINNIFTY") and self.macro_context.get("veto_bnf_ce", False):
             return False, "BNF_HEAVYWEIGHT_DRAG_VETO_CE"
 
@@ -851,7 +699,6 @@ class IntradayV3Engine:
         if sym_ov.get("cooldown") and fuel < 65.0:
             return False, "COOLDOWN_LOW_FUEL"
 
-        # 3. Episodic Memory Check
         similar = [
             m for m in self.market_memory
             if m.get("symbol") == idx
@@ -863,12 +710,9 @@ class IntradayV3Engine:
             if (bad_entries / len(similar)) >= 0.65 and fuel < 62.0:
                 return False, "MEMORY_VETO_TRAP"
 
-        gear = int(self.tuned_params.get("driver_gear", 3))
         if regime_info["is_sideways"] or self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP":
-            return True, f"CITY_SCALP_G{gear}"
-        if regime_info["is_strong_trend"] and gear >= 4:
-            return True, f"HIGHWAY_DRIFT_G{gear}"
-        return True, f"RUNNER_G{gear}"
+            return True, "CITY_SCALP"
+        return True, "HIGHWAY_RUNNER"
 
     def compute_true_fractal_swing_sl(self, df: pd.DataFrame, side: str, spot_price: float, atr14: float) -> tuple:
         lookback = df.iloc[-10:] if len(df) >= 10 else df
@@ -961,30 +805,30 @@ class IntradayV3Engine:
                         cand_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = f"GAP_MOONSHOT ({peak_r:.1f}R)"
+                            pos["trail_stage"] = f"MOONSHOT {int(lock_80*100)}%"
                     elif peak_r >= STAGE3_TREND_R:
                         lock_gain = peak_gain * lock_70
                         cand_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = f"GAP_TREND ({peak_r:.1f}R)"
+                            pos["trail_stage"] = f"TREND {int(lock_70*100)}%"
                     elif peak_r >= STAGE2_LOCK_R:
                         cand_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = f"GAP_LOCK_1.5R ({peak_r:.1f}R)"
+                            pos["trail_stage"] = "LOCK 1.5R"
                     elif peak_r >= STAGE1_BE_R:
                         be_off = max(round_to_tick(entry * 0.0001, tick_sz), tick_sz * 2)
                         cand_sl = round_to_tick((entry - be_off) if is_short else (entry + be_off), tick_sz)
                         if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
                             pos["sl"] = cand_sl
-                            pos["trail_stage"] = "GAP_BE_1.5R"
+                            pos["trail_stage"] = "COST-TO-COST"
 
                     self.active_positions[idx] = pos
                     self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)))
 
                     if (not is_short and curr_ltp <= pos["sl"]) or (is_short and curr_ltp >= pos["sl"]):
-                        reason = "GAP_TRAIL_SL_HIT" if pos.get("trail_stage") else "GAP_STOP_LOSS_HIT"
+                        reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
                         immediate_exits.append((idx, curr_ltp, reason))
 
             for idx, pos in list(self.active_positions.items()):
@@ -995,7 +839,7 @@ class IntradayV3Engine:
 
             self.save_active_positions_state()
         except Exception as e:
-            log.warning(f"Active positions restore/forensics error: {e}")
+            log.warning(f"Active positions restore error: {e}")
 
     def load_today_state_from_journal(self):
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
@@ -1116,28 +960,45 @@ class IntradayV3Engine:
                     peak_r = pos.get("peak_gain", 0.0) / r_unit
                     tick_sz = pos.get("tick_size", 0.05)
 
-                    # 1. Breaking News / War / Crash Emergency CE Ejector
                     if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
                         exit_reason = "BREAKING_NEWS_CE_EJECT"
                         target_idx = idx
                         break
 
-                    # 2. City Traffic Scalp Mode: Quick book at scalp_target_r (e.g. 1.35R)
                     if pos.get("trade_mode") == "SCALP":
                         scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
                         if curr_r >= scalp_r:
-                            exit_reason = f"CITY_SCALP_TARGET ({curr_r:.1f}R)"
+                            exit_reason = "SCALP_TARGET_HIT"
                             target_idx = idx
                             break
 
-                    # 3. Highway Uncapped Runner / Drift Mode
+                    # Instant Tick-by-Tick Progressive SL Trailing (Updates Pinned Board every 5s)
+                    lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
+                    lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
+
                     if peak_r >= STAGE4_MOONSHOT_R:
-                        lock_pct = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
-                        lock_gain = pos["peak_gain"] * lock_pct
-                        moon_sl = round_to_tick((pos["entry_price"] - lock_gain) if is_short else (pos["entry_price"] + lock_gain), tick_sz)
-                        if (is_short and moon_sl < pos["sl"]) or (not is_short and moon_sl > pos["sl"]):
-                            pos["sl"] = moon_sl
-                            pos["trail_stage"] = f"MOONSHOT {int(lock_pct*100)}% ({peak_r:.1f}R)"
+                        lock_gain = pos["peak_gain"] * lock_80
+                        cand_sl = round_to_tick((pos["entry_price"] - lock_gain) if is_short else (pos["entry_price"] + lock_gain), tick_sz)
+                        if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
+                            pos["sl"] = cand_sl
+                            pos["trail_stage"] = f"MOONSHOT {int(lock_80*100)}%"
+                    elif peak_r >= STAGE3_TREND_R:
+                        lock_gain = pos["peak_gain"] * lock_70
+                        cand_sl = round_to_tick((pos["entry_price"] - lock_gain) if is_short else (pos["entry_price"] + lock_gain), tick_sz)
+                        if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
+                            pos["sl"] = cand_sl
+                            pos["trail_stage"] = f"TREND {int(lock_70*100)}%"
+                    elif peak_r >= STAGE2_LOCK_R:
+                        cand_sl = round_to_tick((pos["entry_price"] - 1.5 * r_unit) if is_short else (pos["entry_price"] + 1.5 * r_unit), tick_sz)
+                        if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
+                            pos["sl"] = cand_sl
+                            pos["trail_stage"] = "LOCK 1.5R"
+                    elif peak_r >= STAGE1_BE_R:
+                        be_off = max(round_to_tick(pos["entry_price"] * 0.0001, tick_sz), tick_sz * 2)
+                        cand_sl = round_to_tick((pos["entry_price"] - be_off) if is_short else (pos["entry_price"] + be_off), tick_sz)
+                        if (is_short and cand_sl < pos["sl"]) or (not is_short and cand_sl > pos["sl"]):
+                            pos["sl"] = cand_sl
+                            pos["trail_stage"] = "COST-TO-COST"
 
                     if not is_short and ltp <= pos["sl"]:
                         exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
@@ -1222,12 +1083,6 @@ class IntradayV3Engine:
                 return 0.0
             positions_snap = list(self.active_positions.values())
 
-        if not self.ws_connected:
-            quotes = fetch_ltp_quote([p["instrument_key"] for p in positions_snap])
-            for pos in positions_snap:
-                q_data = quotes.get(pos["instrument_key"], {})
-                pos["last_ltp"] = float(q_data.get("last_price", pos.get("last_ltp", pos["entry_price"])))
-
         total_mtm = 0.0
         for pos in positions_snap:
             ltp = pos.get("last_ltp", pos["entry_price"])
@@ -1235,83 +1090,166 @@ class IntradayV3Engine:
             total_mtm += (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
         return round(total_mtm, 2)
 
-    def render_live_dashboard(self, hhmm: str):
-        live_mtm = self.compute_live_mtm()
-        net_pnl = round(self.day_pnl + live_mtm, 2)
-        mode_badge = "🧪 PAPER" if PAPER_MODE else "⚡ LIVE"
-        gear = int(self.tuned_params.get("driver_gear", 3))
-        macro_lvl = self.macro_context.get("threat_level", "NORMAL")
-        sec_verd = self.macro_context.get("sector_verdict", "BALANCED")
-        net_icon = "🟢" if net_pnl >= 0 else "🔴"
+    def get_performance_summary_lines(self, now_ist: datetime, live_mtm: float) -> list:
+        today_str = now_ist.strftime("%Y-%m-%d")
+        curr_year, curr_week, _ = now_ist.isocalendar()
+        curr_month_prefix = now_ist.strftime("%Y-%m")
 
-        idx_trades = [t for t in self.closed_trades if t["symbol"] in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
-        mcx_trades = [t for t in self.closed_trades if t["symbol"] not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
-        total_wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
+        rows = []
+        if os.path.isfile(JOURNAL_FILE):
+            try:
+                with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
+                    for r in csv.DictReader(f):
+                        try:
+                            d_obj = datetime.strptime(r["date"], "%Y-%m-%d")
+                            y_iso, w_iso, _ = d_obj.isocalendar()
+                            rows.append({
+                                "date": r["date"],
+                                "year": y_iso,
+                                "week": w_iso,
+                                "pnl": float(r.get("pnl", 0.0)),
+                            })
+                        except Exception:
+                            continue
+            except Exception:
+                pass
 
-        lines = [
-            f"╔══════════════════════════════╗",
-            f"  {self.bot_status_text} │ <code>{hhmm} IST</code>",
-            f"╚══════════════════════════════╝",
-            f"💼 <b>Day Net:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b> │ {mode_badge} │ 🏎️ <b>Gear {gear}/5</b>",
-            f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b> │ Live MTM: <b>₹{live_mtm:+,.2f}</b>",
-            f"   ├ Radar: <code>{macro_lvl}</code> │ Sectors: <code>{sec_verd}</code>",
-            f"   └ Today: <b>{len(self.closed_trades)}</b> ({total_wins}W) │ Index: <b>{len(idx_trades)}</b> │ MCX: <b>{len(mcx_trades)}</b>",
+        def calc(sub):
+            tot = len(sub)
+            wins = sum(1 for x in sub if x["pnl"] > 0)
+            wr = int(round((wins / tot) * 100.0)) if tot > 0 else 0
+            net = round(sum(x["pnl"] for x in sub), 2)
+            return tot, wr, net
+
+        d_tot, d_wr, d_net = calc([r for r in rows if r["date"] == today_str])
+        w_tot, w_wr, w_net = calc([r for r in rows if r["year"] == curr_year and r["week"] == curr_week])
+        m_tot, m_wr, m_net = calc([r for r in rows if r["date"].startswith(curr_month_prefix)])
+        y_tot, y_wr, y_net = calc([r for r in rows if r["year"] == curr_year])
+
+        d_live = round(d_net + live_mtm, 2)
+        w_live = round(w_net + live_mtm, 2)
+        m_live = round(m_net + live_mtm, 2)
+        y_live = round(y_net + live_mtm, 2)
+
+        return [
+            f"• <b>Today:</b> <b>₹{d_live:+,.2f}</b> ({d_tot}T | {d_wr}% Win)",
+            f"• <b>This Week:</b> <b>₹{w_live:+,.2f}</b> ({w_tot}T | {w_wr}% Win)",
+            f"• <b>This Month:</b> <b>₹{m_live:+,.2f}</b> ({m_tot}T | {m_wr}% Win)",
+            f"• <b>This Year:</b> <b>₹{y_live:+,.2f}</b> ({y_tot}T | {y_wr}% Win)",
         ]
 
-        with self.pos_lock:
-            active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
+    def render_live_dashboard(self, hhmm: str):
+        with self.dashboard_lock:
+            now_ist = datetime.now(IST)
+            live_mtm = self.compute_live_mtm()
+            net_pnl = round(self.day_pnl + live_mtm, 2)
+            mode_badge = "<code>PAPER</code>" if PAPER_MODE else "<code>LIVE</code>"
+            macro_lvl = self.macro_context.get("threat_level", "NORMAL")
+            net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
-        if active_snap:
-            lines.append("\n🔥 <b>ACTIVE POSITIONS</b>")
-            lines.append("──────────────────────────────")
-            for p_idx, pos in active_snap:
-                ltp = pos.get("last_ltp", pos["entry_price"])
-                is_short = pos["tx_side"] == "SELL"
-                pnl = (pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]
-                curr_gain = (pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])
-                r_unit = max(pos.get("r_unit", 1.0), 1e-6)
-                curr_r = curr_gain / r_unit
-                bar = make_r_bar(curr_r, 8)
-                t_mode = pos.get("trade_mode", "HIGHWAY")
-                tgt_txt = f"Scalp {self.tuned_params.get('scalp_target_r', 1.35)}R" if t_mode == "SCALP" else "UNCAPPED ∞"
-                trail_tag = f" 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f" 🛣️<code>{t_mode}</code>"
-                p_icon = "🟢" if pnl >= 0 else "🔴"
-                lines.append(
-                    f"<b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>{trail_tag}\n"
-                    f"  ├ 🕒 <code>{pos['entry_time'][:5]}</code> │ In <b>₹{pos['entry_price']:.2f}</b> → LTP <b>₹{ltp:.2f}</b>\n"
-                    f"  ├ 🛡️ Trail SL <code>₹{pos['sl']:.2f}</code> │ 🎯 <b>{tgt_txt}</b>\n"
-                    f"  └ {bar} <b>{curr_r:+.1f}R</b> │ {p_icon} <b>₹{pnl:+,.2f}</b>"
-                )
+            self.dashboard_pulse = not self.dashboard_pulse
+            if "CLOSED" in self.bot_status_text or "STOPPED" in self.bot_status_text:
+                status_header = "🔴 <b>MARKET CLOSED</b>"
+            elif "PAUSED" in self.bot_status_text:
+                status_header = "🟡 <b>BOT PAUSED</b>"
+            else:
+                pulse_dot = "🟢" if self.dashboard_pulse else "⚪"
+                status_header = f"{pulse_dot} <b>BOT LIVE</b>"
 
-        lines.append("\n📒 <b>TODAY'S TRADE LEDGER (#1 → #N)</b>")
-        lines.append("──────────────────────────────")
-        if self.closed_trades:
-            for t in sorted(self.closed_trades, key=lambda x: x["trade_no"]):
-                icon = "✅" if t["pnl"] >= 0 else "❌"
-                lines.append(
-                    f"<b>#{t['trade_no']}</b> {icon} <b>{t['symbol']}</b> <code>{t['contract']} {t['side']}</code>\n"
-                    f"  ├ 🕒 <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> │ ₹{t['entry_price']:.2f}→₹{t['exit_price']:.2f} (<b>{t['points']:+.2f}p</b>)\n"
-                    f"  └ SL:<code>{t['sl']:.2f}</code> │ {t['exit_reason']} │ <b>₹{t['pnl']:+,.2f}</b>"
-                )
-        elif not active_snap:
-            lines.append("  <i>Scanning 9 Sectors, Heavyweights & Gann Levels...</i>")
+            total_wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
+            total_losses = sum(1 for t in self.closed_trades if t["pnl"] <= 0)
 
-        if self.last_summaries:
-            lines.append("\n📡 <b>5 INDICES RADAR</b>")
-            lines.append("──────────────────────────────")
-            for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
-                s = self.last_summaries.get(idx)
-                if s:
-                    lines.append(f"• <b>{s['idx']:<10}</b> <code>{s['spot']}</code> │ Fuel <b>{s['fuel']}</b> │ {s['short_status']}")
+            lines = [
+                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge}",
+                f"────────────────────────────",
+                f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
+                f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
+                f"• Today: <b>{len(self.closed_trades)} Trades</b> ({total_wins}W / {total_losses}L)  |  Pulse: <code>{macro_lvl}</code>",
+            ]
 
-            lines.append("\n🛢️ <b>5 MCX COMMODITIES RADAR</b>")
-            lines.append("──────────────────────────────")
-            for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
-                s = self.last_summaries.get(idx)
-                if s:
-                    lines.append(f"• <b>{s['idx']:<10}</b> <code>{s['spot']}</code> │ Fuel <b>{s['fuel']}</b> │ {s['short_status']}")
+            with self.pos_lock:
+                active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
 
-        self.dashboard_msg_id = upsert_telegram_dashboard("\n".join(lines), self.dashboard_msg_id)
+            if active_snap:
+                lines.append(f"\n🔥 <b>ACTIVE POSITIONS ({len(active_snap)})</b>")
+                for p_idx, pos in active_snap:
+                    ltp = pos.get("last_ltp", pos["entry_price"])
+                    is_short = pos["tx_side"] == "SELL"
+                    pnl = round((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"], 2)
+                    sl_pnl = round((pos["entry_price"] - pos["sl"]) * pos["qty"] if is_short else (pos["sl"] - pos["entry_price"]) * pos["qty"], 2)
+                    t_mode = pos.get("trade_mode", "HIGHWAY")
+                    tgt_txt = pos.get("target_label", "SCALP" if t_mode == "SCALP" else "UNCAPPED ∞")
+                    trail_tag = f"🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{t_mode}</code>"
+                    p_icon = "🟢" if pnl >= 0 else "🔴"
+                    sl_label = f"Locked <b>₹{sl_pnl:+,.0f}</b>" if sl_pnl >= 0 else f"Max Risk <b>₹{abs(sl_pnl):,.0f}</b>"
+                    lines.extend([
+                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>  |  {trail_tag}",
+                        f"  Entry: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
+                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
+                        f"  Live P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                    ])
+
+            lines.append("\n📒 <b>TODAY'S CLOSED TRADES</b>")
+            if self.closed_trades:
+                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"]):
+                    icon = "✅" if t["pnl"] >= 0 else "❌"
+                    lines.append(
+                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} <b>₹{t['pnl']:+,.2f}</b>\n"
+                        f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>  |  ₹{t['entry_price']:.2f}→₹{t['exit_price']:.2f}  |  <i>{t['exit_reason']}</i>"
+                    )
+            elif not active_snap:
+                lines.append("<i>Scanning 9 Sectors, Heavyweights &amp; Gann Levels...</i>")
+
+            if self.last_summaries:
+                lines.append("\n📡 <b>INDICES RADAR</b>")
+                for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+                    s = self.last_summaries.get(idx)
+                    if s:
+                        lines.append(f"• <b>{s['idx']}</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
+
+                lines.append("\n🛢️ <b>MCX RADAR</b>")
+                for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
+                    s = self.last_summaries.get(idx)
+                    if s:
+                        lines.append(f"• <b>{s['idx']}</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
+
+            lines.append("\n📊 <b>PERFORMANCE SUMMARY (NET ₹)</b>")
+            lines.extend(self.get_performance_summary_lines(now_ist, live_mtm))
+
+            self.dashboard_msg_id = upsert_telegram_dashboard("\n".join(lines), self.dashboard_msg_id)
+
+    def start_heartbeat_thread(self):
+        def _pulse_loop():
+            while not self.stop_requested:
+                time.sleep(DASHBOARD_PULSE_SEC)
+                if self.stop_requested or not self.dashboard_msg_id or not self.last_summaries:
+                    continue
+                if "CLOSED" in self.bot_status_text or "STOPPED" in self.bot_status_text:
+                    break
+                try:
+                    with self.pos_lock:
+                        active_keys = [p["instrument_key"] for p in self.active_positions.values()]
+                    spot_keys = [cfg["spot_key"] for cfg in INDICES.values() if cfg.get("spot_key")]
+                    all_live_keys = list(dict.fromkeys(active_keys + spot_keys))
+
+                    quotes = fetch_ltp_quote(all_live_keys)
+                    if quotes:
+                        with self.pos_lock:
+                            for pos in self.active_positions.values():
+                                q = quotes.get(pos["instrument_key"], {})
+                                if q.get("last_price"):
+                                    pos["last_ltp"] = float(q["last_price"])
+                        for idx, cfg in INDICES.items():
+                            sk = cfg.get("spot_key")
+                            if sk and quotes.get(sk, {}).get("last_price") and idx in self.last_summaries:
+                                ltp_val = float(quotes[sk]["last_price"])
+                                self.last_summaries[idx]["spot"] = round(ltp_val, 2) if ltp_val < 1000 else int(round(ltp_val))
+
+                    self.render_live_dashboard(datetime.now(IST).strftime("%H:%M"))
+                except Exception:
+                    pass
+
+        threading.Thread(target=_pulse_loop, daemon=True).start()
 
     def close_position_now(self, idx: str, ltp: float, exit_reason: str, now_ist: datetime):
         with self.pos_lock:
@@ -1329,9 +1267,6 @@ class IntradayV3Engine:
 
         pts = round((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"]), 2)
         gross_pnl = round(pts * pos["qty"], 2)
-        r_unit = max(pos.get("r_unit", 1.0), 1e-6)
-        peak_r = round(pos.get("peak_gain", 0.0) / r_unit, 2)
-        exit_r = round(pts / r_unit, 2)
 
         buy_px = ltp if is_short else pos["entry_price"]
         sell_px = pos["entry_price"] if is_short else ltp
@@ -1347,40 +1282,13 @@ class IntradayV3Engine:
             "entry_time": pos.get("entry_time", ""), "exit_time": exit_time_str,
             "symbol": idx, "contract": str(pos["strike"]), "side": pos["display_side"],
             "qty": pos["qty"], "entry_price": pos["entry_price"], "exit_price": ltp,
-            "points": pts, "sl": pos["sl"], "target": 0.0, "exit_reason": f"{exit_reason} ({exit_r:+.1f}R)",
+            "points": pts, "sl": pos["sl"], "target": 0.0, "exit_reason": exit_reason,
             "gross_pnl": gross_pnl, "brokerage": ch_info["brokerage"],
             "taxes_other": ch_info["taxes_other"], "charges": ch_info["total"],
             "pnl": net_pnl, "day_pnl": self.day_pnl, "setup": pos["setup_name"],
-            "peak_r": f"{peak_r:.1f}R",
         }
         self.closed_trades.append(journal_entry)
-        record_trade_journal({k: v for k, v in journal_entry.items() if k != "peak_r"})
-
-        icon = "✅" if net_pnl >= 0 else "❌"
-        exit_caption = (
-            f"🏁 {icon} <b>TRADE #{pos['trade_no']} CLOSED • {idx}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 <b>Contract:</b> <code>{pos['strike']} {pos['display_side']}</code> │ <b>{exit_reason}</b>\n"
-            f"🕒 <b>Time:</b> <code>{pos['entry_time'][:5]} → {exit_time_str[:5]}</code> │ Peak: <b>{peak_r:.1f}R</b>\n"
-            f"💵 <b>Price:</b> ₹{pos['entry_price']:.2f} → ₹{ltp:.2f} (<b>{pts:+.2f} pts</b>)\n"
-            f"📊 <b>Gross PnL:</b> ₹{gross_pnl:+,.2f} │ 🧾 <b>Charges:</b> -₹{ch_info['total']:.2f}\n"
-            f"💰 <b>Net PnL:</b> <b>₹{net_pnl:+,.2f}</b>  │  <b>Day Net:</b> <b>₹{self.day_pnl:+,.2f}</b>"
-        )
-
-        df_plot = self.latest_dfs.get(idx, pd.DataFrame())
-        spot_now = float(df_plot["close"].iloc[-1]) if not df_plot.empty else pos.get("spot_entry", 0.0)
-        send_trade_alert_with_chart(
-            df_plot,
-            title=f"{idx} 5M EXIT │ #{pos['trade_no']} {pos['strike']} {pos['display_side']} ({exit_r:+.1f}R)",
-            caption=exit_caption,
-            gann_lvl=pos.get("gann_level", spot_now),
-            spot_entry=pos.get("spot_entry", spot_now),
-            spot_sl=pos.get("spot_sl", spot_now),
-            is_exit=True,
-            spot_exit=spot_now,
-        )
-
-        notify(build_master_journal_report(now_ist), silent=True)
+        record_trade_journal(journal_entry)
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def evaluate_active_candle_exits(self, idx: str, df: pd.DataFrame, spot_close: float, price_change: float, fuel: float, atr14: float, now_ist: datetime):
@@ -1414,24 +1322,7 @@ class IntradayV3Engine:
         new_sl = pos["sl"]
         trail_label = None
 
-        lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
-        lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
-
-        if peak_r >= STAGE4_MOONSHOT_R:
-            lock_gain = peak_gain * lock_80
-            candidate_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
-            if (is_short and candidate_sl < new_sl and candidate_sl > ltp) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp):
-                new_sl = candidate_sl
-                trail_label = f"MOONSHOT {int(lock_80*100)}% ({peak_r:.1f}R)"
-
-        elif peak_r >= STAGE3_TREND_R:
-            lock_gain = peak_gain * lock_70
-            candidate_sl = round_to_tick((entry - lock_gain) if is_short else (entry + lock_gain), tick_sz)
-            if (is_short and candidate_sl < new_sl and candidate_sl > ltp) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp):
-                new_sl = candidate_sl
-                trail_label = f"TREND {int(lock_70*100)}% ({peak_r:.1f}R)"
-
-        elif peak_r >= STAGE2_LOCK_R:
+        if peak_r >= STAGE2_LOCK_R:
             floor_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
             buf = PIVOT_BUFFER_ATR_MULT * atr14 * cushion
             if is_mcx:
@@ -1445,15 +1336,7 @@ class IntradayV3Engine:
             min_gap = max(atr14 * 0.15, tick_sz * 2) if is_mcx else max(tick_sz * 4, 0.5)
             if (is_short and candidate_sl < new_sl and candidate_sl > ltp + min_gap) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp - min_gap):
                 new_sl = candidate_sl
-                trail_label = f"SWING + 1.5R LOCK ({peak_r:.1f}R)"
-
-        elif peak_r >= STAGE1_BE_R:
-            be_offset = max(round_to_tick(entry * 0.0001, tick_sz), tick_sz * 2)
-            be_sl = round_to_tick((entry - be_offset) if is_short else (entry + be_offset), tick_sz)
-            min_gap = max(atr14 * 0.15, tick_sz * 2) if is_mcx else max(tick_sz * 4, 0.5)
-            if (is_short and be_sl < new_sl and be_sl > ltp + min_gap) or (not is_short and be_sl > new_sl and be_sl < ltp - min_gap):
-                new_sl = be_sl
-                trail_label = "COST-TO-COST (1.5R)"
+                trail_label = "SWING + 1.5R LOCK"
 
         if trail_label and new_sl != pos["sl"]:
             with self.pos_lock:
@@ -1461,17 +1344,12 @@ class IntradayV3Engine:
                     self.active_positions[idx]["sl"] = new_sl
                     self.active_positions[idx]["trail_stage"] = trail_label
             self.save_active_positions_state()
-            notify(
-                f"🛡️🚀 <b>MOMENTUM TRAIL LOCKED • #{pos['trade_no']} [{idx}]</b>\n"
-                f"📌 <b>Stage:</b> {trail_label} │ <b>New Trail SL: ₹{new_sl:.2f}</b> (LTP ₹{ltp:.2f})",
-                silent=False,
-            )
 
         low_fuel_streak = (pos.get("low_fuel_streak", 0) + 1) if fuel < 20.0 else 0
         pos["low_fuel_streak"] = low_fuel_streak
         opposing_move = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
-        if curr_r >= FUEL_FINISH_MIN_R and ((fuel < FUEL_FINISH_THRESHOLD and opposing_move and low_fuel_streak >= 2)):
-            self.close_position_now(idx, ltp, f"FUEL_EXHAUSTED (Fuel {int(fuel)})", now_ist)
+        if curr_r >= FUEL_FINISH_MIN_R and (fuel < FUEL_FINISH_THRESHOLD and opposing_move and low_fuel_streak >= 2):
+            self.close_position_now(idx, ltp, "FUEL_EXHAUSTED", now_ist)
             return
 
         now_ts = time.time()
@@ -1487,7 +1365,7 @@ class IntradayV3Engine:
             win_range = max(prices_in_win) - min(prices_in_win)
             flat_threshold = max(r_unit * 0.50, entry * (0.002 if is_mcx else 0.03))
             if win_range <= flat_threshold and curr_r < STAGE1_BE_R:
-                self.close_position_now(idx, ltp, f"NO_MOMENTUM_EXIT ({int(round(window_span / 60.0))}m)", now_ist)
+                self.close_position_now(idx, ltp, "NO_MOMENTUM_EXIT", now_ist)
 
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
@@ -1546,7 +1424,7 @@ class IntradayV3Engine:
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
                 "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
-                "short_status": f"#{pos['trade_no']} RUNNER (₹{pos_mtm:+.0f})🔥",
+                "short_status": f"#{pos['trade_no']} ACTIVE (₹{pos_mtm:+.0f})",
             }
 
         is_sector_chop = (self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP")
@@ -1600,18 +1478,18 @@ class IntradayV3Engine:
                 if not mem_ok:
                     self.pending_setups[idx] = None
                 elif is_mcx:
-                    self.try_execute_mcx_fut_entry(idx, cfg, pending, df, spot_close, fuel, atr14, now_ist, mem_tag, trade_mode)
+                    self.try_execute_mcx_fut_entry(idx, cfg, pending, df, spot_close, atr14, now_ist, mem_tag, trade_mode)
                 else:
-                    self.try_execute_option_entry(idx, cfg, pending, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag, trade_mode)
+                    self.try_execute_option_entry(idx, cfg, pending, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode)
 
         if trade_mode == "SCALP":
-            short_status = f"CITY SCALP (ADX {regime_info['adx']:.0f}) 🚦"
+            short_status = "CITY SCALP"
         elif regime_info["is_strong_trend"]:
-            short_status = f"HIGHWAY (ADX {regime_info['adx']:.0f}) 🛣️"
+            short_status = "HIGHWAY"
         else:
-            short_status = f"Gann {int(sup)}-{int(res)} 👀"
+            short_status = f"Gann {int(sup)}-{int(res)}"
         if pending:
-            short_status = f"ARMED {pending['display_side']} 🎯"
+            short_status = f"ARMED {pending['display_side']}"
 
         return {
             "idx": idx, "is_mcx": is_mcx,
@@ -1620,7 +1498,7 @@ class IntradayV3Engine:
             "short_status": short_status,
         }
 
-    def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, fuel, atr14, now_ist, mem_tag, trade_mode):
+    def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, atr14, now_ist, mem_tag, trade_mode):
         inst_key = cfg["spot_key"]
         lot_size = cfg["lot_size"]
         tick_sz = cfg.get("tick_size", 0.05)
@@ -1652,7 +1530,9 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            tgt_label = f"SCALP {self.tuned_params.get('scalp_target_r', 1.35)}R" if trade_mode == "SCALP" else "UNCAPPED ∞ (Highway)"
+            scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
+            tgt_px = round_to_tick(fill + (sl_points * scalp_r if tx_side == "BUY" else -sl_points * scalp_r), tick_sz)
+            tgt_label = f"₹{tgt_px:.2f} (SCALP)" if trade_mode == "SCALP" else "UNCAPPED ∞"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
@@ -1662,25 +1542,16 @@ class IntradayV3Engine:
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": False,
-                    "trade_mode": trade_mode,
+                    "trade_mode": trade_mode, "target_label": tgt_label,
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
-            entry_msg = (
-                f"🛢️🚀 <b>NEW TRADE #{t_no} [{idx}] • {trade_mode} MODE</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>Contract:</b> <code>{sym}</code> (<b>{tx_side}</b>) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
-                f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.2f}</b>\n"
-                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>{tgt_label}</b>\n"
-                f"📐 <b>Setup:</b> {setup['name']} │ 🧠 <code>{mem_tag}</code> │ 🔥 <b>Fuel:</b> {fuel}"
-            )
-            send_trade_alert_with_chart(df, f"{idx} 5M ENTRY │ #{t_no} {sym} {tx_side}", entry_msg, setup["gann_level"], fut_price, sl_price)
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
-    def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, fuel, chain, atr14, now_ist, active_expiry, is_today_exp, mem_tag, trade_mode):
+    def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode):
         if not chain:
             return
         step = cfg.get("step", 50)
@@ -1719,8 +1590,9 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            exp_label = "0DTE" if is_today_exp else active_expiry
-            tgt_label = f"SCALP {self.tuned_params.get('scalp_target_r', 1.35)}R" if trade_mode == "SCALP" else "UNCAPPED ∞ (Highway)"
+            scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
+            tgt_px = round_to_tick(fill + sl_points * scalp_r, tick_sz)
+            tgt_label = f"₹{tgt_px:.2f} (SCALP)" if trade_mode == "SCALP" else "UNCAPPED ∞"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "INDEX_OPT", "instrument_key": inst_key,
@@ -1731,22 +1603,13 @@ class IntradayV3Engine:
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": is_today_exp,
-                    "trade_mode": trade_mode,
+                    "trade_mode": trade_mode, "target_label": tgt_label,
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
-            entry_msg = (
-                f"🚀 <b>NEW TRADE #{t_no} [{idx}] • {trade_mode} MODE</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📌 <b>Strike:</b> <code>{atm_strike} {setup['side']}</code> ({exp_label}) │ 🕒 <code>{entry_time_str[:5]} IST</code>\n"
-                f"📦 <b>Qty:</b> {qty} ({lots} Lot) │ <b>Entry:</b> <b>₹{fill:.2f}</b> (Δ {live_delta:.2f})\n"
-                f"🛡️ <b>Pivot SL (1R):</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target:</b> <b>{tgt_label}</b>\n"
-                f"📐 <b>Setup:</b> {setup['name']} │ 🧠 <code>{mem_tag}</code> │ 🔥 <b>Fuel:</b> {fuel}"
-            )
-            send_trade_alert_with_chart(df, f"{idx} 5M ENTRY │ #{t_no} {atm_strike} {setup['side']}", entry_msg, setup["gann_level"], spot_close, spot_sl_equiv)
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def manage_open_positions(self, now_ist: datetime):
@@ -1773,11 +1636,11 @@ class IntradayV3Engine:
             if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
                 exit_reason = "BREAKING_NEWS_CE_EJECT"
             elif pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
-                exit_reason = f"CITY_SCALP_TARGET ({curr_r:.1f}R)"
+                exit_reason = "SCALP_TARGET_HIT"
             elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
-                exit_reason = f"EOD_EXIT ({INDEX_EXIT_TIME})"
+                exit_reason = "EOD_EXIT"
             elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
-                exit_reason = f"MCX_EXIT ({MCX_EXIT_TIME})"
+                exit_reason = "MCX_EOD_EXIT"
             elif not is_short and ltp <= pos["sl"]:
                 exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
             elif is_short and ltp >= pos["sl"]:
@@ -1797,14 +1660,7 @@ class IntradayV3Engine:
                     self.close_position_now(idx, exit_ltp, "MANUAL_STOP_EXIT", now_ist)
 
         self.save_active_positions_state()
-        with self.pos_lock:
-            open_cnt = len(self.active_positions)
-
-        self.bot_status_text = (
-            f"🟡 HANDOVER ({open_cnt} OPEN)"
-            if (reason_label == "SESSION HANDOVER" and open_cnt > 0)
-            else f"🔴 BOT STOPPED • {reason_label}"
-        )
+        self.bot_status_text = "MARKET CLOSED"
         if self.streamer:
             try:
                 self.streamer.disconnect()
@@ -1814,8 +1670,12 @@ class IntradayV3Engine:
             self.ws_connected = False
 
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
-        notify(build_master_journal_report(now_ist), silent=True)
-        notify(f"🔴 <b>BOT STOPPED ({reason_label})</b> │ Open Carried: <b>{open_cnt}</b> │ Closed Today: <b>{len(self.closed_trades)}</b> │ Day Net: <b>₹{self.day_pnl:+,.2f}</b>")
+        if reason_label != "SESSION HANDOVER":
+            notify(
+                f"🔴 <b>SESSION CLOSED ({reason_label})</b>  |  <code>{now_ist.strftime('%H:%M')} IST</code>\n"
+                f"────────────────────────────\n"
+                f"💼 <b>Day Net P&amp;L:</b> <b>₹{self.day_pnl:+,.2f}</b>  |  <b>Trades:</b> {len(self.closed_trades)}"
+            )
 
     def run(self):
         if not UPSTOX_ACCESS_TOKEN:
@@ -1830,19 +1690,26 @@ class IntradayV3Engine:
         self.load_today_state_from_journal()
         self.init_contracts()
         self.load_active_positions_state()
-        self.bot_status_text = "🟢 BOT LIVE • RUNNING"
+        self.bot_status_text = "BOT LIVE"
         session_start_ts = time.time()
 
-        with self.pos_lock:
-            carried_cnt = len(self.active_positions)
+        sec_p = self.macro_context.get("sector_perf", {})
+        g_cnt = sum(1 for v in sec_p.values() if v > 0.15)
+        r_cnt = sum(1 for v in sec_p.values() if v < -0.15)
+        pull_s = ", ".join(self.macro_context.get("top_pullers", [])) or "None"
+        drag_s = ", ".join(self.macro_context.get("top_draggers", [])) or "None"
 
-        gear = int(self.tuned_params.get("driver_gear", 3))
         notify(
-            f"🟢 <b>V3 SELF-MATURING QUANT ENGINE LIVE</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏎️ <b>Driver Gear:</b> <b>{gear}/5</b> │ <b>Trail Cushion:</b> {self.tuned_params.get('trail_cushion_mult', 1.0)}x │ <b>Memory:</b> {len(self.market_memory)}\n"
-            f"🌍 <b>Macro/Sector:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> ({self.macro_context.get('sector_verdict', 'BALANCED')}) │ Carried: {carried_cnt}"
+            f"🌅 <b>V3 QUANT ENGINE • LIVE</b>\n"
+            f"────────────────────────────\n"
+            f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
+            f"🌍 <b>Market Pulse:</b> <code>{self.macro_context.get('threat_level', 'NORMAL')}</code> ({g_cnt}G / {r_cnt}R)\n"
+            f"🟢 <b>Pullers:</b> <code>{pull_s}</code>\n"
+            f"🔴 <b>Draggers:</b> <code>{drag_s}</code>\n"
+            f"🛡️ <b>Focus:</b> <code>{self.macro_context.get('summary', 'Normal Market')}</code>"
         )
+
+        self.start_heartbeat_thread()
 
         while True:
             now_ist = datetime.now(IST)
@@ -1869,9 +1736,9 @@ class IntradayV3Engine:
             risk_locked = (self.day_pnl >= max_profit or self.day_pnl <= max_loss or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES)
 
             if risk_locked:
-                self.bot_status_text = "🟡 BOT PAUSED • RISK LIMIT"
+                self.bot_status_text = "BOT PAUSED"
             else:
-                self.bot_status_text = "🟢 BOT LIVE • RUNNING"
+                self.bot_status_text = "BOT LIVE"
                 for idx, cfg in INDICES.items():
                     if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
                         if idx not in self.last_summaries:
@@ -1879,16 +1746,14 @@ class IntradayV3Engine:
                             if not spot_df.empty:
                                 self.last_summaries[idx] = {
                                     "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
-                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0, "short_status": "CLOSED 🏁",
+                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0, "short_status": "CLOSED",
                                 }
                         continue
                     res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
                         self.last_summaries[idx] = res
 
-            now_ts = time.time()
-            if self.last_summaries and (now_ts - self.last_dashboard_ts >= DASHBOARD_REFRESH_SEC):
-                self.last_dashboard_ts = now_ts
+            if not self.dashboard_msg_id and self.last_summaries:
                 self.render_live_dashboard(hhmm)
 
             time.sleep(10)
