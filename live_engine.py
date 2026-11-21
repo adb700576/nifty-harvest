@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import math
+import signal
 import threading
 import logging
 import requests
@@ -42,42 +43,46 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 # --- STRATEGY & RISK PARAMETERS ---
-MIN_FUEL_SCORE = 45.0            # Minimum momentum fuel score (0-100)
+MIN_FUEL_SCORE = 45.0             # Base minimum fuel score (Indices & Morning MCX)
+MCX_EVENING_FUEL_SCORE = 55.0     # Stricter fuel filter for volatile evening MCX (>= 15:30 IST)
+MCX_MAX_RISK_INR = 2000.0         # Maximum allowed SL risk (₹) per MCX trade
+SESSION_MAX_RUNTIME_SEC = 20700   # 5h 45m graceful exit before GitHub 6h hard kill
+
 INDEX_START_TIME = "09:20"
 INDEX_END_TIME = "15:10"
 INDEX_EXIT_TIME = "15:15"
-EXPIRY_NEXT_SWITCH_TIME = "13:30"  # Switch to next expiry after 1:30 PM on 0DTE
+EXPIRY_NEXT_SWITCH_TIME = "13:30" # Switch to next expiry after 1:30 PM on 0DTE
 
 MCX_START_TIME = "09:20"
 MCX_END_TIME = "23:00"
 MCX_EXIT_TIME = "23:15"
 
-GANN_ZONE_ATR_MULT = 0.40        # Allowed proximity above/below Gann level
-MAX_SPREAD_PCT = 1.50            # Bid-Ask spread protection (%)
-SWING_BUFFER_ATR_MULT = 0.25     # Buffer beyond 3-candle Swing Low/High
-RR_RATIO = 2.00                  # Fixed 1 : 2.0 Risk-to-Reward Target
-SETUP_EXPIRY_SEC = 900           # 15-minute setup validity
-DASHBOARD_REFRESH_SEC = 30       # Self-updating pinned Telegram Live Dashboard interval
+GANN_ZONE_ATR_MULT = 0.40         # Allowed proximity above/below Gann level
+MAX_SPREAD_PCT = 1.50             # Bid-Ask spread protection (%)
+SWING_BUFFER_ATR_MULT = 0.25      # Buffer beyond 3-candle Swing Low/High
+RR_RATIO = 2.00                   # Fixed 1 : 2.0 Risk-to-Reward Target
+SETUP_EXPIRY_SEC = 900            # 15-minute setup validity
+DASHBOARD_REFRESH_SEC = 30        # Self-updating pinned Telegram Live Dashboard interval
 JOURNAL_FILE = "live_journal/trade_journal.csv"
+ACTIVE_STATE_FILE = "live_journal/active_positions.json"
 
 # --- TRAILING SL, FUEL FINISH & NO-MOMENTUM EXIT PARAMETERS ---
-TRAIL_BE_PROGRESS = 0.45         # Move SL to Cost-to-Cost at 45% of Target
-TRAIL_LOCK_PROGRESS = 0.70       # Activate Swing + 50% Profit Lock at 70% of Target
-TRAIL_PROFIT_FLOOR = 0.50        # Lock at least 50% of target gain once 70% reached
+TRAIL_BE_PROGRESS = 0.45          # Move SL to Cost-to-Cost at 45% of Target
+TRAIL_LOCK_PROGRESS = 0.70        # Activate Swing + 50% Profit Lock at 70% of Target
+TRAIL_PROFIT_FLOOR = 0.50         # Lock at least 50% of target gain once 70% reached
 
-FUEL_FINISH_MIN_PROGRESS = 0.25  # Check Fuel Finish once >= 25% of Target reached
-FUEL_FINISH_THRESHOLD = 22.0     # Fuel drop threshold signaling movement finish
+FUEL_FINISH_MIN_PROGRESS = 0.25   # Check Fuel Finish once >= 25% of Target reached
+FUEL_FINISH_THRESHOLD = 22.0      # Fuel drop threshold signaling movement finish
 
-FLAT_LTP_NORMAL_SEC = 900        # 15 mins flat price -> No-Momentum Exit
-FLAT_LTP_EXPIRY_SEC = 600        # 10 mins flat price on expiry day -> Fast Exit
+FLAT_LTP_NORMAL_SEC = 900         # 15 mins flat price -> No-Momentum Exit
+FLAT_LTP_EXPIRY_SEC = 600         # 10 mins flat price on expiry day -> Fast Exit
 
 CAPITAL_PER_TRADE = float(os.getenv("CAPITAL_PER_TRADE", "15000"))
 MCX_CAPITAL_PER_TRADE = float(os.getenv("MCX_CAPITAL_PER_TRADE", os.getenv("CRUDEOIL_CAPITAL", "150000")))
-DAILY_PROFIT_LOCK_PCT = 0.35
-DAILY_LOSS_LOCK_PCT = -0.25
-MAX_CONSECUTIVE_LOSSES = 2
+DAILY_PROFIT_LOCK_PCT = 0.50
+DAILY_LOSS_LOCK_PCT = -0.35
+MAX_CONSECUTIVE_LOSSES = 3
 
-# Clean registry — lot_size, freeze_qty, step, tick_size & live delta are fetched dynamically from Upstox API
 INDICES = {
     "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50"},
     "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank"},
@@ -93,14 +98,13 @@ INDICES = {
 
 
 def round_to_tick(price: float, tick_size: float) -> float:
-    """Rounds any price cleanly to the contract's exact exchange tick_size."""
     ts = tick_size if tick_size and tick_size > 0 else 0.05
     decimals = max(0, len(f"{ts:.10f}".rstrip("0").split(".")[1])) if "." in f"{ts:.10f}".rstrip("0") else 0
     return round(round(price / ts) * ts, decimals)
 
 
 # ==============================================================================
-# 2. DESIGNER TELEGRAM UI, 5M CHARTS & BROKERAGE/TAX BREAKDOWN
+# 2. DESIGNER TELEGRAM UI (🟢 LIVE / 🔴 STOPPED HEARTBEAT + SINGLE ALERTS)
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -135,52 +139,65 @@ def make_progress_bar(progress_ratio: float, length: int = 8) -> str:
     return "▰" * filled + "▱" * (length - filled)
 
 
-def send_telegram_chart(df: pd.DataFrame, title: str, caption: str, gann_lvl: float, spot_entry: float, spot_sl: float, spot_trg: float, is_exit: bool = False, spot_exit: float = None):
-    """Generates a sleek, high-contrast dark-accented 5M setup chart and sends to Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or df.empty:
+def send_trade_alert_with_chart(df: pd.DataFrame, title: str, caption: str, gann_lvl: float, spot_entry: float, spot_sl: float, spot_trg: float, is_exit: bool = False, spot_exit: float = None):
+    """Sends a single combined Photo + Caption alert (falls back to text-only if chart fails)."""
+    clean_lines = [line.strip() for line in caption.splitlines() if line.strip()]
+    log.info(f"[MIRROR] {' | '.join(clean_lines)}")
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
+
+    if not df.empty:
+        try:
+            plot_df = df.tail(36).copy()
+            fig, ax = plt.subplots(figsize=(10.5, 5.0), dpi=140)
+            fig.patch.set_facecolor("#0f172a")
+            ax.set_facecolor("#1e293b")
+
+            ax.plot(plot_df["timestamp"], plot_df["close"], color="#f8fafc", linewidth=2.1, label="Price 5M")
+            ax.axhline(gann_lvl, color="#38bdf8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
+            ax.axhline(spot_sl, color="#f43f5e", linestyle=":", linewidth=1.6, label=f"Swing SL: {spot_sl:.1f}")
+            ax.axhline(spot_trg, color="#a855f7", linestyle=":", linewidth=1.6, label=f"1:2 Target: {spot_trg:.1f}")
+
+            ax.axhspan(min(spot_entry, spot_sl), max(spot_entry, spot_sl), color="#f43f5e", alpha=0.08)
+            ax.axhspan(min(spot_entry, spot_trg), max(spot_entry, spot_trg), color="#22c55e", alpha=0.08)
+
+            entry_ts = plot_df["timestamp"].iloc[-1] if not is_exit else plot_df["timestamp"].iloc[max(0, len(plot_df) - 4)]
+            ax.scatter([entry_ts], [spot_entry], color="#22c55e", edgecolors="#ffffff", linewidth=1.2, s=85, zorder=5, label=f"Entry: {spot_entry:.1f}")
+
+            if is_exit and spot_exit is not None:
+                exit_ts = plot_df["timestamp"].iloc[-1]
+                ax.scatter([exit_ts], [spot_exit], color="#f59e0b", edgecolors="#ffffff", linewidth=1.2, marker="X", s=100, zorder=6, label=f"Exit: {spot_exit:.1f}")
+
+            ax.set_title(title, fontsize=11.5, fontweight="bold", color="#f8fafc", pad=12)
+            ax.tick_params(colors="#cbd5e1", labelsize=8.5)
+            for spine in ax.spines.values():
+                spine.set_color("#334155")
+            ax.grid(True, linestyle="--", color="#334155", alpha=0.55)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %H:%M", tz=IST))
+            leg = ax.legend(loc="upper left", fontsize=8.5, facecolor="#0f172a", edgecolor="#334155", labelcolor="#f8fafc")
+            leg.get_frame().set_alpha(0.92)
+            plt.tight_layout()
+
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
+            plt.close(fig)
+            buf.seek(0)
+
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+            files = {"photo": ("setup_chart.png", buf, "image/png")}
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
+            resp = requests.post(url, data=data, files=files, timeout=12).json()
+            if resp.get("ok"):
+                return
+        except Exception as e:
+            log.warning(f"Chart send failed, falling back to text alert: {e}")
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        plot_df = df.tail(36).copy()
-        fig, ax = plt.subplots(figsize=(10.5, 5.0), dpi=140)
-        fig.patch.set_facecolor("#0f172a")
-        ax.set_facecolor("#1e293b")
-
-        ax.plot(plot_df["timestamp"], plot_df["close"], color="#f8fafc", linewidth=2.1, label="Price 5M")
-        ax.axhline(gann_lvl, color="#38bdf8", linestyle="--", linewidth=1.3, label=f"Gann Pivot: {gann_lvl:.1f}")
-        ax.axhline(spot_sl, color="#f43f5e", linestyle=":", linewidth=1.6, label=f"Swing SL: {spot_sl:.1f}")
-        ax.axhline(spot_trg, color="#a855f7", linestyle=":", linewidth=1.6, label=f"1:2 Target: {spot_trg:.1f}")
-
-        ax.axhspan(min(spot_entry, spot_sl), max(spot_entry, spot_sl), color="#f43f5e", alpha=0.08)
-        ax.axhspan(min(spot_entry, spot_trg), max(spot_entry, spot_trg), color="#22c55e", alpha=0.08)
-
-        entry_ts = plot_df["timestamp"].iloc[-1] if not is_exit else plot_df["timestamp"].iloc[max(0, len(plot_df) - 4)]
-        ax.scatter([entry_ts], [spot_entry], color="#22c55e", edgecolors="#ffffff", linewidth=1.2, s=85, zorder=5, label=f"Entry: {spot_entry:.1f}")
-
-        if is_exit and spot_exit is not None:
-            exit_ts = plot_df["timestamp"].iloc[-1]
-            ax.scatter([exit_ts], [spot_exit], color="#f59e0b", edgecolors="#ffffff", linewidth=1.2, marker="X", s=100, zorder=6, label=f"Exit: {spot_exit:.1f}")
-
-        ax.set_title(title, fontsize=11.5, fontweight="bold", color="#f8fafc", pad=12)
-        ax.tick_params(colors="#cbd5e1", labelsize=8.5)
-        for spine in ax.spines.values():
-            spine.set_color("#334155")
-        ax.grid(True, linestyle="--", color="#334155", alpha=0.55)
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %H:%M", tz=IST))
-        leg = ax.legend(loc="upper left", fontsize=8.5, facecolor="#0f172a", edgecolor="#334155", labelcolor="#f8fafc")
-        leg.get_frame().set_alpha(0.92)
-        plt.tight_layout()
-
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
-        plt.close(fig)
-        buf.seek(0)
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-        files = {"photo": ("setup_chart.png", buf, "image/png")}
-        data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"}
-        requests.post(url, data=data, files=files, timeout=12)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": caption, "parse_mode": "HTML"}, timeout=8)
     except Exception as e:
-        log.warning(f"Chart plot/send error: {e}")
+        log.warning(f"Text alert fallback error: {e}")
 
 
 def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
@@ -234,10 +251,6 @@ def upstox_headers():
 
 
 def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, qty: int, is_mcx: bool) -> dict:
-    """
-    Fetches exact Upstox BUY + SELL leg charges (Brokerage + STT/CTT + Exchange/SEBI/Stamp + GST)
-    via Upstox ChargeApi.get_brokerage (SDK) or GET /v2/charges/brokerage (REST), with fallback.
-    """
     if buy_price > 0 and sell_price > 0 and qty > 0:
         if HAS_UPSTOX_SDK:
             try:
@@ -281,11 +294,9 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
                     tot_sum += float(ch_obj.get("total", 0.0))
                     brk_sum += float(ch_obj.get("brokerage", 0.0))
                 else:
-                    log.warning(f"Brokerage API warning ({instrument_key} {tx_type}): {res}")
                     api_ok = False
                     break
-            except Exception as e:
-                log.warning(f"Brokerage API error ({instrument_key} {tx_type}): {e}")
+            except Exception:
                 api_ok = False
                 break
 
@@ -434,7 +445,6 @@ def build_master_journal_report(now_ist: datetime) -> str:
 # 3. UPSTOX V3 API HELPERS (DYNAMIC CONTRACTS + CANDLES + MARGIN + OPTION CHAIN)
 # ==============================================================================
 def get_active_future_contract(idx: str) -> dict:
-    """Dynamically resolves active FUT contract key, lot_size, freeze_quantity & tick_size."""
     exchange = "BSE" if idx == "SENSEX" else ("MCX" if INDICES[idx]["type"] == "MCX_FUT" else "NSE")
     url = "https://api.upstox.com/v2/instruments/search"
 
@@ -468,7 +478,6 @@ def get_active_future_contract(idx: str) -> dict:
             candidates.sort(key=lambda x: str(x.get("expiry", "9999-12-31")))
             top = candidates[0]
             raw_tick = float(top.get("tick_size", 0.05))
-            # Upstox sometimes returns tick_size in paise (e.g. 5.0 -> 0.05 or 100.0 -> 1.0)
             tick_size = round(raw_tick / 100.0, 4) if raw_tick >= 5.0 else raw_tick
             return {
                 "instrument_key": str(top.get("instrument_key", "")),
@@ -485,7 +494,6 @@ def get_active_future_contract(idx: str) -> dict:
 
 
 def get_dynamic_option_specs(spot_key: str) -> dict:
-    """Dynamically fetches valid expiries, lot_size, freeze_quantity, tick_size & strike step from Upstox."""
     try:
         url = "https://api.upstox.com/v2/option/contract"
         params = {"instrument_key": spot_key}
@@ -583,7 +591,6 @@ def fetch_required_margin(instrument_key: str, lots_or_qty: int, side: str, prod
         data = resp.json()
         if data.get("status") == "success":
             return float(data.get("data", {}).get("required_margin", 0.0))
-        log.warning(f"Margin API warning ({instrument_key}): {data}")
         return 0.0
     except Exception as e:
         log.warning(f"Margin API error ({instrument_key}): {e}")
@@ -792,7 +799,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. MAIN TRADING ENGINE LOOP (ON-DEMAND TICK-BY-TICK WEBSOCKET V3 STREAMER)
+# 6. MAIN TRADING ENGINE LOOP (WITH ACTIVE_POSITIONS.JSON SESSION HANDOVER)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -815,9 +822,91 @@ class IntradayV3Engine:
         self.streamer = None
         self.ws_connected = False
         self.subscribed_keys = set()
+        self.bot_status_text = "🟢 BOT LIVE • RUNNING"
+        self.stop_requested = False
+
+    def save_active_positions_state(self):
+        """Persists currently open positions to JSON for seamless session handover."""
+        os.makedirs(os.path.dirname(ACTIVE_STATE_FILE), exist_ok=True)
+        serializable = {}
+        with self.pos_lock:
+            for idx, pos in self.active_positions.items():
+                pos_copy = dict(pos)
+                pos_copy["ltp_window"] = list(pos.get("ltp_window", []))
+                serializable[idx] = pos_copy
+        try:
+            with open(ACTIVE_STATE_FILE, mode="w", encoding="utf-8") as f:
+                json.dump(serializable, f, indent=2)
+        except Exception as e:
+            log.warning(f"Active positions save error: {e}")
+
+    def load_active_positions_state(self):
+        """Restores any open position from the previous session and resumes Tick-WS."""
+        if not os.path.isfile(ACTIVE_STATE_FILE):
+            return
+        try:
+            with open(ACTIVE_STATE_FILE, mode="r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not data:
+                return
+            with self.pos_lock:
+                for idx, pos in data.items():
+                    pos["ltp_window"] = deque(pos.get("ltp_window", []))
+                    self.active_positions[idx] = pos
+                    self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)))
+            for idx, pos in list(self.active_positions.items()):
+                self.subscribe_tick_instrument(pos["instrument_key"])
+                log.info(
+                    f"[HANDOVER] Resumed open position #{pos['trade_no']} {idx} {pos['strike']} "
+                    f"@ ₹{pos['entry_price']:.2f} (SL: ₹{pos['sl']:.2f} | TRG: ₹{pos['tp']:.2f})"
+                )
+        except Exception as e:
+            log.warning(f"Active positions restore error: {e}")
+
+    def load_today_state_from_journal(self):
+        """Restores today's closed trades and cumulative day_pnl across session restarts."""
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        if not os.path.isfile(JOURNAL_FILE):
+            return
+        try:
+            with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for r in reader:
+                    if r.get("date") == today_str:
+                        pnl_val = float(r.get("pnl", 0.0))
+                        t_no = int(float(r.get("trade_no", len(self.closed_trades) + 1)))
+                        self.closed_trades.append({
+                            "trade_no": t_no,
+                            "date": r["date"],
+                            "entry_time": r.get("entry_time", ""),
+                            "exit_time": r.get("exit_time", ""),
+                            "symbol": r.get("symbol", ""),
+                            "contract": r.get("contract", ""),
+                            "side": r.get("side", ""),
+                            "qty": int(float(r.get("qty", 0))),
+                            "entry_price": float(r.get("entry_price", 0.0)),
+                            "exit_price": float(r.get("exit_price", 0.0)),
+                            "points": float(r.get("points", 0.0)),
+                            "sl": float(r.get("sl", 0.0)),
+                            "target": float(r.get("target", 0.0)),
+                            "exit_reason": r.get("exit_reason", ""),
+                            "gross_pnl": float(r.get("gross_pnl", 0.0)),
+                            "brokerage": float(r.get("brokerage", 0.0)),
+                            "taxes_other": float(r.get("taxes_other", 0.0)),
+                            "charges": float(r.get("charges", 0.0)),
+                            "pnl": pnl_val,
+                            "day_pnl": float(r.get("day_pnl", 0.0)),
+                            "setup": r.get("setup", ""),
+                        })
+                        self.day_pnl = round(self.day_pnl + pnl_val, 2)
+                        self.trade_counter = max(self.trade_counter, t_no)
+            self.closed_trades.sort(key=lambda x: x["trade_no"])
+            if self.closed_trades:
+                log.info(f"[JOURNAL] Restored {len(self.closed_trades)} trades for {today_str} | Day Net: ₹{self.day_pnl:+.2f}")
+        except Exception as e:
+            log.warning(f"Journal state restore warning: {e}")
 
     def init_websocket_streamer(self):
-        """Connects Upstox MarketDataStreamerV3 (ltpc mode) ONLY when at least one trade is active."""
         if not HAS_UPSTOX_SDK or self.streamer is not None:
             return
 
@@ -907,7 +996,6 @@ class IntradayV3Engine:
             log.info("[WS_V3] All trades closed — Tick-by-Tick WebSocket disconnected (Scanning Mode).")
 
     def on_tick_price(self, instrument_key: str, ltp: float):
-        """Millisecond tick callback: triggers instant SL / Trail SL / Target exit."""
         norm_key = instrument_key.replace(":", "|")
         target_idx = None
         exit_reason = None
@@ -941,7 +1029,6 @@ class IntradayV3Engine:
             self.close_position_now(target_idx, ltp, exit_reason, datetime.now(IST))
 
     def init_contracts(self):
-        """Dynamically populates all 10 instruments' specs from Upstox APIs."""
         for idx, cfg in INDICES.items():
             fut_info = get_active_future_contract(idx)
             self.fut_contracts[idx] = fut_info
@@ -1031,8 +1118,8 @@ class IntradayV3Engine:
 
         self.oi_history[idx] = {"pe_oi": total_pe_oi, "ce_oi": total_ce_oi}
 
-        bull_confirmed = cum_bullish and short_rising and oi_bull_ok
-        bear_confirmed = cum_bearish and short_falling and oi_bear_ok
+        bull_confirmed = (cum_bullish or short_rising) and oi_bull_ok
+        bear_confirmed = (cum_bearish or short_falling) and oi_bear_ok
         return pcr, open_p, cum_pcr_diff, bull_confirmed, bear_confirmed
 
     def compute_live_mtm(self) -> float:
@@ -1057,19 +1144,24 @@ class IntradayV3Engine:
         return round(total_mtm, 2)
 
     def render_live_dashboard(self, hhmm: str):
-        """Graphic-designed, compact, scannable pinned Telegram Live Dashboard."""
+        """Pinned Telegram Dashboard with clear 🟢 BOT LIVE / 🔴 BOT STOPPED status & #1..#N ordered ledger."""
         live_mtm = self.compute_live_mtm()
         net_pnl = round(self.day_pnl + live_mtm, 2)
         mode_badge = "🧪 PAPER" if PAPER_MODE else "⚡ LIVE"
         feed_badge = "📡 TICK-WS" if self.ws_connected else "🔍 SCANNING"
         net_icon = "🟢" if net_pnl >= 0 else "🔴"
 
+        idx_trades = [t for t in self.closed_trades if t["symbol"] in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
+        mcx_trades = [t for t in self.closed_trades if t["symbol"] not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")]
+        total_wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
+
         lines = [
             f"╔══════════════════════════════╗",
-            f"  ⚡ <b>V3 QUANT DESK</b> │ <code>{hhmm} IST</code> │ {mode_badge}",
+            f"  {self.bot_status_text} │ <code>{hhmm} IST</code>",
             f"╚══════════════════════════════╝",
-            f"💼 <b>Net PnL:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>  <i>({feed_badge})</i>",
-            f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b>  │  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
+            f"💼 <b>Day Net:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b> │ {mode_badge} │ <i>{feed_badge}</i>",
+            f"   ├ Realized: <b>₹{self.day_pnl:+,.2f}</b> │ Live MTM: <b>₹{live_mtm:+,.2f}</b>",
+            f"   └ Today Trades: <b>{len(self.closed_trades)}</b> (🟢 {total_wins}W) │ Index: <b>{len(idx_trades)}</b> │ MCX: <b>{len(mcx_trades)}</b>",
         ]
 
         with self.pos_lock:
@@ -1096,10 +1188,11 @@ class IntradayV3Engine:
                     f"  └ {bar} <b>{int(round(prog * 100))}%</b> │ {p_icon} <b>₹{pnl:+,.2f}</b>"
                 )
 
-        lines.append("\n📒 <b>TODAY'S TRADE LEDGER</b>")
+        lines.append("\n📒 <b>TODAY'S TRADE LEDGER (#1 → #N)</b>")
         lines.append("──────────────────────────────")
         if self.closed_trades:
-            for t in self.closed_trades:
+            ordered_trades = sorted(self.closed_trades, key=lambda x: x["trade_no"])
+            for t in ordered_trades:
                 icon = "✅" if t["pnl"] >= 0 else "❌"
                 in_t = t["entry_time"][:5]
                 out_t = t["exit_time"][:5]
@@ -1133,7 +1226,7 @@ class IntradayV3Engine:
                 )
 
         dashboard_text = "\n".join(lines)
-        log.info(f"[DASHBOARD] Realized ₹{self.day_pnl:+.2f} | Live MTM ₹{live_mtm:+.2f} | Closed: {len(self.closed_trades)} | Active: {len(active_snap)}")
+        log.info(f"[DASHBOARD] {self.bot_status_text} | Realized ₹{self.day_pnl:+.2f} | Live MTM ₹{live_mtm:+.2f} | Closed: {len(self.closed_trades)} | Active: {len(active_snap)}")
         self.dashboard_msg_id = upsert_telegram_dashboard(dashboard_text, self.dashboard_msg_id)
 
     def close_position_now(self, idx: str, ltp: float, exit_reason: str, now_ist: datetime):
@@ -1143,6 +1236,8 @@ class IntradayV3Engine:
             return
 
         self.unsubscribe_tick_instrument(pos["instrument_key"])
+        self.save_active_positions_state()
+
         is_short = pos["tx_side"] == "SELL"
         is_mcx = pos["type"] == "MCX_FUT"
         close_side = "BUY" if is_short else "SELL"
@@ -1202,11 +1297,10 @@ class IntradayV3Engine:
             f"🧾 <b>Charges:</b> -₹{total_charges:.2f} <i>(Brk ₹{ch_info['brokerage']:.2f} + Tax/STT ₹{ch_info['taxes_other']:.2f})</i>\n"
             f"💰 <b>Net PnL:</b> <b>₹{net_pnl:+,.2f}</b>  │  <b>Day Net:</b> <b>₹{self.day_pnl:+,.2f}</b>"
         )
-        notify(exit_caption)
 
         df_plot = self.latest_dfs.get(idx, pd.DataFrame())
         spot_now = float(df_plot["close"].iloc[-1]) if not df_plot.empty else pos.get("spot_entry", 0.0)
-        send_telegram_chart(
+        send_trade_alert_with_chart(
             df_plot,
             title=f"{idx} 5M EXIT │ #{pos['trade_no']} {pos['strike']} {pos['display_side']} ({exit_reason})",
             caption=exit_caption,
@@ -1248,7 +1342,6 @@ class IntradayV3Engine:
         progress = peak_gain / total_target_dist
         curr_progress = curr_gain / total_target_dist
 
-        # --- 1. HYBRID TRAILING SL (45% COST-TO-COST -> 70% SWING + PROFIT FLOOR) ---
         recent_3 = df.iloc[-4:-1]
         swing_low = float(recent_3["low"].min())
         swing_high = float(recent_3["high"].max())
@@ -1303,6 +1396,7 @@ class IntradayV3Engine:
                 if idx in self.active_positions:
                     self.active_positions[idx]["sl"] = new_sl
                     self.active_positions[idx]["trail_stage"] = trail_label
+            self.save_active_positions_state()
             notify(
                 f"🛡️📈 <b>TRAIL SL LOCKED • TRADE #{pos['trade_no']} [{idx}]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1312,7 +1406,6 @@ class IntradayV3Engine:
                 silent=False,
             )
 
-        # --- 2. FUEL FINISH EXIT ---
         low_fuel_streak = pos.get("low_fuel_streak", 0)
         if fuel < 25.0:
             low_fuel_streak += 1
@@ -1327,7 +1420,6 @@ class IntradayV3Engine:
             self.close_position_now(idx, ltp, f"FUEL_FINISH (Fuel {int(fuel)})", now_ist)
             return
 
-        # --- 3. NO-MOMENTUM / FLAT-PRICE EXIT (ALL OPTIONS + ALL 5 MCX FUTURES) ---
         now_ts = time.time()
         ltp_hist = pos.setdefault("ltp_window", deque())
         ltp_hist.append((now_ts, ltp))
@@ -1476,11 +1568,17 @@ class IntradayV3Engine:
             )
 
         if pending and idx not in self.active_positions and self.is_within_trade_window(idx, now_ist):
+            hhmm_now = now_ist.strftime("%H:%M")
+            req_fuel = (
+                MCX_EVENING_FUEL_SCORE
+                if (is_mcx and hhmm_now >= "15:30")
+                else MIN_FUEL_SCORE
+            )
             dir_confirmed = (
                 (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
                 or (pending["side"] == "PE" and price_change < 0 and oi_pcr_bear_ok and spot_close <= pending["trigger"])
             )
-            if dir_confirmed and fuel >= MIN_FUEL_SCORE:
+            if dir_confirmed and fuel >= req_fuel:
                 if is_mcx:
                     self.try_execute_mcx_fut_entry(idx, cfg, pending, df, spot_close, price_change, fuel, cum_pcr_diff, atr14, now_ist)
                 else:
@@ -1551,15 +1649,21 @@ class IntradayV3Engine:
                 log.info(f"[{idx}] Entry skipped due to high spread: {spread_pct:.2f}%")
                 return
 
-        req_margin_1lot = fetch_required_margin(inst_key, 1, tx_side, "I")
-        if req_margin_1lot > 0:
-            lots = max(1, int(MCX_CAPITAL_PER_TRADE // req_margin_1lot))
-        else:
-            lots = 1
-        qty = min(lots * lot_size, cfg["freeze_qty"])
-
         spot_risk, _, _ = self.compute_swing_sl_and_rr(df, setup["side"], ltp, atr14)
         sl_points = max(round_to_tick(spot_risk, tick_sz), tick_sz * 4)
+
+        risk_1_lot = sl_points * lot_size
+        if risk_1_lot > MCX_MAX_RISK_INR:
+            log.info(f"[{idx}] RISK_CAP_EXCEEDED: 1-Lot SL Risk ₹{risk_1_lot:.0f} > ₹{MCX_MAX_RISK_INR:.0f} cap. Skipping.")
+            self.pending_setups[idx] = None
+            return
+
+        req_margin_1lot = fetch_required_margin(inst_key, 1, tx_side, "I")
+        margin_lots = max(1, int(MCX_CAPITAL_PER_TRADE // req_margin_1lot)) if req_margin_1lot > 0 else 1
+        risk_lots = max(1, int(MCX_MAX_RISK_INR // max(risk_1_lot, 1.0)))
+        lots = min(margin_lots, risk_lots)
+        qty = min(lots * lot_size, cfg["freeze_qty"])
+
         tp_points = round_to_tick(sl_points * RR_RATIO, tick_sz)
 
         if tx_side == "BUY":
@@ -1609,6 +1713,7 @@ class IntradayV3Engine:
                 }
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
+            self.save_active_positions_state()
             entry_msg = (
                 f"🛢️🚀 <b>NEW ENTRY • TRADE #{t_no} [{idx}]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1617,8 +1722,7 @@ class IntradayV3Engine:
                 f"🛡️ <b>Swing SL:</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target (1:2):</b> ₹{tp_price:.2f} (<code>+{tp_points:.2f}p</code>)\n"
                 f"📐 <b>Setup:</b> {setup['name']} │ 🔥 <b>Fuel:</b> {fuel} │ 📊 <b>ΔOI:</b> {oi_change:+.0f}"
             )
-            notify(entry_msg)
-            send_telegram_chart(
+            send_trade_alert_with_chart(
                 df,
                 title=f"{idx} 5M ENTRY │ #{t_no} {sym} {tx_side} (RR 1:2)",
                 caption=entry_msg,
@@ -1652,7 +1756,6 @@ class IntradayV3Engine:
         bid = float(mkt.get("bid_price", 0))
         ask = float(mkt.get("ask_price", 0))
 
-        # Live Option Delta from Upstox Option Chain (clamped safely between 0.30 and 0.75)
         raw_delta = abs(float(greeks.get("delta", 0.0)))
         live_delta = min(0.75, max(0.30, raw_delta)) if raw_delta > 0 else 0.50
 
@@ -1719,6 +1822,7 @@ class IntradayV3Engine:
                 }
             self.pending_setups[idx] = None
             self.subscribe_tick_instrument(inst_key)
+            self.save_active_positions_state()
             entry_msg = (
                 f"🚀 <b>NEW ENTRY • TRADE #{t_no} [{idx}]</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -1727,8 +1831,7 @@ class IntradayV3Engine:
                 f"🛡️ <b>Swing SL:</b> ₹{sl_price:.2f} (<code>-{sl_points:.2f}p</code>) │ 🎯 <b>Target (1:2):</b> ₹{tp_price:.2f} (<code>+{tp_points:.2f}p</code>)\n"
                 f"📐 <b>Setup:</b> {setup['name']} │ 🔥 <b>Fuel:</b> {fuel} │ 📊 <b>PCR:</b> {pcr}"
             )
-            notify(entry_msg)
-            send_telegram_chart(
+            send_trade_alert_with_chart(
                 df,
                 title=f"{idx} 5M ENTRY │ #{t_no} {atm_strike} {setup['side']} (RR 1:2)",
                 caption=entry_msg,
@@ -1777,38 +1880,76 @@ class IntradayV3Engine:
             if exit_reason:
                 self.close_position_now(idx, ltp, exit_reason, now_ist)
 
+    def shutdown_cleanly(self, now_ist: datetime, reason_label: str):
+        """Saves any open positions to JSON and updates pinned dashboard with 🔴 BOT STOPPED."""
+        self.save_active_positions_state()
+        with self.pos_lock:
+            open_cnt = len(self.active_positions)
+
+        self.bot_status_text = (
+            f"🟡 HANDOVER ({open_cnt} OPEN)"
+            if (reason_label == "SESSION HANDOVER" and open_cnt > 0)
+            else f"🔴 BOT STOPPED • {reason_label}"
+        )
+        if self.streamer:
+            try:
+                self.streamer.disconnect()
+            except Exception:
+                pass
+            self.streamer = None
+            self.ws_connected = False
+
+        self.render_live_dashboard(now_ist.strftime("%H:%M"))
+        notify(build_master_journal_report(now_ist), silent=True)
+        notify(
+            f"🔴 <b>BOT STOPPED ({reason_label})</b> │ Open Carried: <b>{open_cnt}</b> │ "
+            f"Closed Today: <b>{len(self.closed_trades)}</b> │ Day Net PnL: <b>₹{self.day_pnl:+,.2f}</b>"
+        )
+
     def run(self):
         if not UPSTOX_ACCESS_TOKEN:
             log.error("UPSTOX_ACCESS_TOKEN missing! Exiting.")
             sys.exit(1)
 
+        def _handle_sigterm(signum, frame):
+            self.stop_requested = True
+
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+        signal.signal(signal.SIGINT, _handle_sigterm)
+
+        self.load_today_state_from_journal()
         self.init_contracts()
+        self.load_active_positions_state()
+        self.bot_status_text = "🟢 BOT LIVE • RUNNING"
+        session_start_ts = time.time()
+
+        with self.pos_lock:
+            carried_cnt = len(self.active_positions)
+
         notify(
-            f"⚡ <b>V3 QUANT ENGINE STARTED</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
+            f"🟢 <b>V3 QUANT ENGINE LIVE</b> ({'PAPER' if PAPER_MODE else 'LIVE'})\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📡 <b>5 Indices:</b> {INDEX_START_TIME}–{INDEX_END_TIME} IST\n"
-            f"🛢️ <b>5 MCX Futures:</b> Crude, NG, Gold, Silver, Copper ({MCX_START_TIME}–{MCX_END_TIME} IST)\n"
-            f"🎯 <b>Mode:</b> Dynamic API Contracts │ On-Demand Tick-WS │ RR 1:2"
+            f"📡 <b>5 Indices:</b> {INDEX_START_TIME}–{INDEX_END_TIME} IST (Fuel ≥{int(MIN_FUEL_SCORE)})\n"
+            f"🛢️ <b>5 MCX Futures:</b> Crude, NG, Gold, Silver, Copper (Eve Fuel ≥{int(MCX_EVENING_FUEL_SCORE)} │ Risk Cap ₹{int(MCX_MAX_RISK_INR)})\n"
+            f"🔄 <b>Handover:</b> {carried_cnt} Active Carried │ Singleton Lock │ RR 1:2"
         )
 
         while True:
             now_ist = datetime.now(IST)
             hhmm = now_ist.strftime("%H:%M")
 
+            if self.stop_requested:
+                self.shutdown_cleanly(now_ist, "MANUAL STOP")
+                break
+
+            if (time.time() - session_start_ts) >= SESSION_MAX_RUNTIME_SEC:
+                self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
+                break
+
             self.manage_open_positions(now_ist)
 
             if hhmm >= "23:20":
-                if self.streamer:
-                    try:
-                        self.streamer.disconnect()
-                    except Exception:
-                        pass
-                self.render_live_dashboard(hhmm)
-                notify(build_master_journal_report(now_ist))
-                notify(
-                    f"🛑 <b>SESSION CLOSED</b> │ Total Trades: <b>{len(self.closed_trades)}</b> │ "
-                    f"Final Day Net PnL: <b>₹{self.day_pnl:+,.2f}</b>"
-                )
+                self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
             max_profit = CAPITAL_PER_TRADE * DAILY_PROFIT_LOCK_PCT
@@ -1819,7 +1960,10 @@ class IntradayV3Engine:
                 or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES
             )
 
-            if not risk_locked:
+            if risk_locked:
+                self.bot_status_text = "🟡 BOT PAUSED • RISK LIMIT"
+            else:
+                self.bot_status_text = "🟢 BOT LIVE • RUNNING"
                 for idx, cfg in INDICES.items():
                     if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
                         if idx not in self.last_summaries:
