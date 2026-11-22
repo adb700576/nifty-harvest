@@ -9,8 +9,10 @@ JOURNAL_DIR = Path("live_journal")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+
 def now_ist() -> datetime:
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -22,14 +24,20 @@ def send_telegram(text: str):
     except Exception as e:
         print(f"[-] Telegram dispatch error: {e}")
 
+
 def run_journal_analytics():
-    csv_files = glob.glob(str(JOURNAL_DIR / "trades_journal_*.csv"))
+    csv_files = []
+    main_journal = JOURNAL_DIR / "trade_journal.csv"
+    if main_journal.is_file():
+        csv_files.append(str(main_journal))
+    csv_files.extend(glob.glob(str(JOURNAL_DIR / "trades_journal_*.csv")))
+
     if not csv_files:
         print("[-] कोणतीही ट्रेड जर्नल्स सापडली नाहीत.")
         return
 
     dfs = []
-    for f in csv_files:
+    for f in dict.fromkeys(csv_files):
         if "master_trading_journal.csv" in f:
             continue
         try:
@@ -44,18 +52,34 @@ def run_journal_analytics():
         return
 
     df = pd.concat(dfs, ignore_index=True)
-    df["entry_time"] = pd.to_datetime(df["entry_time"])
-    df = df.sort_values("entry_time").reset_index(drop=True)
 
-    # मास्टर CSV सेव्ह करणे
+    # Normalize column names between live_engine.py (pnl, points) and legacy journals (net_pnl, pts)
+    if "pnl" in df.columns and "net_pnl" not in df.columns:
+        df["net_pnl"] = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
+    else:
+        df["net_pnl"] = pd.to_numeric(df.get("net_pnl", 0.0), errors="coerce").fillna(0.0)
+
+    if "points" in df.columns and "pts" not in df.columns:
+        df["pts"] = pd.to_numeric(df["points"], errors="coerce").fillna(0.0)
+    else:
+        df["pts"] = pd.to_numeric(df.get("pts", 0.0), errors="coerce").fillna(0.0)
+
+    if "date" in df.columns:
+        df["date"] = df["date"].astype(str)
+        dt_series = pd.to_datetime(df["date"] + " " + df["entry_time"].astype(str), errors="coerce")
+    else:
+        dt_series = pd.to_datetime(df["entry_time"], errors="coerce")
+        df["date"] = dt_series.dt.strftime("%Y-%m-%d")
+
+    df["dt_sort"] = dt_series
+    df = df.sort_values("dt_sort").reset_index(drop=True)
+
     master_path = JOURNAL_DIR / "master_trading_journal.csv"
-    df.to_csv(master_path, index=False)
+    df.drop(columns=["dt_sort"], errors="ignore").to_csv(master_path, index=False)
 
     today_str = now_ist().strftime("%Y-%m-%d")
-    df["date"] = df["entry_time"].dt.strftime("%Y-%m-%d")
-    df["week_num"] = df["entry_time"].dt.isocalendar().week
-    df["month_str"] = df["entry_time"].dt.strftime("%Y-%m")
-    df["year"] = df["entry_time"].dt.strftime("%Y")
+    df["week_num"] = dt_series.dt.isocalendar().week
+    df["month_str"] = dt_series.dt.strftime("%Y-%m")
 
     def calc_stats(sub_df):
         total = len(sub_df)
@@ -65,29 +89,25 @@ def run_journal_analytics():
         losses = len(sub_df[sub_df["net_pnl"] < 0])
         win_rate = (wins / total) * 100
         net_pnl = sub_df["net_pnl"].sum()
-        pts = sub_df["pts"].sum() if "pts" in sub_df.columns else 0.0
+        pts = sub_df["pts"].sum()
         return total, wins, losses, win_rate, net_pnl, pts
 
-    # १. आजचे निकाल
     df_today = df[df["date"] == today_str]
     t_tot, t_win, t_loss, t_wr, t_pnl, t_pts = calc_stats(df_today)
 
-    # २. चालू आठवड्याचे निकाल
     current_week = now_ist().isocalendar().week
     df_week = df[df["week_num"] == current_week]
     w_tot, w_win, w_loss, w_wr, w_pnl, _ = calc_stats(df_week)
 
-    # ३. चालू महिन्याचे निकाल (आठवड्यानुसार विभागणी)
     current_month_str = now_ist().strftime("%Y-%m")
     df_month = df[df["month_str"] == current_month_str]
     m_tot, m_win, m_loss, m_wr, m_pnl, _ = calc_stats(df_month)
 
-    # ४. एकूण ऑल-टाइम / वार्षिक निकाल
     all_tot, all_win, all_loss, all_wr, all_pnl, _ = calc_stats(df)
-    total_charges = df["charges"].sum() if "charges" in df.columns else 0.0
+    total_charges = pd.to_numeric(df["charges"], errors="coerce").fillna(0.0).sum() if "charges" in df.columns else 0.0
 
     msg = (
-        f"📊 <b>NIFTY 5M ALGO: मास्टर ट्रेड जर्नल रिपोर्ट</b>\n"
+        f"📊 <b>V3 QUANT ALGO: मास्टर ट्रेड जर्नल रिपोर्ट</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>आजचा निकाल ({today_str})</b>\n"
         f"• ट्रेड्स: <code>{t_tot}</code> (🟢 {t_win} | 🔴 {t_loss})\n"
@@ -99,12 +119,9 @@ def run_journal_analytics():
         f"🗓️ <b>चालू महिना ({now_ist().strftime('%B %Y')})</b>\n"
     )
 
-    month_weeks = df_month.groupby("week_num")
-    idx = 1
-    for w_num, group in month_weeks:
+    for idx, (w_num, group) in enumerate(df_month.groupby("week_num"), start=1):
         _, _, _, sub_wr, sub_pnl, _ = calc_stats(group)
         msg += f"• Week {idx} (W{w_num}): {len(group)} ट्रेड्स | {sub_wr:.0f}% Win | ₹ {sub_pnl:+,.2f}\n"
-        idx += 1
 
     msg += (
         f"• <b>महिन्याचा एकूण निकाल: ₹ {m_pnl:+,.2f}</b> (Win Rate: {m_wr:.1f}%)\n\n"
@@ -118,6 +135,7 @@ def run_journal_analytics():
 
     send_telegram(msg)
     print("[+] मास्टर जर्नल ॲनालिटिक्स यशस्वीरीत्या पाठवले!")
+
 
 if __name__ == "__main__":
     run_journal_analytics()
