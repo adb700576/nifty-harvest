@@ -636,8 +636,8 @@ class IntradayV3Engine:
         self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
 
-        init_cap = float(os.getenv("CAPITAL_PER_TRADE", "25000"))
-        init_mcx_cap = float(os.getenv("MCX_CAPITAL_PER_TRADE", "150000"))
+        init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
+        init_mcx_cap = float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000")
         self.tuned_params = {
             "brain_version": "v1.0",
             "driver_gear": 3,
