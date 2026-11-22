@@ -16,49 +16,68 @@ log = logging.getLogger("AUTO_TUNER")
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 PARAMS_FILE = "live_journal/strategy_params.json"
 EVENT_CALENDAR_FILE = "live_journal/event_calendar.json"
+LEARNED_HOLIDAYS_FILE = "live_journal/learned_holidays.json"
 GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 
-# NSE Trading Holidays (when Tuesday falls on a holiday, expiry shifts to Monday)
-NSE_HOLIDAYS_2026 = {
-    "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31",
-    "2026-04-03", "2026-04-14", "2026-05-01", "2026-05-28",
-    "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20",
-    "2026-11-10", "2026-11-24", "2026-12-25",
-}
+
+def load_learned_holidays() -> set:
+    if os.path.isfile(LEARNED_HOLIDAYS_FILE):
+        try:
+            with open(LEARNED_HOLIDAYS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            pass
+    return set()
+
+
+def record_learned_holiday(date_str: str):
+    holidays = load_learned_holidays()
+    if date_str not in holidays:
+        holidays.add(date_str)
+        os.makedirs("live_journal", exist_ok=True)
+        with open(LEARNED_HOLIDAYS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(holidays), f, indent=2)
+
+
+def get_market_closed_reason(dt: datetime, upstox_market_status: str = "") -> str:
+    """
+    100% Zero-Hardcode Market Closed Detector:
+    - Catches Saturdays & Sundays forever via weekday math.
+    - Self-learns any weekday Exchange Holiday dynamically from broker status.
+    """
+    if dt.weekday() == 5:
+        return "SATURDAY (WEEKEND)"
+    if dt.weekday() == 6:
+        return "SUNDAY (WEEKEND)"
+
+    d_str = dt.strftime("%Y-%m-%d")
+    if d_str in load_learned_holidays():
+        return "NSE HOLIDAY (SELF-LEARNED)"
+
+    if upstox_market_status.strip().upper() == "CLOSED":
+        record_learned_holiday(d_str)
+        return "NSE HOLIDAY (AUTO-DETECTED)"
+
+    return ""
 
 
 def detect_expiry_for_date(target_dt: datetime, nearest_option_expiry_str: str = "") -> bool:
-    """
-    Detects whether target_dt is an Index Expiry Day:
-    1) Primary: Exact match against broker's nearest NFO option contract expiry date.
-    2) Fallback: Tuesday check, or Monday if Tuesday is an NSE holiday.
-    """
-    target_str = target_dt.strftime("%Y-%m-%d")
-
+    """Matches target date directly against broker's live NFO nearest option expiry contract."""
     if nearest_option_expiry_str:
-        return nearest_option_expiry_str.strip()[:10] == target_str
-
-    weekday = target_dt.weekday()  # Monday=0, Tuesday=1
-    if weekday == 1 and target_str not in NSE_HOLIDAYS_2026:
-        return True
-    if weekday == 0:
-        next_day_str = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
-        if next_day_str in NSE_HOLIDAYS_2026:
-            return True
-
+        return nearest_option_expiry_str.strip()[:10] == target_dt.strftime("%Y-%m-%d")
     return False
 
 
 def get_next_trading_day(now_ist: datetime) -> datetime:
-    """Returns the next NSE trading day (skips Saturday, Sunday, and NSE holidays)."""
+    """Returns next weekday trading session, skipping weekends and self-learned holidays."""
+    learned_holidays = load_learned_holidays()
     candidate = now_ist + timedelta(days=1)
-    while candidate.weekday() >= 5 or candidate.strftime("%Y-%m-%d") in NSE_HOLIDAYS_2026:
+    while candidate.weekday() >= 5 or candidate.strftime("%Y-%m-%d") in learned_holidays:
         candidate += timedelta(days=1)
     return candidate
 
 
 def check_scheduled_event(target_date_str: str) -> tuple[bool, str]:
-    """Checks event_calendar.json (e.g. {'2026-11-23': 'ELECTION_RESULT'}) for major scheduled events."""
     if os.path.isfile(EVENT_CALENDAR_FILE):
         try:
             with open(EVENT_CALENDAR_FILE, "r", encoding="utf-8") as f:
@@ -72,19 +91,17 @@ def check_scheduled_event(target_date_str: str) -> tuple[bool, str]:
 
 def apply_event_day_shield(
     params: dict,
+    capital: float,
     is_scheduled_event: bool = False,
     event_name: str = "",
     vix_change_pct: float = 0.0,
 ) -> dict:
-    """
-    Automatically protects capital on Election Results, Budget, RBI Policy, or sudden VIX spikes
-    by delaying morning entry to 09:45 AM and cutting per-trade risk by 40%.
-    """
     if is_scheduled_event or vix_change_pct >= 15.0:
         params["event_mode"] = True
         params["event_label"] = event_name or f"VIX_SPIKE_{vix_change_pct:+.1f}%"
         params["morning_wait_until"] = "09:45"
-        params["index_max_risk_inr"] = max(600.0, round(float(params["index_max_risk_inr"]) * 0.60, 2))
+        min_floor = round(capital * 0.025, 2)
+        params["index_max_risk_inr"] = max(min_floor, round(float(params["index_max_risk_inr"]) * 0.60, 2))
         params["min_fuel_score"] = max(float(params.get("min_fuel_score", 48.0)), 55.0)
     else:
         params["event_mode"] = False
@@ -94,10 +111,6 @@ def apply_event_day_shield(
 
 
 def upgrade_for_iv_crush_and_low_delta(params: dict, today_trades: list[dict]) -> tuple[dict, str]:
-    """
-    Upgrades Brain parameters when Spot moves in favor, but Option Premium fails to expand
-    due to IV Crush, Theta decay, or low-Delta OTM selection.
-    """
     iv_crush_count = sum(
         1
         for t in today_trades
@@ -106,9 +119,9 @@ def upgrade_for_iv_crush_and_low_delta(params: dict, today_trades: list[dict]) -
     )
 
     if iv_crush_count >= 2:
-        params["strike_offset"] = -1          # Shift to 1-strike ITM for strong intrinsic Delta
-        params["expiry_strike_offset"] = 0    # Strict ATM on expiry instead of OTM
-        params["no_momentum_minutes"] = 10    # Tighten stall exit from 15m to 10m to prevent Theta bleed
+        params["strike_offset"] = -1
+        params["expiry_strike_offset"] = 0
+        params["no_momentum_minutes"] = 10
         params["min_fuel_score"] = min(62.0, float(params.get("min_fuel_score", 48.0)) + 4.0)
         return params, f" | IV-Crush Upgrade ({iv_crush_count} stalls -> ITM/ATM + 10m Timer)"
 
@@ -118,17 +131,13 @@ def upgrade_for_iv_crush_and_low_delta(params: dict, today_trades: list[dict]) -
 
 
 def calibrate_options_chain_brain(params: dict, today_trades: list[dict]) -> tuple[dict, str]:
-    """
-    Calibrates Option Greeks (Delta/IV/Theta), Change in OI (Short Covering vs Writing),
-    and PCR (Put-Call Ratio) rules inside auto_tuner.py for live_engine.py.
-    """
-    params.setdefault("min_option_delta", 0.45)           # Avoid low-delta dead strikes
-    params.setdefault("expiry_slope_min_delta", 0.30)     # Allow 1-strike OTM only on expiry slope
-    params.setdefault("max_theta_decay_pct", 8.0)         # Skip if hourly theta > 8% of premium
-    params.setdefault("max_iv_spike_pct", 25.0)           # Block buying into over-inflated IV
-    params.setdefault("require_oi_short_covering", True)  # Require Call OI unwinding for CE / Put OI unwinding for PE
-    params.setdefault("bullish_pcr_min", 1.15)            # Strong CE bias when PCR >= 1.15 & rising
-    params.setdefault("bearish_pcr_max", 0.85)            # Strong PE bias when PCR <= 0.85 & falling
+    params.setdefault("min_option_delta", 0.45)
+    params.setdefault("expiry_slope_min_delta", 0.30)
+    params.setdefault("max_theta_decay_pct", 8.0)
+    params.setdefault("max_iv_spike_pct", 25.0)
+    params.setdefault("require_oi_short_covering", True)
+    params.setdefault("bullish_pcr_min", 1.15)
+    params.setdefault("bearish_pcr_max", 0.85)
 
     greek_bleed_losses = sum(
         1
@@ -151,30 +160,38 @@ def calibrate_options_chain_brain(params: dict, today_trades: list[dict]) -> tup
 
 def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct: float = 0.0):
     os.makedirs("live_journal", exist_ok=True)
-    capital = float(os.getenv("CAPITAL_PER_TRADE", "25000.0"))
+    existing = {}
+    if os.path.isfile(PARAMS_FILE):
+        try:
+            with open(PARAMS_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            pass
+
+    capital = float(os.getenv("CAPITAL_PER_TRADE") or existing.get("capital_per_trade", 25000.0))
+    mcx_capital = float(os.getenv("MCX_CAPITAL_PER_TRADE") or existing.get("mcx_capital_per_trade", 150000.0))
+
     now_ist = datetime.now(IST)
     next_session_dt = get_next_trading_day(now_ist)
     next_session_str = next_session_dt.strftime("%Y-%m-%d")
 
-    # CENTRAL BRAIN PARAMETERS (Read directly by live_engine.py)
     params = {
-        "brain_version": datetime.now(IST).strftime("v%Y.%m.%d.%H%M"),
+        "brain_version": now_ist.strftime("v%Y.%m.%d.%H%M"),
         "target_session_date": next_session_str,
         "is_expiry_day": detect_expiry_for_date(next_session_dt, nearest_option_expiry_str),
         "driver_gear": 3,
-        # Capital & Risk Shields
-        "max_daily_loss_inr": round(capital * 0.15, 2),             # Hard 15% daily capital shield
-        "index_max_risk_inr": round(capital * 0.05, 2),             # Hard 5% per-trade index risk cap
-        "mcx_max_risk_inr": min(1500.0, round(capital * 0.06, 2)),  # Hard ₹1,500 per-trade MCX risk cap
-        # Flat Road vs. Expiry Downhill Slope Rules
-        "min_fuel_score": 48.0,                                     # Normal flat-road fuel requirement
-        "expiry_slope_fuel_score": 32.0,                            # Expiry 13:45-14:45 downhill slope fuel
+        "capital_per_trade": capital,
+        "mcx_capital_per_trade": mcx_capital,
+        "max_daily_loss_inr": round(capital * 0.15, 2),
+        "index_max_risk_inr": round(capital * 0.05, 2),
+        "mcx_max_risk_inr": round(mcx_capital * 0.01, 2),
+        "min_fuel_score": 48.0,
+        "expiry_slope_fuel_score": 32.0,
         "expiry_slope_start": "13:45",
         "expiry_slope_end": "14:45",
-        "expiry_strike_offset": 1,                                  # ATM or 1-strike OTM (never far ₹5 lottery OTM)
-        "strike_offset": 0,                                         # Default ATM on normal days
+        "expiry_strike_offset": 1,
+        "strike_offset": 0,
         "mcx_evening_fuel_score": 56.0,
-        # Trend, Chop, ATR & News Ignition Geometry
         "min_adx_trend": 19.0,
         "max_chop_index": 60.0,
         "swing_lookback_candles": 75,
@@ -185,7 +202,6 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
         "morning_wait_until": "09:30",
         "news_ignition_atr_mult": 2.2,
         "news_ignition_vol_mult": 2.5,
-        # Greeks, Change in OI & PCR Defaults
         "min_option_delta": 0.45,
         "expiry_slope_min_delta": 0.30,
         "max_theta_decay_pct": 8.0,
@@ -196,21 +212,15 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
         "symbol_overrides": {},
         "last_lesson": "Central Brain Initialized",
     }
+    params.update(existing)
 
-    if os.path.isfile(PARAMS_FILE):
-        try:
-            with open(PARAMS_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                params.update(saved)
-        except Exception:
-            pass
-
-    # Refresh session metadata & reset base risk caps before applying daily adjustments
     params["brain_version"] = now_ist.strftime("v%Y.%m.%d.%H%M")
     params["target_session_date"] = next_session_str
     params["is_expiry_day"] = detect_expiry_for_date(next_session_dt, nearest_option_expiry_str)
+    params["capital_per_trade"] = capital
+    params["mcx_capital_per_trade"] = mcx_capital
     params["index_max_risk_inr"] = round(capital * 0.05, 2)
-    params["mcx_max_risk_inr"] = min(1500.0, round(capital * 0.06, 2))
+    params["mcx_max_risk_inr"] = round(mcx_capital * 0.01, 2)
     params["max_daily_loss_inr"] = round(capital * 0.15, 2)
 
     all_trades = []
@@ -235,6 +245,9 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
     wr_10 = 0.0
     lesson = f"Ready for {next_session_str} ({'EXPIRY SLOPE ARMED' if params['is_expiry_day'] else 'NORMAL SESSION'})"
 
+    idx_risk_floor = round(capital * 0.032, 2)
+    mcx_risk_floor = round(mcx_capital * 0.006, 2)
+
     if recent_10:
         gross_win = sum(t["pnl_val"] for t in recent_10 if t["pnl_val"] > 0)
         gross_loss = abs(sum(t["pnl_val"] for t in recent_10 if t["pnl_val"] < 0))
@@ -243,7 +256,6 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
         wr_10 = round((wins_10 / len(recent_10)) * 100.0, 1)
         lesson = f"Steady Cruise (PF {profit_factor}, WR {wr_10}%)"
 
-        # 1. Consecutive Loss & Major Accident Shield
         consec_losses_today = 0
         max_consec_today = 0
         for t in today_trades:
@@ -257,8 +269,8 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
 
         if major_accident:
             new_gear = min(2, max(1, old_gear - 2))
-            params["index_max_risk_inr"] = max(800.0, round(params["index_max_risk_inr"] * 0.80, 2))
-            params["mcx_max_risk_inr"] = max(900.0, round(params["mcx_max_risk_inr"] * 0.80, 2))
+            params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.80, 2))
+            params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.80, 2))
             params["min_fuel_score"] = min(60.0, float(params.get("min_fuel_score", 48.0)) + 4.0)
             params["expiry_slope_fuel_score"] = min(42.0, float(params.get("expiry_slope_fuel_score", 32.0)) + 3.0)
             lesson = f"SHIELD TRIGGERED -> Gear {old_gear}->{new_gear} | Risk & Fuel tightened (Day ₹{day_net:+.0f})"
@@ -266,7 +278,7 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
             if wr_10 >= 65.0 and profit_factor >= 2.2:
                 new_gear = min(5, old_gear + 1)
                 params["index_max_risk_inr"] = min(round(capital * 0.05, 2), round(params["index_max_risk_inr"] * 1.10, 2))
-                params["mcx_max_risk_inr"] = min(1500.0, round(params["mcx_max_risk_inr"] * 1.10, 2))
+                params["mcx_max_risk_inr"] = min(round(mcx_capital * 0.01, 2), round(params["mcx_max_risk_inr"] * 1.10, 2))
                 params["min_fuel_score"] = max(44.0, float(params.get("min_fuel_score", 48.0)) - 2.0)
                 params["expiry_slope_fuel_score"] = max(30.0, float(params.get("expiry_slope_fuel_score", 32.0)) - 1.0)
                 lesson = f"High Precision -> Upshift Gear {new_gear} (PF {profit_factor})"
@@ -275,39 +287,37 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
                 lesson = f"Strong Trend Capture -> Upshift Gear 4 (PF {profit_factor})"
             elif wr_10 < 35.0 or profit_factor < 0.75:
                 new_gear = max(1, old_gear - 1)
-                params["index_max_risk_inr"] = max(800.0, round(params["index_max_risk_inr"] * 0.85, 2))
-                params["mcx_max_risk_inr"] = max(900.0, round(params["mcx_max_risk_inr"] * 0.85, 2))
+                params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.85, 2))
+                params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.85, 2))
                 params["min_fuel_score"] = min(58.0, float(params.get("min_fuel_score", 48.0)) + 3.0)
                 lesson = f"Drawdown Shield -> Downshift Gear {new_gear} (PF {profit_factor})"
 
-    # 2. Auto-Calibrate ATR Buffer & Trail Cushion by Gear
     params["driver_gear"] = new_gear
     params["trail_cushion_mult"] = 1.15 if new_gear >= 4 else (0.85 if new_gear <= 2 else 1.0)
     params["atr_sl_buffer_mult"] = 0.14 if new_gear >= 4 else (0.10 if new_gear <= 2 else 0.12)
 
-    # 3. Upgrade for IV Crush / Low Delta & Option Chain Greeks/OI/PCR
     params, iv_note = upgrade_for_iv_crush_and_low_delta(params, today_trades)
     params, greeks_note = calibrate_options_chain_brain(params, today_trades)
     lesson += iv_note + greeks_note
 
-    # 4. Symbol-Specific Memory & Cooldown
+    # Dynamic 4% of capital symbol cooldown threshold (zero hardcoded rupee threshold)
+    cooldown_threshold = round(capital * 0.04, 2)
     sym_ov = params.get("symbol_overrides", {})
     for sym in set(t.get("symbol", "") for t in today_trades if t.get("symbol")):
         sym_today_pnl = sum(t["pnl_val"] for t in today_trades if t.get("symbol") == sym)
         ov = sym_ov.get(sym, {"min_fuel": params["min_fuel_score"], "cooldown": False})
-        if sym_today_pnl < -1000:
+        if sym_today_pnl < -cooldown_threshold:
             ov["cooldown"] = True
             ov["min_fuel"] = min(65.0, float(ov.get("min_fuel", 48.0)) + 5.0)
             lesson += f" | {sym} Cooldown (Fuel {ov['min_fuel']}+)"
-        elif sym_today_pnl > 1000:
+        elif sym_today_pnl > cooldown_threshold:
             ov["cooldown"] = False
             ov["min_fuel"] = max(44.0, float(ov.get("min_fuel", 48.0)) - 2.0)
         sym_ov[sym] = ov
     params["symbol_overrides"] = sym_ov
 
-    # 5. Apply Event / Election / VIX Shield for Next Session
     is_event, event_name = check_scheduled_event(next_session_str)
-    params = apply_event_day_shield(params, is_event, event_name, vix_change_pct)
+    params = apply_event_day_shield(params, capital, is_event, event_name, vix_change_pct)
     if params["event_mode"]:
         lesson += f" | EVENT SHIELD ({params['event_label']})"
 
