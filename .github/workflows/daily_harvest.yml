@@ -55,8 +55,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          CAPITAL_PER_TRADE: "25000"
-          MCX_CAPITAL_PER_TRADE: "150000"
+          CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
+          MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -74,7 +74,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          CAPITAL_PER_TRADE: "25000"
+          CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
+          MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
