@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-11-21 16:50:18 IST",
+  "updated_at": "2026-11-22 09:46:04 IST",
   "india_vix": 15.0,
   "vix_chg_pct": 0.0,
   "fii_dii": {
@@ -20,5 +20,7 @@
   "emergency_eject_ce": false,
   "event_caution": true,
   "summary": "Sectors 0G/0R | NiftyImp +0.00% | BNFImp +0.00%",
-  "top_alerts": []
+  "top_alerts": [
+    "Middle East latest: Iran releases video of 'missile city' as diplomatic efforts to end war cont"
+  ]
 }
