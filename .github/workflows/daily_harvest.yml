@@ -55,6 +55,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          CAPITAL_PER_TRADE: "25000"
+          MCX_CAPITAL_PER_TRADE: "150000"
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -64,7 +66,7 @@ jobs:
           fi
           python -u live_engine.py
 
-      - name: Run Nightly Deep Forensics & Driver Skill Coach
+      - name: Run Nightly Deep Forensics, Brain Calibration & Journal Report
         if: always()
         continue-on-error: true
         env:
@@ -72,6 +74,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          CAPITAL_PER_TRADE: "25000"
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -80,7 +83,10 @@ jobs:
             fi
           fi
           if [ -f auto_tuner.py ]; then
-            python -u auto_tuner.py
+            python -u -c "import json, os, auto_tuner; vix_chg = float(json.load(open('live_journal/macro_context.json')).get('vix_chg_pct', 0.0)) if os.path.isfile('live_journal/macro_context.json') else 0.0; auto_tuner.run_nightly_calibration(vix_change_pct=vix_chg)"
+          fi
+          if [ -f generate_journal_analytics.py ]; then
+            python -u generate_journal_analytics.py
           fi
 
       - name: Upload Live Trade Journal & Memory Artifact
