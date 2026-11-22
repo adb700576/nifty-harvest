@@ -13,9 +13,9 @@ log = logging.getLogger("TOKEN_AUTO")
 API_KEY = os.getenv("UPSTOX_API_KEY", "").strip()
 API_SECRET = os.getenv("UPSTOX_API_SECRET", "").strip()
 REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://127.0.0.1:5000/").strip()
-MOBILE_NO = os.getenv("UPSTOX_MOBILE_NO", "").strip()
+MOBILE_NO = (os.getenv("UPSTOX_MOBILE") or os.getenv("UPSTOX_MOBILE_NO") or "").strip()
 PIN = os.getenv("UPSTOX_PIN", "").strip()
-TOTP_SECRET = os.getenv("UPSTOX_TOTP_SECRET", "").strip()
+TOTP_SECRET = (os.getenv("UPSTOX_TOTP_KEY") or os.getenv("UPSTOX_TOTP_SECRET") or "").strip()
 TOKEN_FILE = "ACCESS_TOKEN.txt"
 
 
