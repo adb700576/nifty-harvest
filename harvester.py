@@ -6,9 +6,8 @@ import urllib.parse
 import pytz
 import requests
 import pandas as pd
-import numpy as np
 
-DB_PATH = "nifty_vault.db"
+DB_PATH = os.getenv("VAULT_DB_PATH", "nifty_vault.db")
 BASE_URL = "https://api.upstox.com"
 
 ACCESS_TOKEN = ""
@@ -19,21 +18,16 @@ if not ACCESS_TOKEN:
     ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
 
 
-# ========================= BLACK-SCHOLES FORMULA =========================
 def norm_cdf(x):
     return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
 
-def norm_pdf(x):
-    return (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x * x)
 
 def calculate_greeks(spot, strike, t_years, opt_price, opt_type="CE", r=0.07):
-    """Black-Scholes IV आणि Delta काढणे"""
     if spot <= 0 or strike <= 0 or t_years <= 0 or opt_price <= 0.05:
         return 0.0, 0.0
 
-    # IV शोधण्यासाठी Bisection पद्धत
     low_vol, high_vol = 0.01, 3.0
-    iv = 0.20  # फॉलबॅक
+    iv = 0.20
 
     for _ in range(25):
         mid_vol = (low_vol + high_vol) / 2.0
@@ -56,13 +50,8 @@ def calculate_greeks(spot, strike, t_years, opt_price, opt_type="CE", r=0.07):
     else:
         iv = (low_vol + high_vol) / 2.0
 
-    # अंतिम डेल्टा
     d1 = (math.log(spot / strike) + (r + 0.5 * iv ** 2) * t_years) / (iv * math.sqrt(t_years))
-    if opt_type == "CE":
-        delta = norm_cdf(d1)
-    else:
-        delta = norm_cdf(d1) - 1.0
-
+    delta = norm_cdf(d1) if opt_type == "CE" else (norm_cdf(d1) - 1.0)
     return round(float(iv), 4), round(float(delta), 4)
 
 
@@ -110,10 +99,7 @@ def get_nifty_spot_history(target_date: str):
         headers["Authorization"] = f"Bearer {ACCESS_TOKEN}"
 
     res = requests.get(url, headers=headers, timeout=15)
-    candles = []
-
-    if res.status_code == 200:
-        candles = res.json().get("data", {}).get("candles", [])
+    candles = res.json().get("data", {}).get("candles", []) if res.status_code == 200 else []
 
     if not candles:
         url_alt = f"{BASE_URL}/v2/historical-candle/{instrument_key}/1minute/{target_date}"
@@ -158,9 +144,9 @@ def harvest_options_for_date(target_date: str, spot_price: float, spot_map: dict
     sym_col = "tradingsymbol" if "tradingsymbol" in df_inst.columns else "trading_symbol"
 
     df_opt = df_inst[
-        (df_inst["exchange"] == "NSE_FO") & 
-        (df_inst["name"] == "NIFTY") & 
-        (df_inst["instrument_type"] == "OPTIDX")
+        (df_inst["exchange"] == "NSE_FO")
+        & (df_inst["name"] == "NIFTY")
+        & (df_inst["instrument_type"] == "OPTIDX")
     ].copy()
 
     if df_opt.empty:
@@ -175,19 +161,23 @@ def harvest_options_for_date(target_date: str, spot_price: float, spot_map: dict
     active_expiry = valid_expiries[0]
     print(f"[+] [Expiry Selector] निवडलेली वैध आगामी एक्सपायरी: {active_expiry}", flush=True)
 
-    # एक्सपायरीसाठी शिल्लक दिवस
     exp_dt = datetime.datetime.strptime(active_expiry, "%Y-%m-%d")
     cur_dt = datetime.datetime.strptime(target_date, "%Y-%m-%d")
     days_to_exp = max((exp_dt - cur_dt).days, 0.5)
     t_years = days_to_exp / 365.0
 
-    atm_strike = round(spot_price / 50.0) * 50.0
-    strikes_to_track = [atm_strike + (i * 50) for i in range(-8, 9)]
-    print(f"[+] [Harvester] ट्रॅक करायचे स्ट्राइक्स (ATM {atm_strike}): {strikes_to_track}", flush=True)
+    # Dynamic strike step discovery from live contract chain (no hardcoded 50.0)
+    exp_strikes = sorted({float(s) for s in df_opt[df_opt["expiry"] == active_expiry]["strike"].dropna() if float(s) > 0})
+    diffs = [round(exp_strikes[i + 1] - exp_strikes[i], 2) for i in range(len(exp_strikes) - 1) if (exp_strikes[i + 1] - exp_strikes[i]) > 0]
+    strike_step = float(min(diffs)) if diffs else 50.0
+
+    atm_strike = round(spot_price / strike_step) * strike_step
+    strikes_to_track = [atm_strike + (i * strike_step) for i in range(-8, 9)]
+    print(f"[+] [Harvester] ट्रॅक करायचे स्ट्राइक्स (Step {strike_step}, ATM {atm_strike}): {strikes_to_track}", flush=True)
 
     df_target = df_opt[
-        (df_opt["expiry"] == active_expiry) & 
-        (df_opt["strike"].isin(strikes_to_track))
+        (df_opt["expiry"] == active_expiry)
+        & (df_opt["strike"].isin(strikes_to_track))
     ].copy()
 
     headers = {"Accept": "application/json"}
@@ -207,9 +197,7 @@ def harvest_options_for_date(target_date: str, spot_price: float, spot_map: dict
 
         url = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{target_date}/{target_date}"
         res = requests.get(url, headers=headers, timeout=10)
-        c_list = []
-        if res.status_code == 200:
-            c_list = res.json().get("data", {}).get("candles", [])
+        c_list = res.json().get("data", {}).get("candles", []) if res.status_code == 200 else []
 
         if not c_list:
             url_alt = f"{BASE_URL}/v2/historical-candle/{inst_key}/1minute/{target_date}"
@@ -221,12 +209,10 @@ def harvest_options_for_date(target_date: str, spot_price: float, spot_map: dict
             ts = str(c[0])
             opt_close = float(c[4])
             spot_at_ts = spot_map.get(ts, spot_price)
-
-            # ग्रीक्स कॅल्क्युलेट करणे
             iv, delta = calculate_greeks(spot_at_ts, strike, t_years, opt_close, opt_type)
 
             cur.execute("""
-                INSERT OR REPLACE INTO nifty_options_1m 
+                INSERT OR REPLACE INTO nifty_options_1m
                 (timestamp, symbol, strike, option_type, open, high, low, close, volume, oi, iv, delta)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (ts, sym, strike, opt_type, float(c[1]), float(c[2]), float(c[3]), opt_close, float(c[5]), float(c[6]) if len(c) > 6 else 0.0, iv, delta))
