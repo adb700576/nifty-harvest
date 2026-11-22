@@ -49,12 +49,13 @@ jobs:
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
           fi
 
-      - name: Run Self-Maturing V3 Live Engine (with Pre-Market Macro Radar)
+      - name: Run Self-Maturing V3 Live Engine (with Live Tape + Upstox News AI Radar)
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
           MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
         run: |
