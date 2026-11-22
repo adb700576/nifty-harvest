@@ -248,4 +248,115 @@ def fetch_fii_dii_activity() -> dict:
 
     if result["fii_net_cr"] < -1500 and result["dii_net_cr"] < 0:
         result["flow_regime"] = "BOTH_SELLING_BEAR_ALERT"
-    elif result["
+    elif result["fii_net_cr"] > 500 and result["dii_net_cr"] > 500:
+        result["flow_regime"] = "BOTH_BUYING_STRONG_BULL"
+    return result
+
+
+def scan_news_headlines() -> list:
+    headlines = []
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for url in RSS_FEEDS:
+        try:
+            resp = requests.get(url, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                continue
+            root = ET.fromstring(resp.text)
+            for item in root.findall(".//item")[:5]:
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    headlines.append(title_el.text.strip())
+        except Exception:
+            continue
+    return list(dict.fromkeys(headlines))[:24]
+
+
+def evaluate_macro_context(notify_user: bool = False) -> dict:
+    os.makedirs("live_journal", exist_ok=True)
+    now_ist = datetime.now(IST)
+    today_str = now_ist.strftime("%Y-%m-%d")
+
+    sec_data = fetch_sectors_and_heavyweights()
+    vix, vix_chg = sec_data["vix"], sec_data["vix_chg_pct"]
+    vix_baseline = update_and_get_vix_baseline(today_str, vix)
+    vix_above_baseline_pct = round(((vix - vix_baseline) / max(vix_baseline, 1.0)) * 100.0, 1) if vix > 0 else 0.0
+
+    fii_dii = fetch_fii_dii_activity()
+    headlines = scan_news_headlines()
+
+    bear_hits, event_hits, matched_alerts = [], [], []
+    for h in headlines:
+        hl = h.lower()
+        for kw in SEVERE_BEARISH_KEYWORDS:
+            if kw in hl:
+                bear_hits.append(kw)
+                matched_alerts.append(h[:95])
+                break
+        for kw in EVENT_VOLATILITY_KEYWORDS:
+            if kw in hl:
+                event_hits.append(kw)
+                break
+
+    unique_bear = list(dict.fromkeys(bear_hits))
+    unique_event = list(dict.fromkeys(event_hits))
+
+    veto_ce = False
+    veto_pe = False
+    emergency_eject_ce = False
+    veto_bnf_ce = sec_data["bnf_heavy_impact"] <= -0.65
+    event_caution = len(unique_event) >= 1 or (sec_data["sector_verdict"] == "SECTOR_TUG_OF_WAR_CHOP")
+    threat_level = "NORMAL"
+
+    # Relative VIX spike (>30% above 20-day rolling baseline) instead of hardcoded 21.0
+    if len(unique_bear) >= 2 or vix_above_baseline_pct >= 30.0 or vix_chg >= 7.0 or (len(unique_bear) >= 1 and vix_chg >= 4.5):
+        threat_level = "CRASH_ALERT"
+        veto_ce = True
+        emergency_eject_ce = True
+        summary_reason = f"BREAKING SHOCK ({', '.join(unique_bear[:2]) or f'VIX +{vix_chg}%'}) -> EJECT & VETO CE"
+    elif sec_data["sector_verdict"] == "HEAVYWEIGHT_DRAG_BEARISH" or fii_dii["flow_regime"] == "BOTH_SELLING_BEAR_ALERT":
+        threat_level = "BEARISH_CAUTION"
+        veto_ce = True
+        summary_reason = f"Heavyweights Dragging ({', '.join(sec_data['top_draggers'][:2])}) -> CE Blocked"
+    elif sec_data["sector_verdict"] == "SPLIT_BANK_WEAK_NIFTY_STRONG":
+        threat_level = "SPLIT_DIVERGENCE"
+        summary_reason = f"Bank Heavyweights Weak ({sec_data['bnf_heavy_impact']:+.2f}%) -> BankNifty PE / Nifty CE"
+    elif sec_data["sector_verdict"] == "BROAD_SECTOR_RALLY_BULL":
+        threat_level = "BULLISH_TAILWIND"
+        summary_reason = f"Broad Rally ({sec_data['green_sectors']}/{len(sec_data['sector_perf'])} Sectors Green) -> Highway CE Mode"
+    else:
+        summary_reason = (
+            f"Sectors {sec_data['green_sectors']}G/{sec_data['red_sectors']}R | "
+            f"NiftyImp {sec_data['nifty_heavy_impact']:+.2f}% | BNFImp {sec_data['bnf_heavy_impact']:+.2f}%"
+        )
+
+    context = {
+        "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "india_vix": vix,
+        "vix_baseline_20d": vix_baseline,
+        "vix_chg_pct": vix_chg,
+        "fii_dii": fii_dii,
+        "sector_perf": sec_data["sector_perf"],
+        "bnf_heavy_impact": sec_data["bnf_heavy_impact"],
+        "nifty_heavy_impact": sec_data["nifty_heavy_impact"],
+        "sector_verdict": sec_data["sector_verdict"],
+        "top_pullers": sec_data["top_pullers"],
+        "top_draggers": sec_data["top_draggers"],
+        "threat_level": threat_level,
+        "veto_ce": veto_ce,
+        "veto_pe": veto_pe,
+        "veto_bnf_ce": veto_bnf_ce,
+        "emergency_eject_ce": emergency_eject_ce,
+        "event_caution": event_caution,
+        "summary": summary_reason,
+        "top_alerts": matched_alerts[:3],
+    }
+
+    with open(MACRO_FILE, "w", encoding="utf-8") as f:
+        json.dump(context, f, indent=2)
+
+    log.info(f"[RADAR] {threat_level} | {sec_data['sector_verdict']} | {summary_reason}")
+    return context
+
+
+if __name__ == "__main__":
+    evaluate_macro_context(notify_user=False)
