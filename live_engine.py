@@ -50,17 +50,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-MIN_FUEL_SCORE = 48.0
-MCX_EVENING_FUEL_SCORE = 56.0
+MIN_FUEL_SCORE = 45.0
+MCX_EVENING_FUEL_SCORE = 50.0
 MIN_ADX_TREND = 19.0
 MAX_CHOP_INDEX = 60.0
 SESSION_MAX_RUNTIME_SEC = 20700
 
-INDEX_START_TIME = "09:20"
+INDEX_START_TIME = "09:15"
 INDEX_END_TIME = "15:10"
 INDEX_EXIT_TIME = "15:15"
 
-MCX_START_TIME = "09:20"
+MCX_START_TIME = "09:15"
 MCX_END_TIME = "23:00"
 MCX_EXIT_TIME = "23:15"
 
@@ -75,6 +75,7 @@ ACTIVE_STATE_FILE = "live_journal/active_positions.json"
 PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
 MACRO_FILE = "live_journal/macro_context.json"
+DASHBOARD_STATE_FILE = "live_journal/dashboard_state.json"
 
 STAGE1_BE_R = 1.5
 STAGE2_LOCK_R = 2.5
@@ -131,7 +132,7 @@ def push_trade_to_google_sheet(trade_row: dict):
 
 
 # ==============================================================================
-# 2. TELEGRAM UI & AUTO-CHARGES
+# 2. TELEGRAM UI (SINGLE PINNED MESSAGE) & AUTO-CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -153,19 +154,52 @@ def notify(msg: str, silent: bool = False):
                 log.warning(f"Telegram send error after retry: {e}")
 
 
+def load_saved_dashboard_id() -> int:
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    if os.path.isfile(DASHBOARD_STATE_FILE):
+        try:
+            with open(DASHBOARD_STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            if st.get("date") == today_str and st.get("message_id"):
+                return int(st["message_id"])
+        except Exception:
+            pass
+    return None
+
+
+def save_dashboard_id(msg_id: int):
+    if not msg_id:
+        return
+    os.makedirs("live_journal", exist_ok=True)
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    try:
+        with open(DASHBOARD_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"date": today_str, "message_id": int(msg_id)}, f)
+    except Exception:
+        pass
+
+
 def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return message_id
+
+    if not message_id:
+        message_id = load_saved_dashboard_id()
 
     if message_id:
         edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
         try:
             resp = requests.post(edit_url, json=payload, timeout=8).json()
-            if resp.get("ok") or "message is not modified" in str(resp.get("description", "")).lower():
+            desc = str(resp.get("description", "")).lower()
+            if resp.get("ok") or "message is not modified" in desc:
                 return message_id
-        except Exception as e:
-            log.warning(f"Dashboard edit error: {e}")
+            # Only create a new message if the old message was genuinely deleted
+            if "message to edit not found" not in desc and "message_id_invalid" not in desc:
+                return message_id
+        except Exception:
+            # On temporary network glitch, keep existing message_id instead of spamming new pin
+            return message_id
 
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_notification": True}
@@ -173,6 +207,7 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
         resp = requests.post(send_url, json=payload, timeout=8).json()
         if resp.get("ok"):
             new_id = resp["result"]["message_id"]
+            save_dashboard_id(new_id)
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "message_id": new_id, "disable_notification": True},
@@ -427,10 +462,10 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. BACKGROUND REGIME INTELLIGENCE, GANN LEVELS & FUEL SCORE
+# 4. BACKGROUND REGIME INTELLIGENCE, GANN LEVELS & GRADUAL FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
-    if df.empty or len(df) < 12:
+    if df.empty or len(df) < 6:
         return {"regime": "MODERATE_TREND", "adx": 20.0, "chop": 50.0, "is_sideways": False, "is_strong_trend": False}
 
     high, low, close = df["high"], df["low"], df["close"]
@@ -485,15 +520,27 @@ def compute_gann_levels(price: float, step: float) -> dict:
 
 
 def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) -> dict:
-    if len(df) < 3:
+    if len(df) < 1:
         return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
+
+    zone_band = atr14 * GANN_ZONE_ATR_MULT
+    if len(df) < 3:
+        c = df.iloc[-1]
+        o, h, l, cl = float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"])
+        near_gann = next((lvl for lvl in gann_levels if min(abs(cl - lvl), abs(l - lvl), abs(h - lvl)) <= zone_band), None)
+        if near_gann is None:
+            return {"near_gann": None, "bull_pattern": None, "bear_pattern": None}
+        r = max(h - l, 1e-6)
+        b = abs(cl - o)
+        bull = "OPEN_DRIVE_BULL" if (cl > o and b / r >= 0.55) else None
+        bear = "OPEN_DRIVE_BEAR" if (cl < o and b / r >= 0.55) else None
+        return {"near_gann": near_gann, "bull_pattern": bull, "bear_pattern": bear}
 
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
     o1, h1, l1, cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
     o2, h2, l2, cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
     o3, h3, l3, cl3 = float(c3["open"]), float(c3["high"]), float(c3["low"]), float(c3["close"])
 
-    zone_band = atr14 * GANN_ZONE_ATR_MULT
     near_gann = None
     min_dist = float("inf")
     for lvl in gann_levels:
@@ -520,6 +567,8 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
         bull_pattern = "MORNING_STAR"
     elif (lower_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (upper_wick3 <= 0.25 * r3) and ((cl3 - l3) / r3 >= 0.60):
         bull_pattern = "HAMMER"
+    elif (cl3 > o3) and (b3 / r3 >= 0.65) and (cl3 > h2):
+        bull_pattern = "MOMENTUM_BREAKOUT_BULL"
 
     bear_pattern = None
     if (cl3 < o3) and (cl2 > o2) and (cl3 <= o2) and (o3 >= cl2):
@@ -528,12 +577,14 @@ def detect_6_gann_patterns(df: pd.DataFrame, gann_levels: list, atr14: float) ->
         bear_pattern = "EVENING_STAR"
     elif (upper_wick3 >= 1.8 * max(b3, r3 * 0.1)) and (lower_wick3 <= 0.25 * r3) and ((h3 - cl3) / r3 >= 0.60):
         bear_pattern = "REVERSE_HAMMER"
+    elif (cl3 < o3) and (b3 / r3 >= 0.65) and (cl3 < l2):
+        bear_pattern = "MOMENTUM_BREAKDOWN_BEAR"
 
     return {"near_gann": near_gann, "bull_pattern": bull_pattern, "bear_pattern": bear_pattern}
 
 
 def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) -> pd.DataFrame:
-    if spot_df.empty or len(spot_df) < 3:
+    if spot_df.empty:
         return spot_df
 
     prev_close = spot_df["close"].shift(1).fillna(spot_df["open"])
@@ -576,7 +627,8 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
 
         fuel_scores.append(round(min(100.0, max(0.0, 10.0 + vol_pts + atr_pts + eff_pts)), 1))
 
-    spot_df["fuel"] = fuel_scores
+    # 3-bar EMA smoothing so Fuel increases/decreases gradually without erratic single-tick jumps
+    spot_df["fuel"] = pd.Series(fuel_scores).ewm(span=3, adjust=False).mean().round(1)
     return spot_df
 
 
@@ -626,7 +678,7 @@ class IntradayV3Engine:
         self.consecutive_losses = 0
         self.last_summaries = {}
         self.latest_dfs = {}
-        self.dashboard_msg_id = None
+        self.dashboard_msg_id = load_saved_dashboard_id()
         self.dashboard_pulse = False
         self.dashboard_lock = threading.Lock()
         self.last_macro_ts = 0.0
@@ -660,7 +712,7 @@ class IntradayV3Engine:
             "trail_cushion_mult": 1.0,
             "scalp_target_r": 1.35,
             "no_momentum_minutes": 15,
-            "morning_wait_until": "09:30",
+            "morning_wait_until": "09:15",
             "news_ignition_atr_mult": 2.2,
             "news_ignition_vol_mult": 2.5,
             "min_option_delta": 0.45,
@@ -697,7 +749,12 @@ class IntradayV3Engine:
         if os.path.isfile(PARAMS_FILE):
             try:
                 with open(PARAMS_FILE, "r", encoding="utf-8") as f:
-                    self.tuned_params.update(json.load(f))
+                    loaded = json.load(f)
+                self.tuned_params.update(loaded)
+                # Ensure immediate 09:15 monitoring and 45.0 accessible fuel floor
+                self.tuned_params["morning_wait_until"] = "09:15"
+                if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
+                    self.tuned_params["min_fuel_score"] = 45.0
                 log.info(
                     f"[BRAIN LOADED] {self.tuned_params.get('brain_version')} | "
                     f"Gear={self.tuned_params.get('driver_gear')} | "
@@ -751,7 +808,7 @@ class IntradayV3Engine:
             return False, f"AI_PAIR_VETO_{idx}_{side}"
 
         sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
-        if sym_ov.get("cooldown") and fuel < 65.0:
+        if sym_ov.get("cooldown") and fuel < 60.0:
             return False, "COOLDOWN_LOW_FUEL"
 
         similar = [
@@ -762,7 +819,7 @@ class IntradayV3Engine:
         ]
         if len(similar) >= 3:
             bad_entries = sum(1 for m in similar if m.get("outcome") in ("SIDEWAYS_TRAP", "WRONG_ENTRY_AGAINST_TREND"))
-            if (bad_entries / len(similar)) >= 0.65 and fuel < 62.0:
+            if (bad_entries / len(similar)) >= 0.65 and fuel < 58.0:
                 return False, "MEMORY_VETO_TRAP"
 
         if pair_key in self.macro_context.get("priority_pairs", []):
@@ -830,7 +887,7 @@ class IntradayV3Engine:
                     entry = float(pos["entry_price"])
                     tick_sz = float(pos.get("tick_size", 0.05))
                     r_unit = max(float(pos.get("r_unit", 1.0)), 1e-6)
-                    entry_time_str = pos.get("entry_time", "09:20:00")
+                    entry_time_str = pos.get("entry_time", "09:15:00")
 
                     inst_df = fetch_intraday_5m(inst_key)
                     if not inst_df.empty:
@@ -1446,7 +1503,7 @@ class IntradayV3Engine:
             return None
 
         spot_df = fetch_intraday_5m(cfg["spot_key"])
-        if spot_df.empty or len(spot_df) < 3:
+        if spot_df.empty or len(spot_df) < 1:
             return None
 
         fut_key = self.fut_contracts.get(idx, {}).get("instrument_key", "")
@@ -1454,9 +1511,11 @@ class IntradayV3Engine:
         df = compute_fuel_with_fut_volume(spot_df, fut_df)
         self.latest_dfs[idx] = df
 
-        curr, prev = df.iloc[-1], df.iloc[-2]
+        curr = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else curr
         spot_close = float(curr["close"])
-        price_change = round(spot_close - float(prev["close"]), 2)
+        ref_close = float(prev["close"]) if len(df) >= 2 else float(curr["open"])
+        price_change = round(spot_close - ref_close, 2)
         atr14 = max(float(curr["atr14"]), cfg.get("tick_size", 0.05) * 2)
         fuel = float(curr["fuel"])
 
@@ -1559,15 +1618,6 @@ class IntradayV3Engine:
             pending = new_signal
 
         if pending and idx not in self.active_positions and self.is_within_trade_window(idx, now_ist):
-            morning_wait = str(self.tuned_params.get("morning_wait_until", "09:30"))
-            if not is_mcx and hhmm_now < morning_wait:
-                return {
-                    "idx": idx, "is_mcx": is_mcx,
-                    "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
-                    "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
-                    "short_status": f"WAIT {morning_wait}",
-                }
-
             sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
             if in_expiry_slope:
                 req_fuel = float(self.tuned_params.get("expiry_slope_fuel_score", 32.0))
@@ -1577,7 +1627,7 @@ class IntradayV3Engine:
                 req_fuel = max(base_req_fuel, eve_req_fuel) if (is_mcx and hhmm_now >= "15:30") else base_req_fuel
 
             if (trade_mode == "SCALP" or self.macro_context.get("event_caution", False)) and not in_expiry_slope:
-                req_fuel += 8.0
+                req_fuel += 3.0
 
             dir_confirmed = (
                 (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
@@ -1857,7 +1907,7 @@ class IntradayV3Engine:
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
-            f"🕒 <b>Session:</b> <code>09:20 AM – 11:20 PM IST</code>"
+            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>"
         )
 
         self.start_heartbeat_thread()
