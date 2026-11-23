@@ -147,7 +147,6 @@ def fetch_sectors_and_dynamic_leaders(today_str: str) -> dict:
         "sector_perf": {},
         "green_sectors": 0,
         "red_sectors": 0,
-        "bnf_heavy_impact": 0.0,
         "nifty_heavy_impact": 0.0,
         "top_pullers": [],
         "top_draggers": [],
@@ -209,14 +208,10 @@ def fetch_sectors_and_dynamic_leaders(today_str: str) -> dict:
         weighted_market_impact += imp
         stock_impacts.append((item["sym"], item["chg_pct"], imp))
 
-    bank_vals = [v for s, v in result["sector_perf"].items() if "BANK" in s or "FIN" in s]
-    bnf_impact = round(sum(bank_vals) / len(bank_vals), 2) if bank_vals else round(weighted_market_impact, 2)
-
     green_sec = sum(1 for v in result["sector_perf"].values() if v > 0.15)
     red_sec = sum(1 for v in result["sector_perf"].values() if v < -0.15)
     result["green_sectors"] = green_sec
     result["red_sectors"] = red_sec
-    result["bnf_heavy_impact"] = bnf_impact
     result["nifty_heavy_impact"] = round(weighted_market_impact, 2)
 
     stock_impacts.sort(key=lambda x: x[2], reverse=True)
@@ -226,20 +221,14 @@ def fetch_sectors_and_dynamic_leaders(today_str: str) -> dict:
     total_secs = max(len(result["sector_perf"]), 1)
     majority_secs = max(2, int(round(total_secs * 0.70)))
 
-    if bnf_impact >= 0.65 and all(v > 0 for v in bank_vals) and len(bank_vals) >= 1:
-        result["sector_verdict"] = "BANKING_LED_RALLY"
-    elif bnf_impact <= -0.65 and weighted_market_impact >= 0.15:
-        result["sector_verdict"] = "SPLIT_BANK_WEAK_NIFTY_STRONG"
-    elif bnf_impact <= -0.65 and weighted_market_impact < 0:
-        result["sector_verdict"] = "HEAVYWEIGHT_DRAG_BEARISH"
-    elif green_sec >= majority_secs and weighted_market_impact >= 0.35:
+    if green_sec >= majority_secs and weighted_market_impact >= 0.35:
         result["sector_verdict"] = "BROAD_SECTOR_RALLY_BULL"
     elif red_sec >= majority_secs and weighted_market_impact <= -0.35:
         result["sector_verdict"] = "BROAD_SECTOR_SELLOFF_BEAR"
     elif abs(green_sec - red_sec) <= 2:
         result["sector_verdict"] = "SECTOR_TUG_OF_WAR_CHOP"
     else:
-        result["sector_verdict"] = "BALANCED"
+        result["sector_verdict"] = "DIVERGENT_FLOW"
 
     return result
 
@@ -327,9 +316,9 @@ def fetch_fresh_upstox_news(leader_keys: list) -> list:
 
 def generate_autonomous_desk_brief(sec_data: dict, fii_dii: dict, articles: list, live_pcrs: dict) -> dict:
     """
-    Zero-Script Institutional Desk AI Brain:
-    Reads live sector breadth, VIX velocity, Option Chain PCRs, FII/DII flows, and breaking news
-    to produce an autonomous, unemotional execution stance & trader brief.
+    100% Zero-Hardcode Autonomous Desk Brain:
+    Evaluates live sector breadth, VIX velocity, all live Option Chain PCRs, FII/DII flows,
+    and breaking news to dynamically output symbol-level & side-level execution permissions.
     """
     if not GEMINI_API_KEY:
         return {}
@@ -341,22 +330,24 @@ def generate_autonomous_desk_brief(sec_data: dict, fii_dii: dict, articles: list
     )
 
     prompt = (
-        "You are an unemotional, cold-blooded institutional Indian index options desk trader (Nifty, BankNifty, FinNifty, Sensex).\n"
-        "Analyze the live quantitative telemetry below and decide the exact intraday focus:\n"
+        "You are an unemotional, cold-blooded institutional Indian derivatives risk manager.\n"
+        "Analyze the live market telemetry below and output dynamic execution permissions across all active symbols:\n"
         f"- India VIX: {sec_data['vix']} ({sec_data['vix_chg_pct']:+.2f}%)\n"
-        f"- Sector Breadth: {sec_data['green_sectors']} Green / {sec_data['red_sectors']} Red | Verdict: {sec_data['sector_verdict']}\n"
-        f"- Banking/Financials Impact: {sec_data['bnf_heavy_impact']:+.2f}% | Overall Heavyweights: {sec_data['nifty_heavy_impact']:+.2f}%\n"
+        f"- All Live Sectors (% Chg): {json.dumps(sec_data['sector_perf'])}\n"
+        f"- Heavyweight Flow Impact: {sec_data['nifty_heavy_impact']:+.2f}%\n"
         f"- Top Pullers: {', '.join(sec_data['top_pullers']) or 'None'} | Top Draggers: {', '.join(sec_data['top_draggers']) or 'None'}\n"
         f"- Live Option Chain PCRs: {json.dumps(live_pcrs)}\n"
         f"- FII/DII Cash Flow: FII ₹{fii_dii['fii_net_cr']} Cr | DII ₹{fii_dii['dii_net_cr']} Cr\n"
         f"- Fresh Breaking News (<10m): {headlines_blob}\n\n"
-        "Rules for your autonomous decision:\n"
-        "1. If PCR < 0.65 and heavyweights/sectors are weak, bias is strictly PE_ONLY.\n"
-        "2. If banking sectors are strongly positive while broader market is flat, focus is BANKNIFTY_CE.\n"
-        "3. If sectors are split/tug-of-war, bias is SCALP_ONLY.\n"
-        "4. Write 'desk_note' as a crisp, natural 2-sentence institutional desk note explaining WHY based on numbers and WHICH index/side (CE or PE) the bot is focusing on—zero hype, zero emotion.\n"
+        "Instructions:\n"
+        "1. Decide dynamically if any side ('CE' or 'PE') should be globally blocked ('blocked_sides') due to extreme PCR, sector sweep, or shock.\n"
+        "2. Decide dynamically if specific symbol:side pairs (e.g. 'NIFTY:CE', 'BANKNIFTY:CE', 'FINNIFTY:PE') should be blocked ('blocked_pairs') or prioritized ('priority_pairs') based on sector leadership/drag.\n"
+        "3. Populate 'eject_sides' ONLY if an immediate breaking macro shock requires emergency exit of open 'CE' or 'PE' positions.\n"
+        "4. Set 'force_scalp' to true if sectors are in a tug-of-war / sideways chop.\n"
+        "5. Write 'desk_note' as a sharp, natural 2-sentence institutional note explaining the exact numbers and focus—zero hype, zero emotion.\n"
         "Respond ONLY with valid JSON:\n"
-        '{"is_shock": true/false, "shock_dir": "BEARISH"|"BULLISH"|"NONE", "bias": "CE_ONLY"|"PE_ONLY"|"BANKNIFTY_CE"|"SCALP_ONLY"|"TWO_WAY", "desk_note": "..."}'
+        '{"is_shock": true/false, "eject_sides": [], "blocked_sides": [], "blocked_pairs": [], '
+        '"priority_pairs": [], "force_scalp": true/false, "stance_label": "DYNAMIC_LABEL", "desk_note": "..."}'
     )
 
     try:
@@ -439,88 +430,64 @@ def evaluate_macro_context(notify_user: bool = False, live_pcrs: dict = None) ->
     vix_above_baseline_pct = round(((vix - vix_baseline) / max(vix_baseline, 1.0)) * 100.0, 1) if vix > 0 else 0.0
 
     fii_dii = fetch_fii_dii_activity()
+    fresh_news = fetch_fresh_upstox_news(sec_data.get("top_leader_keys", []))
 
-    veto_ce = False
-    veto_pe = False
-    emergency_eject_ce = False
-    emergency_eject_pe = False
-    veto_bnf_ce = sec_data["bnf_heavy_impact"] <= -0.65
+    blocked_sides = set()
+    eject_sides = set()
+    blocked_pairs = set()
+    priority_pairs = set()
+    force_scalp = (sec_data["sector_verdict"] == "SECTOR_TUG_OF_WAR_CHOP")
     vix_cooling_decay = (vix_chg <= -2.5)
-    event_caution = vix_cooling_decay or (sec_data["sector_verdict"] == "SECTOR_TUG_OF_WAR_CHOP")
+    event_caution = vix_cooling_decay or force_scalp
     threat_level = "NORMAL"
 
-    # Quantitative PCR Extreme Rule (Zero Emotion)
-    nifty_pcr = float(live_pcrs.get("NIFTY", 1.0) or 1.0)
-    if 0 < nifty_pcr < 0.60 and sec_data["nifty_heavy_impact"] <= 0:
-        veto_ce = True
-        threat_level = "EXTREME_CALL_WRITING_PE_FOCUS"
+    if vix_above_baseline_pct >= 30.0 or vix_chg >= 7.0:
+        threat_level = "VIX_SHOCK_ALERT"
+        blocked_sides.add("CE")
+        eject_sides.add("CE")
 
-    if vix_above_baseline_pct >= 30.0 or vix_chg >= 7.0 or (vix_chg >= 4.5 and sec_data["sector_verdict"] == "BROAD_SECTOR_SELLOFF_BEAR"):
-        threat_level = "CRASH_ALERT"
-        veto_ce = True
-        emergency_eject_ce = True
-        summary_reason = f"LIVE VIX SHOCK (VIX {vix} / {vix_chg:+.1f}%) + Leader Selloff -> EJECT & VETO CE"
-    elif sec_data["sector_verdict"] == "BROAD_SECTOR_RALLY_BULL" and (vix_chg <= -3.5 or sec_data["nifty_heavy_impact"] >= 0.45):
-        threat_level = "BULLISH_TAILWIND"
-        veto_pe = True
-        emergency_eject_pe = True
-        summary_reason = f"BROAD RALLY ({sec_data['green_sectors']}/{len(sec_data['sector_perf'])} Green) -> EJECT PE & HIGHWAY CE"
-    elif sec_data["sector_verdict"] == "BANKING_LED_RALLY":
-        threat_level = "BANKNIFTY_LEADER"
-        summary_reason = f"Banks Leading ({sec_data['bnf_heavy_impact']:+.2f}%) -> Focus BankNifty/FinNifty CE"
-    elif sec_data["sector_verdict"] == "HEAVYWEIGHT_DRAG_BEARISH" or fii_dii["flow_regime"] == "BOTH_SELLING_BEAR_ALERT":
-        threat_level = "BEARISH_CAUTION"
-        veto_ce = True
-        summary_reason = f"Leaders Dragging ({', '.join(sec_data['top_draggers'][:2])}) -> CE Blocked, Focus PE"
-    elif sec_data["sector_verdict"] == "SPLIT_BANK_WEAK_NIFTY_STRONG":
-        threat_level = "SPLIT_DIVERGENCE"
-        summary_reason = f"Bank Sector Weak ({sec_data['bnf_heavy_impact']:+.2f}%) -> BankNifty PE / Nifty CE"
-    elif vix_cooling_decay:
-        threat_level = "VIX_DECAY_CAUTION"
-        summary_reason = f"India VIX Falling ({vix_chg:+.1f}%) -> High Theta Decay Caution"
-    else:
-        summary_reason = (
-            f"Sectors {sec_data['green_sectors']}G/{sec_data['red_sectors']}R | "
-            f"LeaderImp {sec_data['nifty_heavy_impact']:+.2f}% | BankImp {sec_data['bnf_heavy_impact']:+.2f}%"
-        )
-
-    fresh_news = fetch_fresh_upstox_news(sec_data.get("top_leader_keys", []))
     prev_verdict = prev_context.get("sector_verdict", "")
-    prev_threat = prev_context.get("threat_level", "")
-    regime_shifted = (sec_data["sector_verdict"] != prev_verdict) or (threat_level != prev_threat)
+    regime_shifted = (sec_data["sector_verdict"] != prev_verdict) or (threat_level != prev_context.get("threat_level", ""))
 
     ai_brief = prev_context.get("ai_brief", "")
-    ai_bias = prev_context.get("ai_bias", "TWO_WAY")
+    stance_label = prev_context.get("stance_label", "ADAPTIVE_TWO_WAY")
 
-    if fresh_news or regime_shifted or notify_user:
+    if fresh_news or regime_shifted or notify_user or not prev_context:
         ai_eval = generate_autonomous_desk_brief(sec_data, fii_dii, fresh_news, live_pcrs)
         if ai_eval:
             ai_brief = str(ai_eval.get("desk_note", "")).strip() or ai_brief
-            ai_bias = str(ai_eval.get("bias", ai_bias)).upper()
+            stance_label = str(ai_eval.get("stance_label", stance_label)).upper().strip()
+            force_scalp = bool(ai_eval.get("force_scalp", force_scalp))
 
-            if ai_bias == "PE_ONLY":
-                veto_ce = True
-            elif ai_bias == "CE_ONLY":
-                veto_pe = True
+            for s in ai_eval.get("blocked_sides", []):
+                blocked_sides.add(str(s).upper().strip())
+            for s in ai_eval.get("eject_sides", []):
+                eject_sides.add(str(s).upper().strip())
+            for p in ai_eval.get("blocked_pairs", []):
+                blocked_pairs.add(str(p).upper().strip())
+            for p in ai_eval.get("priority_pairs", []):
+                priority_pairs.add(str(p).upper().strip())
 
             if ai_eval.get("is_shock"):
-                shock_dir = str(ai_eval.get("shock_dir", "NONE")).upper()
-                if shock_dir == "BEARISH":
-                    threat_level = "CRASH_ALERT"
-                    veto_ce = True
-                    emergency_eject_ce = True
-                elif shock_dir == "BULLISH":
-                    threat_level = "BULLISH_TAILWIND"
-                    veto_pe = True
-                    emergency_eject_pe = True
+                threat_level = "AI_BREAKING_SHOCK"
 
-            if ai_brief and (fresh_news or (regime_shifted and threat_level != "NORMAL")):
+            if ai_brief and (fresh_news or (regime_shifted and prev_verdict)):
                 send_telegram_alert(
                     f"🧠 <b>AI DESK DECISION • {now_ist.strftime('%H:%M')} IST</b>\n"
                     f"────────────────────────────\n"
-                    f"🎯 <b>Stance:</b> <code>{ai_bias}</code>  |  <b>VIX:</b> <code>{vix} ({vix_chg:+.1f}%)</code>\n"
+                    f"🎯 <b>Stance:</b> <code>{stance_label}</code>  |  <b>VIX:</b> <code>{vix} ({vix_chg:+.1f}%)</code>\n"
                     f"<i>{ai_brief}</i>"
                 )
+    else:
+        blocked_sides.update(prev_context.get("blocked_sides", []))
+        blocked_pairs.update(prev_context.get("blocked_pairs", []))
+        priority_pairs.update(prev_context.get("priority_pairs", []))
+        force_scalp = bool(prev_context.get("force_scalp", force_scalp))
+
+    summary_reason = (
+        f"Stance {stance_label} | Sectors {sec_data['green_sectors']}G/{sec_data['red_sectors']}R | "
+        f"Flow {sec_data['nifty_heavy_impact']:+.2f}%"
+    )
 
     context = {
         "updated_at": now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
@@ -529,18 +496,17 @@ def evaluate_macro_context(notify_user: bool = False, live_pcrs: dict = None) ->
         "vix_chg_pct": vix_chg,
         "fii_dii": fii_dii,
         "sector_perf": sec_data["sector_perf"],
-        "bnf_heavy_impact": sec_data["bnf_heavy_impact"],
         "nifty_heavy_impact": sec_data["nifty_heavy_impact"],
         "sector_verdict": sec_data["sector_verdict"],
         "top_pullers": sec_data["top_pullers"],
         "top_draggers": sec_data["top_draggers"],
         "threat_level": threat_level,
-        "ai_bias": ai_bias,
-        "veto_ce": veto_ce,
-        "veto_pe": veto_pe,
-        "veto_bnf_ce": veto_bnf_ce,
-        "emergency_eject_ce": emergency_eject_ce,
-        "emergency_eject_pe": emergency_eject_pe,
+        "stance_label": stance_label,
+        "blocked_sides": sorted(blocked_sides),
+        "eject_sides": sorted(eject_sides),
+        "blocked_pairs": sorted(blocked_pairs),
+        "priority_pairs": sorted(priority_pairs),
+        "force_scalp": force_scalp,
         "event_caution": event_caution,
         "summary": summary_reason,
         "ai_brief": ai_brief,
@@ -549,7 +515,7 @@ def evaluate_macro_context(notify_user: bool = False, live_pcrs: dict = None) ->
     with open(MACRO_FILE, "w", encoding="utf-8") as f:
         json.dump(context, f, indent=2)
 
-    log.info(f"[RADAR] {threat_level} | Bias={ai_bias} | {summary_reason}")
+    log.info(f"[RADAR] {threat_level} | Stance={stance_label} | Blocked={sorted(blocked_pairs)} | {summary_reason}")
     return context
 
 
