@@ -2040,7 +2040,7 @@ class IntradayV3Engine:
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
             f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>  |  📊 <code>5m IDX / 15m MCX</code>"
         )
-
+        self.dashboard_msg_id = None
         self.start_heartbeat_thread()
 
         while True:
