@@ -286,11 +286,11 @@ def save_dashboard_id(msg_id: int):
         pass
 
 
-def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
+ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return message_id
 
-   if message_id:
+    if message_id:
         edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
         try:
@@ -300,7 +300,6 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
                 return message_id
         except Exception:
             pass
-            
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_notification": True}
     try:
