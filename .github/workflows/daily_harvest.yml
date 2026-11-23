@@ -49,7 +49,7 @@ jobs:
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
           fi
 
-      - name: Run Self-Maturing V3 Live Engine (with Live Tape + Upstox News AI Radar)
+      - name: Run Self-Maturing V3 Live Engine (with Tick-by-Tick AI Trading Agent)
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -68,7 +68,7 @@ jobs:
           fi
           python -u live_engine.py
 
-      - name: Run Nightly Vault Harvester, Brain Calibration & Journal Report
+      - name: Run Nightly Vault Harvester, Brain Calibration, AI Code Architect & Journal Report
         if: always()
         continue-on-error: true
         env:
@@ -76,6 +76,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
           MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
           VAULT_DB_PATH: live_journal/nifty_vault.db
@@ -92,6 +93,9 @@ jobs:
           if [ -f auto_tuner.py ]; then
             python -u -c "import json, os, auto_tuner; vix_chg = float(json.load(open('live_journal/macro_context.json')).get('vix_chg_pct', 0.0)) if os.path.isfile('live_journal/macro_context.json') else 0.0; exp_str = str(json.load(open('live_journal/strategy_params.json')).get('nearest_option_expiry', '')) if os.path.isfile('live_journal/strategy_params.json') else ''; auto_tuner.run_nightly_calibration(nearest_option_expiry_str=exp_str, vix_change_pct=vix_chg)"
           fi
+          if [ -f ai_trading_agent.py ]; then
+            python -u ai_trading_agent.py
+          fi
           if [ -f generate_journal_analytics.py ]; then
             python -u generate_journal_analytics.py
           fi
@@ -103,17 +107,15 @@ jobs:
           name: live-trades-journal
           path: live_journal/
 
-      - name: Commit & Push Journal, Vault, Macro Context & Self-Tuned Params
+      - name: Commit & Push Journal, Vault, AI Code Upgrades & Self-Tuned Params
         if: always()
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/ 2>/dev/null)" ]; then
-            git add live_journal/*
-            if ! git diff --quiet || ! git diff --staged --quiet; then
-              git commit -m "chore(ai-coach): update trade journal, vault, macro radar & driver gear [skip ci]"
-              git pull --rebase origin main || git pull --rebase origin master
-              git push
-              echo "✅ Journal, Vault, Macro Context & Driver Gear committed."
-            fi
+          git config --global user.name "AI_TRADING_AGENT"
+          git config --global user.email "bot@nifty-harvest.local"
+          git add live_journal/* *.py || true
+          if ! git diff --quiet || ! git diff --staged --quiet; then
+            git commit -m "🤖 AI_TRADING_AGENT: update journal, vault, driver gear & self-upgraded code [skip ci]"
+            git pull --rebase origin main || git pull --rebase origin master
+            git push
+            echo "✅ Journal, Vault, Macro Context, Driver Gear & AI Code Upgrades committed."
           fi
