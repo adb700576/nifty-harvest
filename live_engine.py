@@ -54,7 +54,7 @@ MIN_FUEL_SCORE = 48.0
 MCX_EVENING_FUEL_SCORE = 56.0
 MIN_ADX_TREND = 19.0
 MAX_CHOP_INDEX = 60.0
-SESSION_MAX_RUNTIME_SEC = 21100
+SESSION_MAX_RUNTIME_SEC = 20700
 
 INDEX_START_TIME = "09:20"
 INDEX_END_TIME = "15:10"
@@ -113,7 +113,7 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
     hhmm = now_ist.strftime("%H:%M")
-    return ("14:45" <= hhmm <= "14:58") or ("20:40" <= hhmm <= "20:55")
+    return ("14:35" <= hhmm <= "14:58") or ("20:30" <= hhmm <= "20:55")
 
 
 def push_trade_to_google_sheet(trade_row: dict):
@@ -680,6 +680,7 @@ class IntradayV3Engine:
             "veto_pe": False,
             "veto_bnf_ce": False,
             "emergency_eject_ce": False,
+            "emergency_eject_pe": False,
             "event_caution": False,
             "india_vix": 15.0,
             "summary": "Normal Market",
@@ -1014,6 +1015,11 @@ class IntradayV3Engine:
                         target_idx = idx
                         break
 
+                    if pos["side"] == "PE" and self.macro_context.get("emergency_eject_pe", False):
+                        exit_reason = "BREAKING_NEWS_PE_EJECT"
+                        target_idx = idx
+                        break
+
                     if pos.get("trade_mode") == "SCALP":
                         scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
                         if curr_r >= scalp_r:
@@ -1076,6 +1082,16 @@ class IntradayV3Engine:
                 cfg["freeze_qty"] = opt_specs["freeze_quantity"]
                 cfg["tick_size"] = opt_specs["tick_size"]
                 cfg["step"] = opt_specs["step"]
+
+        nifty_exps = self.expiries.get("NIFTY", [])
+        if nifty_exps:
+            self.tuned_params["nearest_option_expiry"] = nifty_exps[0]
+            os.makedirs(os.path.dirname(PARAMS_FILE), exist_ok=True)
+            try:
+                with open(PARAMS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(self.tuned_params, f, indent=2)
+            except Exception:
+                pass
 
     def get_smart_expiry(self, idx: str, now_ist: datetime) -> tuple:
         valid_exps = self.expiries.get(idx, [])
@@ -1759,6 +1775,8 @@ class IntradayV3Engine:
 
             if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
                 exit_reason = "BREAKING_NEWS_CE_EJECT"
+            elif pos["side"] == "PE" and self.macro_context.get("emergency_eject_pe", False):
+                exit_reason = "BREAKING_NEWS_PE_EJECT"
             elif pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
                 exit_reason = "SCALP_TARGET_HIT"
             elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
