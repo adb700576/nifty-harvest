@@ -32,7 +32,7 @@ except ImportError:
     HAS_AUTO_TUNER = False
 
 # ==============================================================================
-# 1. CONFIGURATION, SELF-TUNED PARAMS & GOOGLE SHEETS SYNC
+# 1. CONFIGURATION, SELF-TUNED PARAMS & GOOGLE SHEETS SYNC + AUTO-RESTORE
 # ==============================================================================
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -77,6 +77,12 @@ PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
 MACRO_FILE = "live_journal/macro_context.json"
 DASHBOARD_STATE_FILE = "live_journal/dashboard_state.json"
+
+JOURNAL_FIELDNAMES = [
+    "trade_no", "date", "entry_time", "exit_time", "symbol", "contract", "side",
+    "qty", "entry_price", "exit_price", "points", "sl", "target", "exit_reason",
+    "gross_pnl", "brokerage", "taxes_other", "charges", "pnl", "day_pnl", "setup",
+]
 
 STAGE1_BE_R = 1.5
 STAGE2_LOCK_R = 2.5
@@ -130,6 +136,106 @@ def push_trade_to_google_sheet(trade_row: dict):
         log.info(f"[GSHEET] Synced Trade #{trade_row['trade_no']} to Google Sheets.")
     except Exception as e:
         log.warning(f"[GSHEET] Sync warning: {e}")
+
+
+def _normalize_date_str(val) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    if "T" in s:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(IST)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            return s[:10]
+    return s[:10]
+
+
+def _normalize_time_str(val) -> str:
+    s = str(val or "").strip()
+    if not s:
+        return ""
+    if "T" in s:
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(IST)
+            return dt.strftime("%H:%M:%S")
+        except Exception:
+            return s[11:19]
+    return s
+
+
+def restore_journal_from_google_sheet():
+    if not GSHEET_WEBHOOK_URL:
+        return
+    try:
+        resp = requests.get(GSHEET_WEBHOOK_URL, params={"action": "GET_TRADES"}, timeout=12).json()
+        sheet_trades = resp.get("trades", []) if isinstance(resp, dict) else []
+        if not sheet_trades:
+            return
+
+        os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
+        existing_rows = []
+        seen_keys = set()
+
+        if os.path.isfile(JOURNAL_FILE):
+            with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    d_str = _normalize_date_str(r.get("date"))
+                    t_no = int(float(r.get("trade_no", 0) or 0))
+                    key = (d_str, t_no, str(r.get("symbol", "")).strip(), str(r.get("entry_time", "")).strip())
+                    seen_keys.add(key)
+                    existing_rows.append(r)
+
+        added_count = 0
+        for st in sheet_trades:
+            d_str = _normalize_date_str(st.get("date"))
+            if not d_str:
+                continue
+            t_no = int(float(st.get("trade_no", 0) or 0))
+            sym = str(st.get("symbol", "")).strip()
+            e_time = _normalize_time_str(st.get("entry_time"))
+            x_time = _normalize_time_str(st.get("exit_time"))
+            key = (d_str, t_no, sym, e_time)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            clean_row = {
+                "trade_no": t_no,
+                "date": d_str,
+                "entry_time": e_time,
+                "exit_time": x_time,
+                "symbol": sym,
+                "contract": str(st.get("contract", "")).strip(),
+                "side": str(st.get("side", "")).strip(),
+                "qty": int(float(st.get("qty", 0) or 0)),
+                "entry_price": float(st.get("entry_price", 0.0) or 0.0),
+                "exit_price": float(st.get("exit_price", 0.0) or 0.0),
+                "points": float(st.get("points", 0.0) or 0.0),
+                "sl": float(st.get("sl", 0.0) or 0.0),
+                "target": float(st.get("target", 0.0) or 0.0),
+                "exit_reason": str(st.get("exit_reason", "")).strip(),
+                "gross_pnl": float(st.get("gross_pnl", 0.0) or 0.0),
+                "brokerage": float(st.get("brokerage", 0.0) or 0.0),
+                "taxes_other": float(st.get("taxes_other", 0.0) or 0.0),
+                "charges": float(st.get("charges", 0.0) or 0.0),
+                "pnl": float(st.get("pnl", 0.0) or 0.0),
+                "day_pnl": float(st.get("day_pnl", 0.0) or 0.0),
+                "setup": str(st.get("setup", "")).strip(),
+            }
+            existing_rows.append(clean_row)
+            added_count += 1
+
+        if added_count > 0:
+            existing_rows.sort(key=lambda r: (_normalize_date_str(r.get("date")), int(float(r.get("trade_no", 0) or 0))))
+            with open(JOURNAL_FILE, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=JOURNAL_FIELDNAMES)
+                writer.writeheader()
+                for r in existing_rows:
+                    writer.writerow({k: r.get(k, "") for k in JOURNAL_FIELDNAMES})
+            log.info(f"[GSHEET RESTORE] Restored {added_count} trade(s) from Google Sheets into {JOURNAL_FILE}.")
+    except Exception as e:
+        log.warning(f"[GSHEET RESTORE] Sync skipped: {e}")
 
 
 # ==============================================================================
@@ -305,14 +411,9 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
 def record_trade_journal(row: dict):
     os.makedirs(os.path.dirname(JOURNAL_FILE), exist_ok=True)
     file_exists = os.path.isfile(JOURNAL_FILE)
-    fieldnames = [
-        "trade_no", "date", "entry_time", "exit_time", "symbol", "contract", "side",
-        "qty", "entry_price", "exit_price", "points", "sl", "target", "exit_reason",
-        "gross_pnl", "brokerage", "taxes_other", "charges", "pnl", "day_pnl", "setup",
-    ]
     try:
         with open(JOURNAL_FILE, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=JOURNAL_FIELDNAMES)
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
@@ -658,7 +759,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (DUAL-TF + ADAPTIVE HYBRID + SMART EXIT)
+# 6. SELF-MATURING V3 ENGINE (DUAL-TF + ADAPTIVE HYBRID + GSHEET RESTORE)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -952,17 +1053,21 @@ class IntradayV3Engine:
             log.warning(f"Active positions restore error: {e}")
 
     def load_today_state_from_journal(self):
+        restore_journal_from_google_sheet()
         today_str = datetime.now(IST).strftime("%Y-%m-%d")
         if not os.path.isfile(JOURNAL_FILE):
             return
         try:
+            self.closed_trades = []
+            self.day_pnl = 0.0
             with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
                 for r in csv.DictReader(f):
-                    if r.get("date") == today_str:
+                    d_str = _normalize_date_str(r.get("date"))
+                    if d_str == today_str:
                         pnl_val = float(r.get("pnl", 0.0))
                         t_no = int(float(r.get("trade_no", len(self.closed_trades) + 1)))
                         self.closed_trades.append({
-                            "trade_no": t_no, "date": r["date"], "entry_time": r.get("entry_time", ""),
+                            "trade_no": t_no, "date": d_str, "entry_time": r.get("entry_time", ""),
                             "exit_time": r.get("exit_time", ""), "symbol": r.get("symbol", ""),
                             "contract": r.get("contract", ""), "side": r.get("side", ""),
                             "qty": int(float(r.get("qty", 0))), "entry_price": float(r.get("entry_price", 0.0)),
@@ -976,6 +1081,8 @@ class IntradayV3Engine:
                         self.day_pnl = round(self.day_pnl + pnl_val, 2)
                         self.trade_counter = max(self.trade_counter, t_no)
             self.closed_trades.sort(key=lambda x: x["trade_no"])
+            if self.closed_trades:
+                log.info(f"[STATE LOADED] {len(self.closed_trades)} today's trade(s) loaded | Net PnL: ₹{self.day_pnl:+.2f}")
         except Exception:
             pass
 
@@ -1216,10 +1323,11 @@ class IntradayV3Engine:
                 with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
                     for r in csv.DictReader(f):
                         try:
-                            d_obj = datetime.strptime(r["date"], "%Y-%m-%d")
+                            d_str = _normalize_date_str(r.get("date"))
+                            d_obj = datetime.strptime(d_str, "%Y-%m-%d")
                             y_iso, w_iso, _ = d_obj.isocalendar()
                             rows.append({
-                                "date": r["date"],
+                                "date": d_str,
                                 "year": y_iso,
                                 "week": w_iso,
                                 "pnl": float(r.get("pnl", 0.0)),
@@ -1439,7 +1547,6 @@ class IntradayV3Engine:
         peak_r = peak_gain / r_unit
         curr_r = curr_gain / r_unit
 
-        # 1. SMART INSTITUTIONAL PROFIT-BOOKING RADAR (At >= 1.8R Profit)
         scalp_gate_r = float(self.tuned_params.get("scalp_target_r", 1.80))
         if curr_r >= scalp_gate_r:
             c_curr = df.iloc[-1]
@@ -1447,7 +1554,6 @@ class IntradayV3Engine:
             upper_wick = float(c_curr["high"]) - max(float(c_curr["open"]), float(c_curr["close"]))
             lower_wick = min(float(c_curr["open"]), float(c_curr["close"])) - float(c_curr["low"])
 
-            # A. Gann Support / Resistance Touch + Rejection Wick
             if pos["side"] == "CE" and abs(spot_close - gann_res) <= (atr14 * 0.35) and (upper_wick / c_range) >= 0.45:
                 self.close_position_now(idx, ltp, "GANN_RES_PROFIT_BOOK", now_ist)
                 return
@@ -1455,28 +1561,23 @@ class IntradayV3Engine:
                 self.close_position_now(idx, ltp, "GANN_SUP_PROFIT_BOOK", now_ist)
                 return
 
-            # B. OI Unwinding & PCR Reversal Detection (Options)
             if not is_mcx:
                 hist = list(self.pcr_history.get(idx, []))
                 pcr_turned_bull = len(hist) >= 3 and hist[-1] > hist[-2] > hist[-3]
                 pcr_turned_bear = len(hist) >= 3 and hist[-1] < hist[-2] < hist[-3]
 
-                # For PE: Put Unwinding (d_pe < 0) + Call Writing building (d_ce > 0) + Spot bouncing
                 if pos["side"] == "PE" and ((d_pe < 0 and d_ce > 0 and price_change > 0) or (pcr_turned_bull and price_change > 0)):
                     self.close_position_now(idx, ltp, "OI_PCR_REVERSAL_EXIT", now_ist)
                     return
-                # For CE: Call Unwinding (d_ce < 0) + Put Unwinding (d_pe < 0) + Spot dropping
                 if pos["side"] == "CE" and ((d_ce < 0 and d_pe < 0 and price_change < 0) or (pcr_turned_bear and price_change < 0)):
                     self.close_position_now(idx, ltp, "OI_PCR_REVERSAL_EXIT", now_ist)
                     return
 
-            # C. Early Momentum Fade at Peak (Fuel drops below 32 with opposing price tick)
             opposing_tick = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
             if fuel < 32.0 and opposing_tick:
                 self.close_position_now(idx, ltp, "PEAK_MOMENTUM_LOCK", now_ist)
                 return
 
-        # 2. SWING + 1.5R LOCK TRAILING (If Trend Continues into Highway Mode!)
         if len(df) >= 4:
             recent_3 = df.iloc[-4:-1]
             swing_low = float(recent_3["low"].min())
@@ -1508,7 +1609,6 @@ class IntradayV3Engine:
                         self.active_positions[idx]["trail_stage"] = trail_label
                 self.save_active_positions_state()
 
-        # 3. FUEL EXHAUSTED & NO MOMENTUM TIME STOP
         low_fuel_streak = (pos.get("low_fuel_streak", 0) + 1) if fuel < 20.0 else 0
         pos["low_fuel_streak"] = low_fuel_streak
         opposing_move = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
