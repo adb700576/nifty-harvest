@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-23",
+  "vix_key": "NSE_INDEX|India VIX",
+  "sectors": {
+    "CONSUMPTION": "NSE_INDEX|Nifty Consumption",
+    "RURAL": "NSE_INDEX|Nifty Rural",
+    "COREHOUSING": "NSE_INDEX|Nifty CoreHousing",
+    "REALTY": "NSE_INDEX|Nifty Realty",
+    "RAILWAYSPSU": "NSE_INDEX|Nifty RailwaysPSU",
+    "INFRALOG": "NSE_INDEX|Nifty InfraLog",
+    "REITS REALTY": "NSE_INDEX|Nifty REITs Realty",
+    "EV": "NSE_INDEX|Nifty EV",
+    "IT": "NSE_INDEX|Nifty IT",
+    "PSE": "NSE_INDEX|Nifty PSE",
+    "IPO": "NSE_INDEX|Nifty IPO",
+    "MNC": "NSE_INDEX|Nifty MNC",
+    "IND DIGITAL": "NSE_INDEX|NIFTY IND DIGITAL",
+    "INDIA MFG": "NSE_INDEX|NIFTY INDIA MFG"
+  },
+  "fo_equities": {
+    "BHEL": "NSE_EQ|INE257A01026"
+  }
+}
