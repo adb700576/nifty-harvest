@@ -675,12 +675,13 @@ class IntradayV3Engine:
         self.market_memory = []
         self.macro_context = {
             "threat_level": "NORMAL",
+            "stance_label": "ADAPTIVE_TWO_WAY",
             "sector_verdict": "BALANCED",
-            "veto_ce": False,
-            "veto_pe": False,
-            "veto_bnf_ce": False,
-            "emergency_eject_ce": False,
-            "emergency_eject_pe": False,
+            "blocked_sides": [],
+            "eject_sides": [],
+            "blocked_pairs": [],
+            "priority_pairs": [],
+            "force_scalp": False,
             "event_caution": False,
             "india_vix": 15.0,
             "summary": "Normal Market",
@@ -724,9 +725,14 @@ class IntradayV3Engine:
         if not force and (now_ts - self.last_macro_ts) < MACRO_REFRESH_SEC:
             return
         self.last_macro_ts = now_ts
+        live_pcrs = {
+            idx: s["pcr"]
+            for idx, s in self.last_summaries.items()
+            if not s.get("is_mcx") and s.get("pcr", 0) > 0
+        }
         if HAS_MACRO_RADAR:
             try:
-                self.macro_context = evaluate_macro_context(notify_user=False)
+                self.macro_context = evaluate_macro_context(notify_user=False, live_pcrs=live_pcrs)
                 return
             except Exception:
                 pass
@@ -738,12 +744,11 @@ class IntradayV3Engine:
                 pass
 
     def consult_market_memory(self, idx: str, side: str, regime_info: dict, fuel: float) -> tuple:
-        if side == "CE" and self.macro_context.get("veto_ce", False):
-            return False, "MACRO_CRASH_VETO_CE"
-        if side == "PE" and self.macro_context.get("veto_pe", False):
-            return False, "MACRO_VETO_PE"
-        if side == "CE" and idx in ("BANKNIFTY", "FINNIFTY") and self.macro_context.get("veto_bnf_ce", False):
-            return False, "BNF_HEAVYWEIGHT_DRAG_VETO_CE"
+        pair_key = f"{idx}:{side}".upper()
+        if side.upper() in self.macro_context.get("blocked_sides", []):
+            return False, f"AI_SIDE_VETO_{side}"
+        if pair_key in self.macro_context.get("blocked_pairs", []):
+            return False, f"AI_PAIR_VETO_{idx}_{side}"
 
         sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
         if sym_ov.get("cooldown") and fuel < 65.0:
@@ -760,7 +765,9 @@ class IntradayV3Engine:
             if (bad_entries / len(similar)) >= 0.65 and fuel < 62.0:
                 return False, "MEMORY_VETO_TRAP"
 
-        if regime_info["is_sideways"] or self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP":
+        if pair_key in self.macro_context.get("priority_pairs", []):
+            return True, "AI_PRIORITY_HIGHWAY"
+        if regime_info["is_sideways"] or self.macro_context.get("force_scalp", False):
             return True, "CITY_SCALP"
         return True, "HIGHWAY_RUNNER"
 
@@ -1010,13 +1017,8 @@ class IntradayV3Engine:
                     peak_r = pos.get("peak_gain", 0.0) / r_unit
                     tick_sz = pos.get("tick_size", 0.05)
 
-                    if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
-                        exit_reason = "BREAKING_NEWS_CE_EJECT"
-                        target_idx = idx
-                        break
-
-                    if pos["side"] == "PE" and self.macro_context.get("emergency_eject_pe", False):
-                        exit_reason = "BREAKING_NEWS_PE_EJECT"
+                    if pos["side"].upper() in self.macro_context.get("eject_sides", []):
+                        exit_reason = f"AI_SHOCK_EJECT_{pos['side']}"
                         target_idx = idx
                         break
 
@@ -1270,11 +1272,12 @@ class IntradayV3Engine:
                 lines.append("<i>No closed trades yet today.</i>")
 
             if self.last_summaries:
-                lines.append("\n📡 <b>INDICES LIVE</b>")
+                ai_stance = self.macro_context.get("stance_label", "ADAPTIVE_TWO_WAY")
+                lines.append(f"\n📡 <b>INDICES LIVE</b>  |  🧠 <code>{ai_stance}</code>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
+                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
                 lines.append("\n🛢️ <b>MCX LIVE</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
@@ -1502,7 +1505,7 @@ class IntradayV3Engine:
         slope_end = str(self.tuned_params.get("expiry_slope_end", "14:45"))
         in_expiry_slope = (not is_mcx) and is_today_exp and (slope_start <= hhmm_now <= slope_end)
 
-        is_sector_chop = (self.macro_context.get("sector_verdict") == "SECTOR_TUG_OF_WAR_CHOP")
+        is_sector_chop = bool(self.macro_context.get("force_scalp", False))
         if in_expiry_slope:
             trade_mode = "HIGHWAY"
         else:
@@ -1680,7 +1683,6 @@ class IntradayV3Engine:
         greeks = chosen.get("option_greeks", {})
         ltp = float(mkt.get("ltp", 0))
 
-        # Dynamic minimum premium floor proportional to underlying spot (0.012% of spot)
         min_opt_premium = max(tick_sz * 20, round(spot_close * 0.00012, 2))
         if ltp < min_opt_premium:
             return
@@ -1773,10 +1775,8 @@ class IntradayV3Engine:
             curr_r = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) / r_unit
             exit_reason = None
 
-            if pos["side"] == "CE" and self.macro_context.get("emergency_eject_ce", False):
-                exit_reason = "BREAKING_NEWS_CE_EJECT"
-            elif pos["side"] == "PE" and self.macro_context.get("emergency_eject_pe", False):
-                exit_reason = "BREAKING_NEWS_PE_EJECT"
+            if pos["side"].upper() in self.macro_context.get("eject_sides", []):
+                exit_reason = f"AI_SHOCK_EJECT_{pos['side']}"
             elif pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
                 exit_reason = "SCALP_TARGET_HIT"
             elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
@@ -1824,7 +1824,6 @@ class IntradayV3Engine:
             log.error("UPSTOX_ACCESS_TOKEN missing! Exiting.")
             sys.exit(1)
 
-        # Zero-Hardcode Weekend & Exchange Holiday Gatekeeper
         now_ist = datetime.now(IST)
         live_nse_status = check_live_exchange_status("NSE") if now_ist.weekday() < 5 else ""
         if HAS_AUTO_TUNER:
