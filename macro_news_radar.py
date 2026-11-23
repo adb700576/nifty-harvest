@@ -22,7 +22,7 @@ UNIVERSE_CACHE_FILE = "live_journal/dynamic_universe.json"
 SEEN_NEWS_FILE = "live_journal/seen_news.json"
 INSTRUMENTS_MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 
-FRESH_NEWS_MAX_AGE_SEC = 600  # Strict 10-minute freshness gate
+FRESH_NEWS_MAX_AGE_SEC = 600
 
 
 def upstox_headers():
@@ -47,7 +47,6 @@ def send_telegram_alert(text: str):
 
 
 def update_and_get_vix_baseline(today_str: str, current_vix: float) -> float:
-    """Self-learning 20-day rolling India VIX baseline."""
     history = {}
     if os.path.isfile(VIX_HISTORY_FILE):
         try:
@@ -69,10 +68,6 @@ def update_and_get_vix_baseline(today_str: str, current_vix: float) -> float:
 
 
 def discover_live_market_universe(today_str: str) -> dict:
-    """
-    100% Zero-Hardcode Universe Discovery from Upstox Instruments Master:
-    Discovers India VIX, NSE Sectoral Indices, and active F&O equities dynamically.
-    """
     if os.path.isfile(UNIVERSE_CACHE_FILE):
         try:
             with open(UNIVERSE_CACHE_FILE, "r", encoding="utf-8") as f:
@@ -117,10 +112,6 @@ def discover_live_market_universe(today_str: str) -> dict:
         os.makedirs("live_journal", exist_ok=True)
         with open(UNIVERSE_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(universe, f, indent=2)
-        log.info(
-            f"[UNIVERSE DISCOVERED] VIX={bool(universe['vix_key'])} | "
-            f"Sectors={len(universe['sectors'])} | Liquid F&O Stocks={len(universe['fo_equities'])}"
-        )
     except Exception as e:
         log.warning(f"Universe discovery error: {e}")
 
@@ -235,7 +226,9 @@ def fetch_sectors_and_dynamic_leaders(today_str: str) -> dict:
     total_secs = max(len(result["sector_perf"]), 1)
     majority_secs = max(2, int(round(total_secs * 0.70)))
 
-    if bnf_impact <= -0.65 and weighted_market_impact >= 0.15:
+    if bnf_impact >= 0.65 and all(v > 0 for v in bank_vals) and len(bank_vals) >= 1:
+        result["sector_verdict"] = "BANKING_LED_RALLY"
+    elif bnf_impact <= -0.65 and weighted_market_impact >= 0.15:
         result["sector_verdict"] = "SPLIT_BANK_WEAK_NIFTY_STRONG"
     elif bnf_impact <= -0.65 and weighted_market_impact < 0:
         result["sector_verdict"] = "HEAVYWEIGHT_DRAG_BEARISH"
@@ -270,12 +263,6 @@ def save_seen_news(seen: dict):
 
 
 def fetch_fresh_upstox_news(leader_keys: list) -> list:
-    """
-    Fetches breaking news from Upstox GET /v2/news for:
-    1) Top 25 turnover-weighted F&O leaders (category=instrument_keys, max 30)
-    2) Currently open broker positions (category=positions)
-    Strictly filters to articles published within the last 10 minutes and deduplicates via SHA-256 hash.
-    """
     if not UPSTOX_ACCESS_TOKEN:
         return []
 
@@ -338,27 +325,38 @@ def fetch_fresh_upstox_news(leader_keys: list) -> list:
     return fresh_articles
 
 
-def classify_fresh_news_with_gemini(articles: list, tape_summary: str) -> dict:
+def generate_autonomous_desk_brief(sec_data: dict, fii_dii: dict, articles: list, live_pcrs: dict) -> dict:
     """
-    Zero-Script, Zero-Keyword AI Event Classifier:
-    Evaluates fresh (<10 min) Upstox headlines alongside live market tape.
+    Zero-Script Institutional Desk AI Brain:
+    Reads live sector breadth, VIX velocity, Option Chain PCRs, FII/DII flows, and breaking news
+    to produce an autonomous, unemotional execution stance & trader brief.
     """
-    if not GEMINI_API_KEY or not articles:
+    if not GEMINI_API_KEY:
         return {}
 
-    headlines_blob = "\n".join(
-        f"- [{a['age_sec']}s ago | {a['instrument_key']}] {a['heading']} ({a['summary'][:140]})"
-        for a in articles[:8]
+    headlines_blob = (
+        "\n".join(f"- [{a['age_sec']}s ago] {a['heading']}" for a in articles[:6])
+        if articles
+        else "None in last 10 mins"
     )
+
     prompt = (
-        "You are an institutional Indian index derivatives (Nifty/BankNifty) risk manager.\n"
-        f"Current Live Market Tape: {tape_summary}\n"
-        f"Fresh Breaking News (published <10 minutes ago):\n{headlines_blob}\n\n"
-        "Determine if ANY headline represents an immediate, high-impact market shock "
-        "(such as military conflict/ceasefire, central bank emergency policy, regulatory penalty/fraud on major bank, or sovereign macro shock).\n"
-        "Respond ONLY with valid JSON (no markdown):\n"
-        '{"is_shock": true/false, "direction": "BEARISH"|"BULLISH"|"NEUTRAL", "confidence": 0.0-1.0, '
-        '"telegram_brief": "One concise, natural 2-sentence trader alert explaining the breaking news and immediate action taken."}'
+        "You are an unemotional, cold-blooded institutional Indian index options desk trader (Nifty, BankNifty, FinNifty, Sensex).\n"
+        "Analyze the live quantitative telemetry below and decide the exact intraday focus:\n"
+        f"- India VIX: {sec_data['vix']} ({sec_data['vix_chg_pct']:+.2f}%)\n"
+        f"- Sector Breadth: {sec_data['green_sectors']} Green / {sec_data['red_sectors']} Red | Verdict: {sec_data['sector_verdict']}\n"
+        f"- Banking/Financials Impact: {sec_data['bnf_heavy_impact']:+.2f}% | Overall Heavyweights: {sec_data['nifty_heavy_impact']:+.2f}%\n"
+        f"- Top Pullers: {', '.join(sec_data['top_pullers']) or 'None'} | Top Draggers: {', '.join(sec_data['top_draggers']) or 'None'}\n"
+        f"- Live Option Chain PCRs: {json.dumps(live_pcrs)}\n"
+        f"- FII/DII Cash Flow: FII ₹{fii_dii['fii_net_cr']} Cr | DII ₹{fii_dii['dii_net_cr']} Cr\n"
+        f"- Fresh Breaking News (<10m): {headlines_blob}\n\n"
+        "Rules for your autonomous decision:\n"
+        "1. If PCR < 0.65 and heavyweights/sectors are weak, bias is strictly PE_ONLY.\n"
+        "2. If banking sectors are strongly positive while broader market is flat, focus is BANKNIFTY_CE.\n"
+        "3. If sectors are split/tug-of-war, bias is SCALP_ONLY.\n"
+        "4. Write 'desk_note' as a crisp, natural 2-sentence institutional desk note explaining WHY based on numbers and WHICH index/side (CE or PE) the bot is focusing on—zero hype, zero emotion.\n"
+        "Respond ONLY with valid JSON:\n"
+        '{"is_shock": true/false, "shock_dir": "BEARISH"|"BULLISH"|"NONE", "bias": "CE_ONLY"|"PE_ONLY"|"BANKNIFTY_CE"|"SCALP_ONLY"|"TWO_WAY", "desk_note": "..."}'
     )
 
     try:
@@ -379,7 +377,7 @@ def classify_fresh_news_with_gemini(articles: list, tape_summary: str) -> dict:
         parsed = json.loads(clean_json)
         return parsed if isinstance(parsed, dict) else {}
     except Exception as e:
-        log.warning(f"Gemini AI classification warning: {e}")
+        log.warning(f"Gemini autonomous desk brief warning: {e}")
         return {}
 
 
@@ -421,15 +419,19 @@ def fetch_fii_dii_activity() -> dict:
     return result
 
 
-def evaluate_macro_context(notify_user: bool = False) -> dict:
-    """
-    100% Zero-Hardcode Hybrid Radar:
-    1) Pure Live Tape (VIX velocity + 9-sector breadth + top turnover leaders)
-    2) Upstox Official GET /v2/news (<10m fresh articles) + Gemini Flash AI Brain
-    """
+def evaluate_macro_context(notify_user: bool = False, live_pcrs: dict = None) -> dict:
     os.makedirs("live_journal", exist_ok=True)
     now_ist = datetime.now(IST)
     today_str = now_ist.strftime("%Y-%m-%d")
+    live_pcrs = live_pcrs or {}
+
+    prev_context = {}
+    if os.path.isfile(MACRO_FILE):
+        try:
+            with open(MACRO_FILE, "r", encoding="utf-8") as f:
+                prev_context = json.load(f)
+        except Exception:
+            pass
 
     sec_data = fetch_sectors_and_dynamic_leaders(today_str)
     vix, vix_chg = sec_data["vix"], sec_data["vix_chg_pct"]
@@ -447,7 +449,12 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
     event_caution = vix_cooling_decay or (sec_data["sector_verdict"] == "SECTOR_TUG_OF_WAR_CHOP")
     threat_level = "NORMAL"
 
-    # Layer 1: Live Tape & VIX Velocity Evaluation
+    # Quantitative PCR Extreme Rule (Zero Emotion)
+    nifty_pcr = float(live_pcrs.get("NIFTY", 1.0) or 1.0)
+    if 0 < nifty_pcr < 0.60 and sec_data["nifty_heavy_impact"] <= 0:
+        veto_ce = True
+        threat_level = "EXTREME_CALL_WRITING_PE_FOCUS"
+
     if vix_above_baseline_pct >= 30.0 or vix_chg >= 7.0 or (vix_chg >= 4.5 and sec_data["sector_verdict"] == "BROAD_SECTOR_SELLOFF_BEAR"):
         threat_level = "CRASH_ALERT"
         veto_ce = True
@@ -457,11 +464,14 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
         threat_level = "BULLISH_TAILWIND"
         veto_pe = True
         emergency_eject_pe = True
-        summary_reason = f"BROAD RALLY ({sec_data['green_sectors']}/{len(sec_data['sector_perf'])} Green, VIX {vix_chg:+.1f}%) -> EJECT PE & HIGHWAY CE"
+        summary_reason = f"BROAD RALLY ({sec_data['green_sectors']}/{len(sec_data['sector_perf'])} Green) -> EJECT PE & HIGHWAY CE"
+    elif sec_data["sector_verdict"] == "BANKING_LED_RALLY":
+        threat_level = "BANKNIFTY_LEADER"
+        summary_reason = f"Banks Leading ({sec_data['bnf_heavy_impact']:+.2f}%) -> Focus BankNifty/FinNifty CE"
     elif sec_data["sector_verdict"] == "HEAVYWEIGHT_DRAG_BEARISH" or fii_dii["flow_regime"] == "BOTH_SELLING_BEAR_ALERT":
         threat_level = "BEARISH_CAUTION"
         veto_ce = True
-        summary_reason = f"Leaders Dragging ({', '.join(sec_data['top_draggers'][:2])}) -> CE Blocked"
+        summary_reason = f"Leaders Dragging ({', '.join(sec_data['top_draggers'][:2])}) -> CE Blocked, Focus PE"
     elif sec_data["sector_verdict"] == "SPLIT_BANK_WEAK_NIFTY_STRONG":
         threat_level = "SPLIT_DIVERGENCE"
         summary_reason = f"Bank Sector Weak ({sec_data['bnf_heavy_impact']:+.2f}%) -> BankNifty PE / Nifty CE"
@@ -474,29 +484,41 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
             f"LeaderImp {sec_data['nifty_heavy_impact']:+.2f}% | BankImp {sec_data['bnf_heavy_impact']:+.2f}%"
         )
 
-    # Layer 2: Fresh (<10m) Upstox /v2/news + Gemini AI Interpreter
     fresh_news = fetch_fresh_upstox_news(sec_data.get("top_leader_keys", []))
-    ai_brief = ""
-    if fresh_news:
-        ai_eval = classify_fresh_news_with_gemini(fresh_news, summary_reason)
-        if ai_eval.get("is_shock") and float(ai_eval.get("confidence", 0.0)) >= 0.80:
-            ai_dir = str(ai_eval.get("direction", "NEUTRAL")).upper()
-            ai_brief = str(ai_eval.get("telegram_brief", "")).strip()
-            if ai_dir == "BEARISH":
-                threat_level = "CRASH_ALERT"
-                veto_ce = True
-                emergency_eject_ce = True
-                summary_reason = f"AI BREAKING BEAR SHOCK: {fresh_news[0]['heading'][:80]}"
-            elif ai_dir == "BULLISH":
-                threat_level = "BULLISH_TAILWIND"
-                veto_pe = True
-                emergency_eject_pe = True
-                summary_reason = f"AI BREAKING BULL SHOCK: {fresh_news[0]['heading'][:80]}"
+    prev_verdict = prev_context.get("sector_verdict", "")
+    prev_threat = prev_context.get("threat_level", "")
+    regime_shifted = (sec_data["sector_verdict"] != prev_verdict) or (threat_level != prev_threat)
 
-            if ai_brief:
+    ai_brief = prev_context.get("ai_brief", "")
+    ai_bias = prev_context.get("ai_bias", "TWO_WAY")
+
+    if fresh_news or regime_shifted or notify_user:
+        ai_eval = generate_autonomous_desk_brief(sec_data, fii_dii, fresh_news, live_pcrs)
+        if ai_eval:
+            ai_brief = str(ai_eval.get("desk_note", "")).strip() or ai_brief
+            ai_bias = str(ai_eval.get("bias", ai_bias)).upper()
+
+            if ai_bias == "PE_ONLY":
+                veto_ce = True
+            elif ai_bias == "CE_ONLY":
+                veto_pe = True
+
+            if ai_eval.get("is_shock"):
+                shock_dir = str(ai_eval.get("shock_dir", "NONE")).upper()
+                if shock_dir == "BEARISH":
+                    threat_level = "CRASH_ALERT"
+                    veto_ce = True
+                    emergency_eject_ce = True
+                elif shock_dir == "BULLISH":
+                    threat_level = "BULLISH_TAILWIND"
+                    veto_pe = True
+                    emergency_eject_pe = True
+
+            if ai_brief and (fresh_news or (regime_shifted and threat_level != "NORMAL")):
                 send_telegram_alert(
-                    f"⚡ <b>LIVE AI MACRO RADAR • {now_ist.strftime('%H:%M')} IST</b>\n"
+                    f"🧠 <b>AI DESK DECISION • {now_ist.strftime('%H:%M')} IST</b>\n"
                     f"────────────────────────────\n"
+                    f"🎯 <b>Stance:</b> <code>{ai_bias}</code>  |  <b>VIX:</b> <code>{vix} ({vix_chg:+.1f}%)</code>\n"
                     f"<i>{ai_brief}</i>"
                 )
 
@@ -513,6 +535,7 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
         "top_pullers": sec_data["top_pullers"],
         "top_draggers": sec_data["top_draggers"],
         "threat_level": threat_level,
+        "ai_bias": ai_bias,
         "veto_ce": veto_ce,
         "veto_pe": veto_pe,
         "veto_bnf_ce": veto_bnf_ce,
@@ -526,7 +549,7 @@ def evaluate_macro_context(notify_user: bool = False) -> dict:
     with open(MACRO_FILE, "w", encoding="utf-8") as f:
         json.dump(context, f, indent=2)
 
-    log.info(f"[RADAR] {threat_level} | {sec_data['sector_verdict']} | {summary_reason}")
+    log.info(f"[RADAR] {threat_level} | Bias={ai_bias} | {summary_reason}")
     return context
 
 
