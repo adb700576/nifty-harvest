@@ -30,12 +30,13 @@ try:
     HAS_AUTO_TUNER = True
 except ImportError:
     HAS_AUTO_TUNER = False
+
 try:
     from ai_trading_agent import TickByTickAITradingAgent
     HAS_AI_AGENT = True
 except ImportError:
     HAS_AI_AGENT = False
-    
+
 # ==============================================================================
 # 1. CONFIGURATION, SELF-TUNED PARAMS & GOOGLE SHEETS SYNC + AUTO-RESTORE
 # ==============================================================================
@@ -786,7 +787,7 @@ class IntradayV3Engine:
         self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
         self.ai_agent = TickByTickAITradingAgent(self) if HAS_AI_AGENT else None
-        
+
         init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
         init_mcx_cap = float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000")
         self.tuned_params = {
@@ -1113,11 +1114,11 @@ class IntradayV3Engine:
                             or feed_obj.get("fullFeed", {}).get("marketFF", {}).get("ltpc")
                             or feed_obj.get("firstLevelWithGreeks", {}).get("ltpc")
                         )
-                if ltpc and "ltp" in ltpc and float(ltpc["ltp"]) > 0:
+                        if ltpc and "ltp" in ltpc and float(ltpc["ltp"]) > 0:
                             if self.ai_agent:
                                 self.ai_agent.on_market_tick(inst_key, float(ltpc["ltp"]))
                             else:
-                                self.on_tick_price(inst_key, float(ltpc["ltp"]))       
+                                self.on_tick_price(inst_key, float(ltpc["ltp"]))
                 except Exception:
                     pass
 
