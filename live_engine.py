@@ -1113,11 +1113,11 @@ class IntradayV3Engine:
                             or feed_obj.get("fullFeed", {}).get("marketFF", {}).get("ltpc")
                             or feed_obj.get("firstLevelWithGreeks", {}).get("ltpc")
                         )
-                        if ltpc and "ltp" in ltpc and float(ltpc["ltp"]) > 0:
+                if ltpc and "ltp" in ltpc and float(ltpc["ltp"]) > 0:
                             if self.ai_agent:
-                            self.ai_agent.on_market_tick(inst_key, float(ltpc["ltp"]))
-                        else:
-                            self.on_tick_price(inst_key, float(ltpc["ltp"]))
+                                self.ai_agent.on_market_tick(inst_key, float(ltpc["ltp"]))
+                            else:
+                                self.on_tick_price(inst_key, float(ltpc["ltp"]))       
                 except Exception:
                     pass
 
