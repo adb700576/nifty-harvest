@@ -2,8 +2,8 @@ name: Daily Harvest Vault
 
 on:
   schedule:
-    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Zero-Gap overlap till 02:46 PM IST)
-    - cron: '16 9 * * 1-5'   # Session 2: 02:46 PM IST (Zero-Gap overlap till 08:38 PM IST)
+    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Exits cleanly at 02:40 PM IST)
+    - cron: '16 9 * * 1-5'   # Session 2: 02:46 PM IST (Exits cleanly at 08:31 PM IST)
     - cron: '08 15 * * 1-5'  # Session 3: 08:38 PM IST (Runs till 11:20 PM IST + Nightly Forensics)
   workflow_dispatch:
 
@@ -58,6 +58,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
           MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
+          PAPER_MODE: ${{ secrets.PAPER_MODE || 'true' }}
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -67,7 +68,7 @@ jobs:
           fi
           python -u live_engine.py
 
-      - name: Run Nightly Deep Forensics, Brain Calibration & Journal Report
+      - name: Run Nightly Vault Harvester, Brain Calibration & Journal Report
         if: always()
         continue-on-error: true
         env:
@@ -77,6 +78,7 @@ jobs:
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
           CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
           MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
+          VAULT_DB_PATH: live_journal/nifty_vault.db
         run: |
           if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
             FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
@@ -84,8 +86,11 @@ jobs:
               export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
             fi
           fi
+          if [ -f harvester.py ]; then
+            python -u harvester.py
+          fi
           if [ -f auto_tuner.py ]; then
-            python -u -c "import json, os, auto_tuner; vix_chg = float(json.load(open('live_journal/macro_context.json')).get('vix_chg_pct', 0.0)) if os.path.isfile('live_journal/macro_context.json') else 0.0; auto_tuner.run_nightly_calibration(vix_change_pct=vix_chg)"
+            python -u -c "import json, os, auto_tuner; vix_chg = float(json.load(open('live_journal/macro_context.json')).get('vix_chg_pct', 0.0)) if os.path.isfile('live_journal/macro_context.json') else 0.0; exp_str = str(json.load(open('live_journal/strategy_params.json')).get('nearest_option_expiry', '')) if os.path.isfile('live_journal/strategy_params.json') else ''; auto_tuner.run_nightly_calibration(nearest_option_expiry_str=exp_str, vix_change_pct=vix_chg)"
           fi
           if [ -f generate_journal_analytics.py ]; then
             python -u generate_journal_analytics.py
@@ -98,7 +103,7 @@ jobs:
           name: live-trades-journal
           path: live_journal/
 
-      - name: Commit & Push Journal, Macro Context & Self-Tuned Params
+      - name: Commit & Push Journal, Vault, Macro Context & Self-Tuned Params
         if: always()
         run: |
           git config --global user.name "github-actions[bot]"
@@ -106,9 +111,9 @@ jobs:
           if [ -d "live_journal" ] && [ -n "$(ls -A live_journal/ 2>/dev/null)" ]; then
             git add live_journal/*
             if ! git diff --quiet || ! git diff --staged --quiet; then
-              git commit -m "chore(ai-coach): update trade journal, macro radar, memory & driver gear [skip ci]"
+              git commit -m "chore(ai-coach): update trade journal, vault, macro radar & driver gear [skip ci]"
               git pull --rebase origin main || git pull --rebase origin master
               git push
-              echo "✅ Journal, Macro Context, Memory & Driver Gear committed."
+              echo "✅ Journal, Vault, Macro Context & Driver Gear committed."
             fi
           fi
