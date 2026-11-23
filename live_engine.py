@@ -290,10 +290,7 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return message_id
 
-    if not message_id:
-        message_id = load_saved_dashboard_id()
-
-    if message_id:
+   if message_id:
         edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
         try:
@@ -301,11 +298,9 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
             desc = str(resp.get("description", "")).lower()
             if resp.get("ok") or "message is not modified" in desc:
                 return message_id
-            if "message to edit not found" not in desc and "message_id_invalid" not in desc:
-                return message_id
         except Exception:
-            return message_id
-
+            pass
+            
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_notification": True}
     try:
