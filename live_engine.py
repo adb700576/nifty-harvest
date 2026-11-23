@@ -1015,7 +1015,7 @@ class IntradayV3Engine:
                 except Exception:
                     pass
 
-            def on_close():
+            def on_close(*args):
                 self.ws_connected = False
 
             self.streamer.on("open", on_open)
