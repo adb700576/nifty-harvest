@@ -126,8 +126,9 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
+    """Covers Session 1->2 (14:35-15:05 IST) and Session 2->3 (20:30-21:05 IST) cron handovers cleanly."""
     hhmm = now_ist.strftime("%H:%M")
-    return ("14:35" <= hhmm <= "14:58") or ("20:30" <= hhmm <= "20:55")
+    return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "21:05")
 
 
 def push_trade_to_google_sheet(trade_row: dict):
@@ -1109,9 +1110,11 @@ class IntradayV3Engine:
                 try:
                     data = json.loads(message) if isinstance(message, str) else message
                     for inst_key, feed_obj in data.get("feeds", {}).items():
+                        full_feed = feed_obj.get("fullFeed", {})
                         ltpc = (
                             feed_obj.get("ltpc")
-                            or feed_obj.get("fullFeed", {}).get("marketFF", {}).get("ltpc")
+                            or full_feed.get("marketFF", {}).get("ltpc")
+                            or full_feed.get("indexFF", {}).get("ltpc")
                             or feed_obj.get("firstLevelWithGreeks", {}).get("ltpc")
                         )
                         if ltpc and "ltp" in ltpc and float(ltpc["ltp"]) > 0:
@@ -2049,55 +2052,3 @@ class IntradayV3Engine:
 
         while True:
             now_ist = datetime.now(IST)
-            hhmm = now_ist.strftime("%H:%M")
-
-            if self.stop_requested:
-                stop_type = "SESSION HANDOVER" if is_scheduled_handover_window(now_ist) else "MANUAL STOP"
-                self.shutdown_cleanly(now_ist, stop_type)
-                break
-
-            if (time.time() - session_start_ts) >= SESSION_MAX_RUNTIME_SEC:
-                self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
-                break
-
-            self.refresh_live_macro_news(force=False)
-            if self.ai_agent:
-                self.ai_agent.think_and_adapt_live_strategy()
-            self.manage_open_positions(now_ist)
-
-            if hhmm >= "23:20":
-                self.shutdown_cleanly(now_ist, "EOD CLOSED")
-                break
-
-            cap = self.get_active_capital()
-            max_profit = cap * DAILY_PROFIT_LOCK_PCT
-            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
-            risk_locked = (self.day_pnl >= max_profit or self.day_pnl <= max_loss or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES)
-
-            if risk_locked:
-                self.bot_status_text = "BOT PAUSED"
-            else:
-                self.bot_status_text = "BOT LIVE"
-                for idx, cfg in INDICES.items():
-                    if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
-                        if idx not in self.last_summaries:
-                            spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
-                            if not spot_df.empty:
-                                self.last_summaries[idx] = {
-                                    "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
-                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0, "short_status": "CLOSED",
-                                }
-                        continue
-                    res = self.evaluate_instrument(idx, cfg, now_ist)
-                    if res:
-                        self.last_summaries[idx] = res
-
-            if not self.dashboard_msg_id and self.last_summaries:
-                self.render_live_dashboard(hhmm)
-
-            time.sleep(10)
-
-
-if __name__ == "__main__":
-    engine = IntradayV3Engine()
-    engine.run()
