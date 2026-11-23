@@ -51,6 +51,7 @@ GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 MIN_FUEL_SCORE = 45.0
+MCX_MORNING_FUEL_SCORE = 55.0
 MCX_EVENING_FUEL_SCORE = 50.0
 MIN_ADX_TREND = 19.0
 MAX_CHOP_INDEX = 60.0
@@ -93,16 +94,16 @@ DAILY_LOSS_LOCK_PCT = -0.15
 MAX_CONSECUTIVE_LOSSES = 3
 
 INDICES = {
-    "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50"},
-    "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank"},
-    "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service"},
-    "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT"},
-    "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX"},
-    "CRUDEOIL":   {"type": "MCX_FUT"},
-    "NATURALGAS": {"type": "MCX_FUT"},
-    "GOLD":       {"type": "MCX_FUT"},
-    "SILVER":     {"type": "MCX_FUT"},
-    "COPPER":     {"type": "MCX_FUT"},
+    "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "tf_min": 5},
+    "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank", "tf_min": 5},
+    "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service", "tf_min": 5},
+    "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT", "tf_min": 5},
+    "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX", "tf_min": 5},
+    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 15},
+    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 15},
+    "GOLD":       {"type": "MCX_FUT", "tf_min": 15},
+    "SILVER":     {"type": "MCX_FUT", "tf_min": 15},
+    "COPPER":     {"type": "MCX_FUT", "tf_min": 15},
 }
 
 
@@ -194,11 +195,9 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
             desc = str(resp.get("description", "")).lower()
             if resp.get("ok") or "message is not modified" in desc:
                 return message_id
-            # Only create a new message if the old message was genuinely deleted
             if "message to edit not found" not in desc and "message_id_invalid" not in desc:
                 return message_id
         except Exception:
-            # On temporary network glitch, keep existing message_id instead of spamming new pin
             return message_id
 
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -398,11 +397,11 @@ def get_dynamic_option_specs(spot_key: str) -> dict:
         return {"expiries": [], "lot_size": 1, "freeze_quantity": 1800, "tick_size": 0.05, "step": 50}
 
 
-def fetch_intraday_5m(instrument_key: str) -> pd.DataFrame:
+def fetch_intraday_candles(instrument_key: str, interval_min: int = 5) -> pd.DataFrame:
     if not instrument_key:
         return pd.DataFrame()
     encoded_key = requests.utils.quote(instrument_key, safe="")
-    url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/5"
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/{int(interval_min)}"
     try:
         candles = requests.get(url, headers=upstox_headers(), timeout=10).json().get("data", {}).get("candles", [])
         if not candles:
@@ -462,7 +461,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. BACKGROUND REGIME INTELLIGENCE, GANN LEVELS & GRADUAL FUEL SCORE
+# 4. REGIME INTELLIGENCE, GANN LEVELS & GRADUAL FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 6:
@@ -627,7 +626,6 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
 
         fuel_scores.append(round(min(100.0, max(0.0, 10.0 + vol_pts + atr_pts + eff_pts)), 1))
 
-    # 3-bar EMA smoothing so Fuel increases/decreases gradually without erratic single-tick jumps
     spot_df["fuel"] = pd.Series(fuel_scores).ewm(span=3, adjust=False).mean().round(1)
     return spot_df
 
@@ -660,7 +658,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (100% ZERO-HARDCODE DRIVER)
+# 6. SELF-MATURING V3 ENGINE (DUAL-TF + ADAPTIVE HYBRID + SMART EXIT)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -704,13 +702,14 @@ class IntradayV3Engine:
             "expiry_slope_end": "14:45",
             "expiry_strike_offset": 1,
             "strike_offset": 0,
+            "mcx_morning_fuel_score": MCX_MORNING_FUEL_SCORE,
             "mcx_evening_fuel_score": MCX_EVENING_FUEL_SCORE,
             "min_adx_trend": MIN_ADX_TREND,
             "max_chop_index": MAX_CHOP_INDEX,
             "swing_lookback_candles": 75,
             "atr_sl_buffer_mult": PIVOT_BUFFER_ATR_MULT,
             "trail_cushion_mult": 1.0,
-            "scalp_target_r": 1.35,
+            "scalp_target_r": 1.80,
             "no_momentum_minutes": 15,
             "morning_wait_until": "09:15",
             "news_ignition_atr_mult": 2.2,
@@ -751,16 +750,14 @@ class IntradayV3Engine:
                 with open(PARAMS_FILE, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
                 self.tuned_params.update(loaded)
-                # Ensure immediate 09:15 monitoring and 45.0 accessible fuel floor
                 self.tuned_params["morning_wait_until"] = "09:15"
                 if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
                     self.tuned_params["min_fuel_score"] = 45.0
                 log.info(
                     f"[BRAIN LOADED] {self.tuned_params.get('brain_version')} | "
                     f"Gear={self.tuned_params.get('driver_gear')} | "
-                    f"FlatFuel={self.tuned_params.get('min_fuel_score')} | "
-                    f"SlopeFuel={self.tuned_params.get('expiry_slope_fuel_score')} | "
-                    f"WaitUntil={self.tuned_params.get('morning_wait_until')}"
+                    f"IdxFuel(5m)={self.tuned_params.get('min_fuel_score')} | "
+                    f"McxFuel(15m)={self.tuned_params.get('mcx_morning_fuel_score')}"
                 )
             except Exception as e:
                 log.warning(f"Failed to load strategy_params.json: {e}")
@@ -808,7 +805,7 @@ class IntradayV3Engine:
             return False, f"AI_PAIR_VETO_{idx}_{side}"
 
         sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
-        if sym_ov.get("cooldown") and fuel < 60.0:
+        if sym_ov.get("cooldown") and fuel < 62.0:
             return False, "COOLDOWN_LOW_FUEL"
 
         similar = [
@@ -823,17 +820,15 @@ class IntradayV3Engine:
                 return False, "MEMORY_VETO_TRAP"
 
         if pair_key in self.macro_context.get("priority_pairs", []):
-            return True, "AI_PRIORITY_HIGHWAY"
-        if regime_info["is_sideways"] or self.macro_context.get("force_scalp", False):
-            return True, "CITY_SCALP"
-        return True, "HIGHWAY_RUNNER"
+            return True, "AI_PRIORITY_HYBRID"
+        return True, "ADAPTIVE_HYBRID"
 
     def compute_true_fractal_swing_sl(self, df: pd.DataFrame, side: str, spot_price: float, atr14: float) -> tuple:
         lookback = df.iloc[-10:] if len(df) >= 10 else df
         sl_mult = float(self.tuned_params.get("atr_sl_buffer_mult", PIVOT_BUFFER_ATR_MULT))
         buffer = sl_mult * atr14
-        min_spot_risk = 0.35 * atr14
-        max_spot_risk = 1.35 * atr14
+        min_spot_risk = 0.45 * atr14
+        max_spot_risk = 1.45 * atr14
 
         if side == "CE":
             lows = lookback["low"].values
@@ -888,8 +883,9 @@ class IntradayV3Engine:
                     tick_sz = float(pos.get("tick_size", 0.05))
                     r_unit = max(float(pos.get("r_unit", 1.0)), 1e-6)
                     entry_time_str = pos.get("entry_time", "09:15:00")
+                    tf_m = INDICES.get(idx, {}).get("tf_min", 5)
 
-                    inst_df = fetch_intraday_5m(inst_key)
+                    inst_df = fetch_intraday_candles(inst_key, tf_m)
                     if not inst_df.empty:
                         inst_df["hhmmss"] = inst_df["timestamp"].dt.strftime("%H:%M:%S")
                         since_entry = inst_df[inst_df["hhmmss"] >= entry_time_str]
@@ -993,7 +989,7 @@ class IntradayV3Engine:
             self.streamer = upstox_client.MarketDataStreamerV3(api_client)
             self.streamer.auto_reconnect(True, 5, 20)
 
-            def on_open():
+            def on_open(*args):
                 self.ws_connected = True
                 with self.pos_lock:
                     active_keys = [p["instrument_key"] for p in self.active_positions.values()]
@@ -1070,7 +1066,6 @@ class IntradayV3Engine:
                         pos["last_peak_ts"] = time.time()
 
                     r_unit = max(pos.get("r_unit", 1.0), 1e-6)
-                    curr_r = curr_gain / r_unit
                     peak_r = pos.get("peak_gain", 0.0) / r_unit
                     tick_sz = pos.get("tick_size", 0.05)
 
@@ -1078,13 +1073,6 @@ class IntradayV3Engine:
                         exit_reason = f"AI_SHOCK_EJECT_{pos['side']}"
                         target_idx = idx
                         break
-
-                    if pos.get("trade_mode") == "SCALP":
-                        scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
-                        if curr_r >= scalp_r:
-                            exit_reason = "SCALP_TARGET_HIT"
-                            target_idx = idx
-                            break
 
                     lock_80 = max(0.68, min(0.82, 0.80 / max(cushion, 0.85)))
                     lock_70 = max(0.58, min(0.72, 0.70 / max(cushion, 0.85)))
@@ -1170,7 +1158,7 @@ class IntradayV3Engine:
 
     def analyze_oi_and_pcr(self, idx: str, chain: list):
         if not chain:
-            return 1.0, 1.0, 0.0, False, False
+            return 1.0, 1.0, 0.0, False, False, 0.0, 0.0
         total_pe_oi = sum(float(r.get("put_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         total_ce_oi = sum(float(r.get("call_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
         pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
@@ -1194,6 +1182,7 @@ class IntradayV3Engine:
 
         prev_oi = self.oi_history[idx]
         oi_bull_ok, oi_bear_ok = True, True
+        d_pe, d_ce = 0.0, 0.0
         if prev_oi is not None:
             d_pe = total_pe_oi - prev_oi["pe_oi"]
             d_ce = total_ce_oi - prev_oi["ce_oi"]
@@ -1201,7 +1190,7 @@ class IntradayV3Engine:
             oi_bear_ok = (d_ce >= d_pe) or (d_pe < 0)
 
         self.oi_history[idx] = {"pe_oi": total_pe_oi, "ce_oi": total_ce_oi}
-        return pcr, open_p, cum_pcr_diff, ((cum_bullish or short_rising) and oi_bull_ok), ((cum_bearish or short_falling) and oi_bear_ok)
+        return pcr, open_p, cum_pcr_diff, ((cum_bullish or short_rising) and oi_bull_ok), ((cum_bearish or short_falling) and oi_bear_ok), d_pe, d_ce
 
     def compute_live_mtm(self) -> float:
         with self.pos_lock:
@@ -1303,18 +1292,20 @@ class IntradayV3Engine:
                 for p_idx, pos in active_snap:
                     ltp = pos.get("last_ltp", pos["entry_price"])
                     is_short = pos["tx_side"] == "SELL"
-                    pnl = round((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"], 2)
-                    sl_pnl = round((pos["entry_price"] - pos["sl"]) * pos["qty"] if is_short else (pos["sl"] - pos["entry_price"]) * pos["qty"], 2)
-                    t_mode = pos.get("trade_mode", "HIGHWAY")
-                    tgt_txt = pos.get("target_label", "SCALP" if t_mode == "SCALP" else "UNCAPPED ∞")
+                    est_charges = float(pos.get("est_charges", 180.0 if pos["type"] == "MCX_FUT" else 65.0))
+                    pnl = round(((pos["entry_price"] - ltp) * pos["qty"] if is_short else (ltp - pos["entry_price"]) * pos["qty"]) - est_charges, 2)
+                    sl_gross = (pos["entry_price"] - pos["sl"]) * pos["qty"] if is_short else (pos["sl"] - pos["entry_price"]) * pos["qty"]
+                    sl_net_pnl = round(sl_gross - est_charges, 0)
+                    t_mode = pos.get("trade_mode", "HYBRID")
+                    tgt_txt = pos.get("target_label", "SMART HYBRID ∞")
                     trail_tag = f"🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{t_mode}</code>"
                     p_icon = "🟢" if pnl >= 0 else "🔴"
-                    sl_label = f"Locked <b>₹{sl_pnl:+,.0f}</b>" if sl_pnl >= 0 else f"Max Risk <b>₹{abs(sl_pnl):,.0f}</b>"
+                    sl_label = f"Locked <b>₹{sl_net_pnl:+,.0f}</b>" if sl_net_pnl >= 0 else f"Max Risk <b>₹{abs(sl_net_pnl):,.0f}</b>"
                     lines.extend([
                         f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code>  |  {trail_tag}",
                         f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
                         f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
-                        f"  Live P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                        f"  Live Net P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
 
             lines.append("\n📒 <b>TODAY'S CLOSED TRADES</b>")
@@ -1330,13 +1321,13 @@ class IntradayV3Engine:
 
             if self.last_summaries:
                 ai_stance = self.macro_context.get("stance_label", "ADAPTIVE_TWO_WAY")
-                lines.append(f"\n📡 <b>INDICES LIVE</b>  |  🧠 <code>{ai_stance}</code>")
+                lines.append(f"\n📡 <b>INDICES LIVE (5m)</b>  |  🧠 <code>{ai_stance}</code>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
                         lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX LIVE</b>")
+                lines.append("\n🛢️ <b>MCX LIVE (15m)</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
@@ -1420,10 +1411,14 @@ class IntradayV3Engine:
         record_trade_journal(journal_entry)
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
-    def evaluate_active_candle_exits(self, idx: str, df: pd.DataFrame, spot_close: float, price_change: float, fuel: float, atr14: float, now_ist: datetime):
+    def evaluate_active_candle_exits(
+        self, idx: str, df: pd.DataFrame, spot_close: float, price_change: float,
+        fuel: float, atr14: float, now_ist: datetime, gann_sup: float, gann_res: float,
+        d_pe: float, d_ce: float
+    ):
         with self.pos_lock:
             pos = self.active_positions.get(idx)
-        if not pos or len(df) < 4:
+        if not pos or len(df) < 3:
             return
 
         is_short = pos["tx_side"] == "SELL"
@@ -1444,36 +1439,76 @@ class IntradayV3Engine:
         peak_r = peak_gain / r_unit
         curr_r = curr_gain / r_unit
 
-        recent_3 = df.iloc[-4:-1]
-        swing_low = float(recent_3["low"].min())
-        swing_high = float(recent_3["high"].max())
+        # 1. SMART INSTITUTIONAL PROFIT-BOOKING RADAR (At >= 1.8R Profit)
+        scalp_gate_r = float(self.tuned_params.get("scalp_target_r", 1.80))
+        if curr_r >= scalp_gate_r:
+            c_curr = df.iloc[-1]
+            c_range = max(float(c_curr["high"]) - float(c_curr["low"]), 1e-6)
+            upper_wick = float(c_curr["high"]) - max(float(c_curr["open"]), float(c_curr["close"]))
+            lower_wick = min(float(c_curr["open"]), float(c_curr["close"])) - float(c_curr["low"])
 
-        new_sl = pos["sl"]
-        trail_label = None
+            # A. Gann Support / Resistance Touch + Rejection Wick
+            if pos["side"] == "CE" and abs(spot_close - gann_res) <= (atr14 * 0.35) and (upper_wick / c_range) >= 0.45:
+                self.close_position_now(idx, ltp, "GANN_RES_PROFIT_BOOK", now_ist)
+                return
+            if pos["side"] == "PE" and abs(spot_close - gann_sup) <= (atr14 * 0.35) and (lower_wick / c_range) >= 0.45:
+                self.close_position_now(idx, ltp, "GANN_SUP_PROFIT_BOOK", now_ist)
+                return
 
-        if peak_r >= STAGE2_LOCK_R:
-            floor_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
-            buf = float(self.tuned_params.get("atr_sl_buffer_mult", PIVOT_BUFFER_ATR_MULT)) * atr14 * cushion
-            if is_mcx:
-                swing_sl = round_to_tick((swing_high + buf) if is_short else (swing_low - buf), tick_sz)
-                candidate_sl = min(floor_sl, swing_sl) if is_short else max(floor_sl, swing_sl)
-            else:
-                spot_entry = pos.get("spot_entry", spot_close)
-                delta_spot = (swing_low - buf - spot_entry) if pos["side"] == "CE" else (spot_entry - (swing_high + buf))
-                candidate_sl = max(floor_sl, round_to_tick(entry + delta_spot * eff_delta, tick_sz))
+            # B. OI Unwinding & PCR Reversal Detection (Options)
+            if not is_mcx:
+                hist = list(self.pcr_history.get(idx, []))
+                pcr_turned_bull = len(hist) >= 3 and hist[-1] > hist[-2] > hist[-3]
+                pcr_turned_bear = len(hist) >= 3 and hist[-1] < hist[-2] < hist[-3]
 
-            min_gap = max(atr14 * 0.15, tick_sz * 2) if is_mcx else max(tick_sz * 4, 0.5)
-            if (is_short and candidate_sl < new_sl and candidate_sl > ltp + min_gap) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp - min_gap):
-                new_sl = candidate_sl
-                trail_label = "SWING + 1.5R LOCK"
+                # For PE: Put Unwinding (d_pe < 0) + Call Writing building (d_ce > 0) + Spot bouncing
+                if pos["side"] == "PE" and ((d_pe < 0 and d_ce > 0 and price_change > 0) or (pcr_turned_bull and price_change > 0)):
+                    self.close_position_now(idx, ltp, "OI_PCR_REVERSAL_EXIT", now_ist)
+                    return
+                # For CE: Call Unwinding (d_ce < 0) + Put Unwinding (d_pe < 0) + Spot dropping
+                if pos["side"] == "CE" and ((d_ce < 0 and d_pe < 0 and price_change < 0) or (pcr_turned_bear and price_change < 0)):
+                    self.close_position_now(idx, ltp, "OI_PCR_REVERSAL_EXIT", now_ist)
+                    return
 
-        if trail_label and new_sl != pos["sl"]:
-            with self.pos_lock:
-                if idx in self.active_positions:
-                    self.active_positions[idx]["sl"] = new_sl
-                    self.active_positions[idx]["trail_stage"] = trail_label
-            self.save_active_positions_state()
+            # C. Early Momentum Fade at Peak (Fuel drops below 32 with opposing price tick)
+            opposing_tick = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
+            if fuel < 32.0 and opposing_tick:
+                self.close_position_now(idx, ltp, "PEAK_MOMENTUM_LOCK", now_ist)
+                return
 
+        # 2. SWING + 1.5R LOCK TRAILING (If Trend Continues into Highway Mode!)
+        if len(df) >= 4:
+            recent_3 = df.iloc[-4:-1]
+            swing_low = float(recent_3["low"].min())
+            swing_high = float(recent_3["high"].max())
+
+            new_sl = pos["sl"]
+            trail_label = None
+
+            if peak_r >= STAGE2_LOCK_R:
+                floor_sl = round_to_tick((entry - 1.5 * r_unit) if is_short else (entry + 1.5 * r_unit), tick_sz)
+                buf = float(self.tuned_params.get("atr_sl_buffer_mult", PIVOT_BUFFER_ATR_MULT)) * atr14 * cushion
+                if is_mcx:
+                    swing_sl = round_to_tick((swing_high + buf) if is_short else (swing_low - buf), tick_sz)
+                    candidate_sl = min(floor_sl, swing_sl) if is_short else max(floor_sl, swing_sl)
+                else:
+                    spot_entry = pos.get("spot_entry", spot_close)
+                    delta_spot = (swing_low - buf - spot_entry) if pos["side"] == "CE" else (spot_entry - (swing_high + buf))
+                    candidate_sl = max(floor_sl, round_to_tick(entry + delta_spot * eff_delta, tick_sz))
+
+                min_gap = max(atr14 * 0.15, tick_sz * 2) if is_mcx else max(tick_sz * 4, 0.5)
+                if (is_short and candidate_sl < new_sl and candidate_sl > ltp + min_gap) or (not is_short and candidate_sl > new_sl and candidate_sl < ltp - min_gap):
+                    new_sl = candidate_sl
+                    trail_label = "SWING + 1.5R LOCK"
+
+            if trail_label and new_sl != pos["sl"]:
+                with self.pos_lock:
+                    if idx in self.active_positions:
+                        self.active_positions[idx]["sl"] = new_sl
+                        self.active_positions[idx]["trail_stage"] = trail_label
+                self.save_active_positions_state()
+
+        # 3. FUEL EXHAUSTED & NO MOMENTUM TIME STOP
         low_fuel_streak = (pos.get("low_fuel_streak", 0) + 1) if fuel < 20.0 else 0
         pos["low_fuel_streak"] = low_fuel_streak
         opposing_move = (price_change > 0) if (pos["side"] == "PE") else (price_change < 0)
@@ -1499,15 +1534,16 @@ class IntradayV3Engine:
 
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
+        tf_min = int(cfg.get("tf_min", 15 if is_mcx else 5))
         if not cfg.get("spot_key"):
             return None
 
-        spot_df = fetch_intraday_5m(cfg["spot_key"])
+        spot_df = fetch_intraday_candles(cfg["spot_key"], tf_min)
         if spot_df.empty or len(spot_df) < 1:
             return None
 
         fut_key = self.fut_contracts.get(idx, {}).get("instrument_key", "")
-        fut_df = spot_df if is_mcx else fetch_intraday_5m(fut_key)
+        fut_df = spot_df if is_mcx else fetch_intraday_candles(fut_key, tf_min)
         df = compute_fuel_with_fut_volume(spot_df, fut_df)
         self.latest_dfs[idx] = df
 
@@ -1529,6 +1565,7 @@ class IntradayV3Engine:
         sup, res, gann_levels = gann["support"], gann["resistance"], gann["all"]
 
         chain, active_expiry, is_today_exp = [], "", False
+        d_pe, d_ce = 0.0, 0.0
         if is_mcx:
             oi_change = float(curr["oi"]) - float(prev["oi"])
             oi_pcr_bull_ok, oi_pcr_bear_ok = (price_change > 0), (price_change < 0)
@@ -1536,14 +1573,14 @@ class IntradayV3Engine:
         else:
             active_expiry, is_today_exp = self.get_smart_expiry(idx, now_ist)
             chain = fetch_option_chain(cfg["spot_key"], active_expiry)
-            pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok = self.analyze_oi_and_pcr(idx, chain)
+            pcr, open_p, cum_pcr_diff, oi_pcr_bull_ok, oi_pcr_bear_ok, d_pe, d_ce = self.analyze_oi_and_pcr(idx, chain)
 
         with self.pos_lock:
             in_trade = idx in self.active_positions
 
         if in_trade:
             self.pending_setups[idx] = None
-            self.evaluate_active_candle_exits(idx, df, spot_close, price_change, fuel, atr14, now_ist)
+            self.evaluate_active_candle_exits(idx, df, spot_close, price_change, fuel, atr14, now_ist, sup, res, d_pe, d_ce)
 
         with self.pos_lock:
             pos = self.active_positions.get(idx)
@@ -1551,7 +1588,8 @@ class IntradayV3Engine:
         if pos:
             ltp_now = pos.get("last_ltp", spot_close if is_mcx else pos["entry_price"])
             is_short = pos["tx_side"] == "SELL"
-            pos_mtm = (pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]
+            est_ch = float(pos.get("est_charges", 180.0 if is_mcx else 65.0))
+            pos_mtm = ((pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]) - est_ch
             return {
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
@@ -1564,11 +1602,7 @@ class IntradayV3Engine:
         slope_end = str(self.tuned_params.get("expiry_slope_end", "14:45"))
         in_expiry_slope = (not is_mcx) and is_today_exp and (slope_start <= hhmm_now <= slope_end)
 
-        is_sector_chop = bool(self.macro_context.get("force_scalp", False))
-        if in_expiry_slope:
-            trade_mode = "HIGHWAY"
-        else:
-            trade_mode = "SCALP" if (regime_info["is_sideways"] or is_sector_chop) else "HIGHWAY"
+        trade_mode = "HYBRID"
 
         pat_info = detect_6_gann_patterns(df, gann_levels, atr14)
         near_gann, bull_pattern, bear_pattern = pat_info["near_gann"], pat_info["bull_pattern"], pat_info["bear_pattern"]
@@ -1621,12 +1655,14 @@ class IntradayV3Engine:
             sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
             if in_expiry_slope:
                 req_fuel = float(self.tuned_params.get("expiry_slope_fuel_score", 32.0))
+            elif is_mcx:
+                morn_mcx = float(self.tuned_params.get("mcx_morning_fuel_score", MCX_MORNING_FUEL_SCORE))
+                eve_mcx = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
+                req_fuel = eve_mcx if hhmm_now >= "15:30" else morn_mcx
             else:
-                base_req_fuel = float(sym_ov.get("min_fuel", self.tuned_params.get("min_fuel_score", MIN_FUEL_SCORE)))
-                eve_req_fuel = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
-                req_fuel = max(base_req_fuel, eve_req_fuel) if (is_mcx and hhmm_now >= "15:30") else base_req_fuel
+                req_fuel = float(sym_ov.get("min_fuel", self.tuned_params.get("min_fuel_score", MIN_FUEL_SCORE)))
 
-            if (trade_mode == "SCALP" or self.macro_context.get("event_caution", False)) and not in_expiry_slope:
+            if (regime_info["is_sideways"] or self.macro_context.get("event_caution", False)) and not in_expiry_slope:
                 req_fuel += 3.0
 
             dir_confirmed = (
@@ -1660,11 +1696,13 @@ class IntradayV3Engine:
 
         ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
         spot_risk, _ = self.compute_true_fractal_swing_sl(df, setup["side"], ltp, atr14)
-        sl_points = max(round_to_tick(spot_risk, tick_sz), tick_sz * 4)
+        min_mcx_sl = round_to_tick(ltp * 0.0012, tick_sz)
+        sl_points = max(round_to_tick(spot_risk, tick_sz), min_mcx_sl, tick_sz * 4)
 
         mcx_cap = self.get_active_mcx_capital()
         max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.01, 2)))
-        risk_1_lot = sl_points * lot_size
+        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, lot_size, True).get("total", 180.0)
+        risk_1_lot = (sl_points * lot_size) + est_ch
         if risk_1_lot > max_risk_cap:
             self.pending_setups[idx] = None
             return
@@ -1674,6 +1712,7 @@ class IntradayV3Engine:
         risk_lots = max(1, int(max_risk_cap // max(risk_1_lot, 1.0)))
         lots = min(margin_lots, risk_lots)
         qty = min(lots * lot_size, cfg["freeze_qty"])
+        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, True).get("total", 180.0)
 
         sl_price = round_to_tick((ltp - sl_points) if tx_side == "BUY" else (ltp + sl_points), tick_sz)
 
@@ -1685,19 +1724,16 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
-            tgt_px = round_to_tick(fill + (sl_points * scalp_r if tx_side == "BUY" else -sl_points * scalp_r), tick_sz)
-            tgt_label = f"₹{tgt_px:.2f} (SCALP)" if trade_mode == "SCALP" else "UNCAPPED ∞"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
                     "side": setup["side"], "tx_side": tx_side, "display_side": tx_side,
                     "qty": qty, "tick_size": tick_sz, "delta": 1.0, "entry_price": fill,
                     "spot_entry": fut_price, "spot_sl": sl_price, "r_unit": sl_points,
-                    "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
-                    "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
+                    "est_charges": total_est_ch, "gann_level": setup["gann_level"], "last_ltp": fill,
+                    "sl": sl_price, "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": False,
-                    "trade_mode": trade_mode, "target_label": tgt_label,
+                    "trade_mode": trade_mode, "target_label": "SMART HYBRID ∞",
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
@@ -1756,13 +1792,14 @@ class IntradayV3Engine:
         live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else min_req_delta
 
         spot_risk, spot_sl_equiv = self.compute_true_fractal_swing_sl(df, setup["side"], spot_close, atr14)
-        raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.08), ltp * 0.35)
-        sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 3)
+        raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.12), ltp * 0.35)
+        sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 4)
         sl_price = round_to_tick(ltp - sl_points, tick_sz)
 
         cap = self.get_active_capital()
         max_idx_risk = float(self.tuned_params.get("index_max_risk_inr", round(cap * 0.05, 2)))
-        risk_1_lot = sl_points * cfg["lot_size"]
+        est_ch_1 = fetch_exact_trade_charges(inst_key, ltp, ltp, cfg["lot_size"], False).get("total", 65.0)
+        risk_1_lot = (sl_points * cfg["lot_size"]) + est_ch_1
         if risk_1_lot > max_idx_risk:
             self.pending_setups[idx] = None
             return
@@ -1773,6 +1810,7 @@ class IntradayV3Engine:
         risk_lots = max(1, int(max_idx_risk // max(risk_1_lot, 1.0)))
         lots = min(cap_lots, risk_lots)
         qty = min(lots * cfg["lot_size"], cfg["freeze_qty"])
+        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
 
         order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
         if order_res.get("status") == "success":
@@ -1781,9 +1819,6 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            scalp_r = float(self.tuned_params.get("scalp_target_r", 1.35))
-            tgt_px = round_to_tick(fill + sl_points * scalp_r, tick_sz)
-            tgt_label = f"₹{tgt_px:.2f} (SCALP)" if trade_mode == "SCALP" else "UNCAPPED ∞"
             mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else mem_tag
             with self.pos_lock:
                 self.active_positions[idx] = {
@@ -1791,11 +1826,11 @@ class IntradayV3Engine:
                     "strike": target_strike, "side": setup["side"], "tx_side": "BUY",
                     "display_side": setup["side"], "qty": qty, "tick_size": tick_sz,
                     "delta": live_delta, "entry_price": fill, "spot_entry": spot_close,
-                    "spot_sl": spot_sl_equiv, "r_unit": sl_points,
+                    "spot_sl": spot_sl_equiv, "r_unit": sl_points, "est_charges": total_est_ch,
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": is_today_exp,
-                    "trade_mode": trade_mode, "target_label": tgt_label,
+                    "trade_mode": trade_mode, "target_label": "SMART HYBRID ∞",
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mode_suffix}",
                     "entry_time": entry_time_str,
                 }
@@ -1821,14 +1856,10 @@ class IntradayV3Engine:
                 ltp = pos.get("last_ltp", pos["entry_price"])
 
             is_short = pos["tx_side"] == "SELL"
-            r_unit = max(pos.get("r_unit", 1.0), 1e-6)
-            curr_r = ((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"])) / r_unit
             exit_reason = None
 
             if pos["side"].upper() in self.macro_context.get("eject_sides", []):
                 exit_reason = f"AI_SHOCK_EJECT_{pos['side']}"
-            elif pos.get("trade_mode") == "SCALP" and curr_r >= float(self.tuned_params.get("scalp_target_r", 1.35)):
-                exit_reason = "SCALP_TARGET_HIT"
             elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
                 exit_reason = "EOD_EXIT"
             elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
@@ -1907,7 +1938,7 @@ class IntradayV3Engine:
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
-            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>"
+            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>  |  📊 <code>5m IDX / 15m MCX</code>"
         )
 
         self.start_heartbeat_thread()
@@ -1944,7 +1975,7 @@ class IntradayV3Engine:
                 for idx, cfg in INDICES.items():
                     if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
                         if idx not in self.last_summaries:
-                            spot_df = fetch_intraday_5m(cfg["spot_key"])
+                            spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
                             if not spot_df.empty:
                                 self.last_summaries[idx] = {
                                     "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
