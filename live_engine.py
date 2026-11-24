@@ -137,12 +137,39 @@ def is_overnight_dead_hours(now_ist: datetime) -> bool:
     return hhmm >= "23:20" or hhmm < "07:30"
 
 
-def check_upstox_exchange_holiday(now_ist: datetime) -> tuple[bool, str, bool]:
+def ms_to_ist_hhmm(epoch_ms) -> str:
+    try:
+        val = int(epoch_ms)
+        if val <= 0:
+            return ""
+        dt = datetime.fromtimestamp(val / 1000.0, tz=timezone.utc).astimezone(IST)
+        return dt.strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def inspect_special_session_schedule(now_ist: datetime) -> dict:
     """
-    Queries official Upstox /v2/market/holidays/{date} API:
-    Returns (is_nse_closed, holiday_description, is_mcx_evening_open).
+    Dynamically inspects Upstox /v2/market/holidays/{date} & live exchange status for:
+    1. Full Holiday (both NSE & MCX closed)
+    2. Holiday with Evening MCX Session (e.g., Gurunanak Jayanti: MCX opens 17:00-23:15 IST)
+    3. Muhurat Trading Session (Special evening NSE/NFO + MCX window)
     """
     d_str = now_ist.strftime("%Y-%m-%d")
+    info = {
+        "is_holiday": False,
+        "description": "",
+        "nse_open": True,
+        "nse_start": INDEX_START_TIME,
+        "nse_end": INDEX_END_TIME,
+        "nse_exit": INDEX_EXIT_TIME,
+        "mcx_open": True,
+        "mcx_start": MCX_START_TIME,
+        "mcx_end": MCX_END_TIME,
+        "mcx_exit": MCX_EXIT_TIME,
+        "is_muhurat": False,
+    }
+
     try:
         res = requests.get(
             f"https://api.upstox.com/v2/market/holidays/{d_str}",
@@ -152,15 +179,53 @@ def check_upstox_exchange_holiday(now_ist: datetime) -> tuple[bool, str, bool]:
         data = res.get("data", [])
         if isinstance(data, list) and data:
             item = data[0]
-            closed_ex = [str(x).upper() for x in item.get("closed_exchanges", [])]
+            info["is_holiday"] = True
+            info["description"] = str(item.get("description", "EXCHANGE HOLIDAY")).strip()
+            closed_ex = {str(x).upper() for x in item.get("closed_exchanges", [])}
             open_ex = item.get("open_exchanges", [])
-            desc = str(item.get("description", "EXCHANGE HOLIDAY")).strip()
-            nse_closed = ("NSE" in closed_ex) or ("NFO" in closed_ex)
-            mcx_evening_open = any(str(o.get("exchange", "")).upper() == "MCX" for o in open_ex if isinstance(o, dict))
-            return nse_closed, desc, mcx_evening_open
+
+            if "NSE" in closed_ex or "NFO" in closed_ex:
+                info["nse_open"] = False
+            if "MCX" in closed_ex:
+                info["mcx_open"] = False
+
+            for o in open_ex:
+                if not isinstance(o, dict):
+                    continue
+                ex = str(o.get("exchange", "")).upper()
+                st_hhmm = ms_to_ist_hhmm(o.get("start_time"))
+                en_hhmm = ms_to_ist_hhmm(o.get("end_time"))
+
+                if ex in ("NSE", "NFO"):
+                    info["nse_open"] = True
+                    if st_hhmm and en_hhmm:
+                        info["nse_start"] = st_hhmm
+                        # Leave 5 min buffer before session close for auto square-off
+                        en_dt = datetime.strptime(f"{d_str} {en_hhmm}", "%Y-%m-%d %H:%M")
+                        info["nse_end"] = (en_dt - timedelta(minutes=8)).strftime("%H:%M")
+                        info["nse_exit"] = (en_dt - timedelta(minutes=3)).strftime("%H:%M")
+                        if st_hhmm >= "16:00":
+                            info["is_muhurat"] = True
+                elif ex == "MCX":
+                    info["mcx_open"] = True
+                    if st_hhmm and en_hhmm:
+                        info["mcx_start"] = st_hhmm
+                        en_dt = datetime.strptime(f"{d_str} {en_hhmm}", "%Y-%m-%d %H:%M")
+                        info["mcx_end"] = (en_dt - timedelta(minutes=15)).strftime("%H:%M")
+                        info["mcx_exit"] = (en_dt - timedelta(minutes=5)).strftime("%H:%M")
+                        if st_hhmm >= "16:30" and "MUHURAT" in info["description"].upper():
+                            info["is_muhurat"] = True
     except Exception as e:
-        log.warning(f"Holiday API check skipped: {e}")
-    return False, "", False
+        log.warning(f"Holiday/Muhurat schedule check warning: {e}")
+
+    # Fallback check if Upstox holiday list didn't return an entry but MCX live status is open in evening
+    if info["is_holiday"] and not info["mcx_open"]:
+        mcx_live = check_live_exchange_status("MCX")
+        if mcx_live in ("NORMAL_OPEN", "OPEN", "PRE_OPEN"):
+            info["mcx_open"] = True
+            info["mcx_start"] = "17:00"
+
+    return info
 
 
 def push_trade_to_google_sheet(trade_row: dict):
@@ -819,7 +884,19 @@ class IntradayV3Engine:
         self.subscribed_keys = set()
         self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
-        self.nse_holiday_today = False
+        self.session_sched = {
+            "is_holiday": False,
+            "description": "",
+            "nse_open": True,
+            "nse_start": INDEX_START_TIME,
+            "nse_end": INDEX_END_TIME,
+            "nse_exit": INDEX_EXIT_TIME,
+            "mcx_open": True,
+            "mcx_start": MCX_START_TIME,
+            "mcx_end": MCX_END_TIME,
+            "mcx_exit": MCX_EXIT_TIME,
+            "is_muhurat": False,
+        }
         self.ai_agent = TickByTickAITradingAgent(self) if HAS_AI_AGENT else None
 
         init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
@@ -1301,7 +1378,18 @@ class IntradayV3Engine:
 
     def is_within_trade_window(self, idx: str, now_ist: datetime) -> bool:
         hhmm = now_ist.strftime("%H:%M")
-        return (MCX_START_TIME <= hhmm <= MCX_END_TIME) if INDICES[idx]["type"] == "MCX_FUT" else (INDEX_START_TIME <= hhmm <= INDEX_END_TIME)
+        if INDICES[idx]["type"] == "MCX_FUT":
+            if not self.session_sched.get("mcx_open", True):
+                return False
+            st = self.session_sched.get("mcx_start", MCX_START_TIME)
+            en = self.session_sched.get("mcx_end", MCX_END_TIME)
+            return st <= hhmm <= en
+        else:
+            if not self.session_sched.get("nse_open", True):
+                return False
+            st = self.session_sched.get("nse_start", INDEX_START_TIME)
+            en = self.session_sched.get("nse_end", INDEX_END_TIME)
+            return st <= hhmm <= en
 
     def analyze_oi_and_pcr(self, idx: str, chain: list):
         if not chain:
@@ -1415,6 +1503,8 @@ class IntradayV3Engine:
                 status_header = "🔴 <b>MARKET CLOSED</b>"
             elif "PAUSED" in self.bot_status_text:
                 status_header = "🟡 <b>BOT PAUSED</b>"
+            elif "STANDBY" in self.bot_status_text:
+                status_header = f"🟠 <b>{self.bot_status_text}</b>"
             else:
                 pulse_dot = "🟢" if self.dashboard_pulse else "⚪"
                 status_header = f"{pulse_dot} <b>BOT LIVE</b>"
@@ -1819,7 +1909,13 @@ class IntradayV3Engine:
                     self.try_execute_option_entry(idx, cfg, pending, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode, in_expiry_slope)
 
         slope_tag = " [SLOPE]" if in_expiry_slope else ""
-        short_status = f"ARMED {pending['display_side']}{slope_tag}" if pending else f"Gann {int(sup)}-{int(res)}{slope_tag}"
+        if pending:
+            short_status = f"ARMED {pending['display_side']}{slope_tag}"
+        elif not self.is_within_trade_window(idx, now_ist) and hhmm_now < (self.session_sched.get("mcx_start", MCX_START_TIME) if is_mcx else self.session_sched.get("nse_start", INDEX_START_TIME)):
+            st_t = self.session_sched.get("mcx_start", MCX_START_TIME) if is_mcx else self.session_sched.get("nse_start", INDEX_START_TIME)
+            short_status = f"OPENS {st_t}"
+        else:
+            short_status = f"Gann {int(sup)}-{int(res)}{slope_tag}"
 
         return {
             "idx": idx, "is_mcx": is_mcx,
@@ -1986,6 +2082,8 @@ class IntradayV3Engine:
             pos_items = list(self.active_positions.items())
 
         hhmm = now_ist.strftime("%H:%M")
+        nse_exit_t = self.session_sched.get("nse_exit", INDEX_EXIT_TIME)
+        mcx_exit_t = self.session_sched.get("mcx_exit", MCX_EXIT_TIME)
         quotes = fetch_ltp_quote([p["instrument_key"] for _, p in pos_items]) if not self.ws_connected else {}
 
         for idx, pos in pos_items:
@@ -2000,9 +2098,9 @@ class IntradayV3Engine:
 
             if pos["side"].upper() in self.macro_context.get("eject_sides", []):
                 exit_reason = f"AI_SHOCK_EJECT_{pos['side']}"
-            elif pos["type"] == "INDEX_OPT" and hhmm >= INDEX_EXIT_TIME:
-                exit_reason = "EOD_EXIT"
-            elif pos["type"] == "MCX_FUT" and hhmm >= MCX_EXIT_TIME:
+            elif pos["type"] == "INDEX_OPT" and hhmm >= nse_exit_t:
+                exit_reason = "MUHURAT_EOD_EXIT" if self.session_sched.get("is_muhurat") else "EOD_EXIT"
+            elif pos["type"] == "MCX_FUT" and hhmm >= mcx_exit_t:
                 exit_reason = "MCX_EOD_EXIT"
             elif not is_short and ltp <= pos["sl"]:
                 exit_reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
@@ -2052,35 +2150,45 @@ class IntradayV3Engine:
             log.info(f"Outside market hours ({now_ist.strftime('%H:%M')} IST). Standing down cleanly.")
             return
 
-        # 2. Weekend + Official Upstox Exchange Holiday Check
-        live_nse_status = check_live_exchange_status("NSE") if now_ist.weekday() < 5 else ""
-        if HAS_AUTO_TUNER:
-            closed_reason = get_market_closed_reason(now_ist, live_nse_status)
-        else:
-            closed_reason = "SATURDAY (WEEKEND)" if now_ist.weekday() == 5 else ("SUNDAY (WEEKEND)" if now_ist.weekday() == 6 else "")
-
-        mcx_evening_only = False
-        if not closed_reason and now_ist.weekday() < 5:
-            is_hol, hol_desc, mcx_eve_open = check_upstox_exchange_holiday(now_ist)
-            if is_hol:
-                if HAS_AUTO_TUNER:
-                    record_learned_holiday(now_ist.strftime("%Y-%m-%d"))
-                if mcx_eve_open:
-                    self.nse_holiday_today = True
-                    mcx_evening_only = True
-                    log.info(f"[HOLIDAY DETECTED] {hol_desc}: NSE/BSE Closed today; MCX Evening Session (17:00-23:15 IST) active.")
-                else:
-                    closed_reason = f"HOLIDAY ({hol_desc})"
-
-        if closed_reason:
-            self.bot_status_text = f"MARKET CLOSED ({closed_reason})"
+        # 2. Weekend Guard (Saturday / Sunday — zero trading on all exchanges)
+        if now_ist.weekday() >= 5:
+            wk_label = "SATURDAY (WEEKEND)" if now_ist.weekday() == 5 else "SUNDAY (WEEKEND)"
+            self.bot_status_text = f"MARKET CLOSED ({wk_label})"
             notify(
-                f"🔴 <b>MARKET CLOSED • {closed_reason}</b>\n"
+                f"🔴 <b>MARKET CLOSED • {wk_label}</b>\n"
                 f"────────────────────────────\n"
                 f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
                 f"💤 <i>No live trading session today. Engine standing down cleanly.</i>"
             )
             return
+
+        # 3. Dynamic Holiday + Evening Commodity (17:00 IST) + Muhurat Trading Schedule Inspector
+        self.session_sched = inspect_special_session_schedule(now_ist)
+        live_nse_status = check_live_exchange_status("NSE")
+        if HAS_AUTO_TUNER:
+            learned_reason = get_market_closed_reason(now_ist, live_nse_status)
+            if learned_reason and not self.session_sched["is_holiday"]:
+                self.session_sched["is_holiday"] = True
+                self.session_sched["description"] = learned_reason
+                self.session_sched["nse_open"] = False
+                # On NSE holidays, MCX evening session still opens at 17:00 IST unless explicitly closed
+                self.session_sched["mcx_open"] = True
+                self.session_sched["mcx_start"] = "17:00"
+
+        if self.session_sched["is_holiday"]:
+            if HAS_AUTO_TUNER:
+                record_learned_holiday(now_ist.strftime("%Y-%m-%d"))
+
+            if not self.session_sched["nse_open"] and not self.session_sched["mcx_open"]:
+                hol_txt = self.session_sched["description"] or "EXCHANGE HOLIDAY"
+                self.bot_status_text = f"MARKET CLOSED ({hol_txt})"
+                notify(
+                    f"🔴 <b>MARKET CLOSED • {hol_txt}</b>\n"
+                    f"────────────────────────────\n"
+                    f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
+                    f"💤 <i>Both NSE/BSE and MCX closed today. Standing down cleanly.</i>"
+                )
+                return
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, "stop_requested", True))
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, "stop_requested", True))
@@ -2094,13 +2202,19 @@ class IntradayV3Engine:
         session_start_ts = time.time()
         holiday_checked_0916 = False
 
-        mode_note = "MCX Evening Session Only (NSE Holiday)" if mcx_evening_only else "5m IDX / 15m MCX"
+        if self.session_sched["is_muhurat"]:
+            sess_banner = f"🪔 MUHURAT TRADING • NSE {self.session_sched['nse_start']}–{self.session_sched['nse_exit']} | MCX {self.session_sched['mcx_start']}–{self.session_sched['mcx_exit']}"
+        elif self.session_sched["is_holiday"] and not self.session_sched["nse_open"] and self.session_sched["mcx_open"]:
+            sess_banner = f"🛢️ NSE HOLIDAY • MCX EVENING SESSION ({self.session_sched['mcx_start']}–{self.session_sched['mcx_exit']} IST)"
+        else:
+            sess_banner = "5m IDX / 15m MCX (09:15 AM – 11:20 PM IST)"
+
         notify(
             f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
-            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>  |  📊 <code>{mode_note}</code>"
+            f"🕒 <b>Session:</b> <code>{sess_banner}</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
@@ -2118,8 +2232,8 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
                 break
 
-            # Live fallback check at 09:16 IST: if NIFTY has zero today candles, auto-mark NSE Holiday
-            if not holiday_checked_0916 and not self.nse_holiday_today and "09:16" <= hhmm <= "09:30":
+            # Live fallback at 09:16 IST: if NIFTY has zero today candles on a non-Muhurat morning, switch to MCX Evening mode
+            if not holiday_checked_0916 and self.session_sched["nse_open"] and not self.session_sched["is_muhurat"] and "09:16" <= hhmm <= "09:30":
                 holiday_checked_0916 = True
                 nifty_check_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
                 today_s = now_ist.strftime("%Y-%m-%d")
@@ -2128,13 +2242,16 @@ class IntradayV3Engine:
                     and str(nifty_check_df["timestamp"].iloc[-1])[:10] == today_s
                 )
                 if not has_today_candle:
-                    self.nse_holiday_today = True
+                    self.session_sched["is_holiday"] = True
+                    self.session_sched["nse_open"] = False
+                    self.session_sched["mcx_open"] = True
+                    self.session_sched["mcx_start"] = "17:00"
                     if HAS_AUTO_TUNER:
                         record_learned_holiday(today_s)
                     notify(
-                        f"🟡 <b>NSE/BSE HOLIDAY DETECTED ({today_s})</b>\n"
+                        f"🟡 <b>NSE/BSE HOLIDAY ({today_s}) • MCX EVENING ARMED</b>\n"
                         f"────────────────────────────\n"
-                        f"📉 <i>No NSE live candles after 09:15 IST. Index trading disabled; MCX evening session monitored.</i>"
+                        f"🛢️ <i>Index trading disabled; MCX commodity trading will auto-start at 17:00 IST.</i>"
                     )
 
             self.refresh_live_macro_news(force=False)
@@ -2153,19 +2270,28 @@ class IntradayV3Engine:
 
             if risk_locked:
                 self.bot_status_text = "BOT PAUSED"
+            elif not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
+            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
             else:
                 self.bot_status_text = "BOT LIVE"
+
+            if not risk_locked:
                 for idx, cfg in INDICES.items():
-                    if cfg["type"] == "INDEX_OPT" and (hhmm > "15:20" or self.nse_holiday_today):
-                        if idx not in self.last_summaries:
-                            spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
-                            if not spot_df.empty:
-                                self.last_summaries[idx] = {
-                                    "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
-                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0,
-                                    "short_status": "HOLIDAY" if self.nse_holiday_today else "CLOSED",
-                                }
-                        continue
+                    is_mcx = cfg["type"] == "MCX_FUT"
+                    if not is_mcx:
+                        nse_closed_now = (not self.session_sched["nse_open"]) or (hhmm > self.session_sched.get("nse_exit", "15:20"))
+                        if nse_closed_now:
+                            if idx not in self.last_summaries:
+                                spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
+                                if not spot_df.empty:
+                                    self.last_summaries[idx] = {
+                                        "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
+                                        "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0,
+                                        "short_status": "HOLIDAY" if not self.session_sched["nse_open"] else "CLOSED",
+                                    }
+                            continue
                     res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
                         self.last_summaries[idx] = res
