@@ -57,8 +57,8 @@ GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 MIN_FUEL_SCORE = 45.0
-MCX_MORNING_FUEL_SCORE = 55.0
-MCX_EVENING_FUEL_SCORE = 50.0
+MCX_MORNING_FUEL_SCORE = 48.0
+MCX_EVENING_FUEL_SCORE = 46.0
 MIN_ADX_TREND = 19.0
 MAX_CHOP_INDEX = 60.0
 SESSION_MAX_RUNTIME_SEC = 20700
@@ -68,22 +68,24 @@ INDEX_END_TIME = "15:10"
 INDEX_EXIT_TIME = "15:15"
 
 MCX_START_TIME = "09:15"
-MCX_END_TIME = "23:00"
-MCX_EXIT_TIME = "23:15"
+MCX_END_TIME = "23:10"
+MCX_EXIT_TIME = "23:25"
 
 GANN_ZONE_ATR_MULT = 0.40
 PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
-REENTRY_COOLDOWN_SEC = 900          # Minimum 15 minutes cooldown after closing a trade on same symbol
-MAX_ACTIVE_TRADES_TOTAL = 1         # Strict 1 open trade at a time across all scripts
+REENTRY_COOLDOWN_SEC = 900          # 15-min cooldown per symbol after closing a trade
+MAX_ACTIVE_TRADES_TOTAL = 5         # Allow up to 5 concurrent symbols (max 1 per symbol)
+STARTUP_WARMUP_SEC = 90             # Wait 90s on boot before taking fresh signals
 DASHBOARD_PULSE_SEC = 5.0
 MACRO_REFRESH_SEC = 180
 
 # Hybrid Multi-Trigger & Greeks Filter Constants
 BREAKOUT_EXPANSION_ATR = 1.20
-CRASH_FASTTRACK_ATR = 1.50
+CRASH_FASTTRACK_ATR = 1.45
 CRASH_DAY_PCT_THRESHOLD = 1.15
 RETEST_TOLERANCE_ATR = 0.35
+MAX_EMA20_EXTENSION_ATR = 2.60
 MAX_OPTION_SPREAD_PCT = 1.50
 THETA_BURN_RATIO_MAX = 0.30
 
@@ -121,11 +123,11 @@ INDICES = {
     "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service", "tf_min": 5},
     "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT", "tf_min": 5},
     "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX", "tf_min": 5},
-    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 15},
-    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 15},
-    "GOLD":       {"type": "MCX_FUT", "tf_min": 15},
-    "SILVER":     {"type": "MCX_FUT", "tf_min": 15},
-    "COPPER":     {"type": "MCX_FUT", "tf_min": 15},
+    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 5},
+    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 5},
+    "GOLD":       {"type": "MCX_FUT", "tf_min": 5},
+    "SILVER":     {"type": "MCX_FUT", "tf_min": 5},
+    "COPPER":     {"type": "MCX_FUT", "tf_min": 5},
 }
 
 
@@ -136,15 +138,13 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
-    """Covers Session 1->2 (14:35-15:05 IST) and Session 2->3 (20:30-21:05 IST) cron handovers cleanly."""
     hhmm = now_ist.strftime("%H:%M")
     return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "21:05")
 
 
 def is_overnight_dead_hours(now_ist: datetime) -> bool:
-    """Blocks delayed GitHub cron jobs that wake up between 23:20 IST and 07:30 IST."""
     hhmm = now_ist.strftime("%H:%M")
-    return hhmm >= "23:20" or hhmm < "07:30"
+    return hhmm >= "23:35" or hhmm < "07:30"
 
 
 def ms_to_ist_hhmm(epoch_ms) -> str:
@@ -214,8 +214,8 @@ def inspect_special_session_schedule(now_ist: datetime) -> dict:
                     if st_hhmm and en_hhmm:
                         info["mcx_start"] = st_hhmm
                         en_dt = datetime.strptime(f"{d_str} {en_hhmm}", "%Y-%m-%d %H:%M")
-                        info["mcx_end"] = (en_dt - timedelta(minutes=15)).strftime("%H:%M")
-                        info["mcx_exit"] = (en_dt - timedelta(minutes=5)).strftime("%H:%M")
+                        info["mcx_end"] = (en_dt - timedelta(minutes=25)).strftime("%H:%M")
+                        info["mcx_exit"] = (en_dt - timedelta(minutes=15)).strftime("%H:%M")
                         if st_hhmm >= "16:30" and "MUHURAT" in info["description"].upper():
                             info["is_muhurat"] = True
     except Exception as e:
@@ -869,7 +869,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (ANTI-IMMEDIATE-REENTRY + 4-GATE HYBRID)
+# 6. SELF-MATURING V3 ENGINE (5-SCRIPT PARALLEL + VWAP PULLBACK + ANTI-CHASE)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -893,6 +893,7 @@ class IntradayV3Engine:
         self.dashboard_pulse = False
         self.dashboard_lock = threading.Lock()
         self.last_macro_ts = 0.0
+        self.engine_boot_ts = time.time()
         self.streamer = None
         self.ws_connected = False
         self.subscribed_keys = set()
@@ -922,7 +923,7 @@ class IntradayV3Engine:
             "mcx_capital_per_trade": init_mcx_cap,
             "max_daily_loss_inr": round(init_cap * 0.15, 2),
             "index_max_risk_inr": round(init_cap * 0.05, 2),
-            "mcx_max_risk_inr": round(init_mcx_cap * 0.01, 2),
+            "mcx_max_risk_inr": round(init_mcx_cap * 0.025, 2),
             "min_fuel_score": MIN_FUEL_SCORE,
             "expiry_slope_fuel_score": 32.0,
             "expiry_slope_start": "13:45",
@@ -980,11 +981,17 @@ class IntradayV3Engine:
                 self.tuned_params["morning_wait_until"] = "09:15"
                 if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
                     self.tuned_params["min_fuel_score"] = 45.0
+                if float(self.tuned_params.get("mcx_evening_fuel_score", 46.0)) > 48.0:
+                    self.tuned_params["mcx_evening_fuel_score"] = 46.0
+                min_mcx_risk = round(self.get_active_mcx_capital() * 0.025, 2)
+                if float(self.tuned_params.get("mcx_max_risk_inr", 1500.0)) < min_mcx_risk:
+                    self.tuned_params["mcx_max_risk_inr"] = min_mcx_risk
                 log.info(
                     f"[BRAIN LOADED] {self.tuned_params.get('brain_version')} | "
                     f"Gear={self.tuned_params.get('driver_gear')} | "
                     f"IdxFuel(5m)={self.tuned_params.get('min_fuel_score')} | "
-                    f"McxFuel(15m)={self.tuned_params.get('mcx_morning_fuel_score')}"
+                    f"McxFuel(5m)={self.tuned_params.get('mcx_evening_fuel_score')} | "
+                    f"McxRiskCap=₹{self.tuned_params.get('mcx_max_risk_inr')}"
                 )
             except Exception as e:
                 log.warning(f"Failed to load strategy_params.json: {e}")
@@ -1208,13 +1215,12 @@ class IntradayV3Engine:
                         self.trade_counter = max(self.trade_counter, t_no)
             self.closed_trades.sort(key=lambda x: x["trade_no"])
             if self.closed_trades:
-                # Seed cooldown from last closed trade on restart so cron handover never double-enters
-                last_t = self.closed_trades[-1]
-                try:
-                    ex_dt = datetime.strptime(f"{today_str} {last_t['exit_time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                    self.last_exit_ts[last_t["symbol"]] = ex_dt.timestamp()
-                except Exception:
-                    pass
+                for t in self.closed_trades:
+                    try:
+                        ex_dt = datetime.strptime(f"{today_str} {t['exit_time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+                        self.last_exit_ts[t["symbol"]] = max(self.last_exit_ts.get(t["symbol"], 0.0), ex_dt.timestamp())
+                    except Exception:
+                        pass
                 log.info(f"[STATE LOADED] {len(self.closed_trades)} today's trade(s) loaded | Net PnL: ₹{self.day_pnl:+.2f}")
         except Exception:
             pass
@@ -1586,7 +1592,7 @@ class IntradayV3Engine:
                     if s:
                         lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX LIVE (15m)</b>")
+                lines.append("\n🛢️ <b>MCX LIVE (5m)</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
@@ -1636,7 +1642,6 @@ class IntradayV3Engine:
         if not pos:
             return
 
-        # Record strict cooldown and candle timestamp so same script cannot immediately re-enter
         self.last_exit_ts[idx] = time.time()
         self.pending_setups[idx] = None
         df_curr = self.latest_dfs.get(idx)
@@ -1696,7 +1701,6 @@ class IntradayV3Engine:
         r_unit = max(pos.get("r_unit", 1.0), 1e-6)
         cushion = float(self.tuned_params.get("trail_cushion_mult", 1.0))
 
-        # 1. Underlying Structural Stop-Loss Invalidation
         spot_sl = float(pos.get("spot_sl", 0.0))
         if spot_sl > 0:
             if pos["side"] == "CE" and spot_close <= spot_sl:
@@ -1723,7 +1727,6 @@ class IntradayV3Engine:
             upper_wick = float(c_curr["high"]) - max(float(c_curr["open"]), float(c_curr["close"]))
             lower_wick = min(float(c_curr["open"]), float(c_curr["close"])) - float(c_curr["low"])
 
-            # VWAP Reversal Profit Lock
             if (pos["side"] == "CE" and spot_close < curr_vwap and price_change < 0) or (
                 pos["side"] == "PE" and spot_close > curr_vwap and price_change > 0
             ):
@@ -1792,7 +1795,6 @@ class IntradayV3Engine:
             self.close_position_now(idx, ltp, "FUEL_EXHAUSTED", now_ist)
             return
 
-        # Only trigger NO_MOMENTUM_EXIT if trade has NOT moved meaningfully in profit (curr_r < 0.30R)
         now_ts = time.time()
         ltp_hist = pos.setdefault("ltp_window", deque())
         ltp_hist.append((now_ts, ltp))
@@ -1811,7 +1813,7 @@ class IntradayV3Engine:
 
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
-        tf_min = int(cfg.get("tf_min", 15 if is_mcx else 5))
+        tf_min = int(cfg.get("tf_min", 5))
         if not cfg.get("spot_key"):
             return None
 
@@ -1828,8 +1830,8 @@ class IntradayV3Engine:
         prev = df.iloc[-2] if len(df) >= 2 else curr
         curr_candle_ts = str(curr["timestamp"])
         spot_close = float(curr["close"])
-        ref_close = float(prev["close"]) if len(df) >= 2 else float(curr["open"])
-        price_change = round(spot_close - ref_close, 2)
+        prev_close = float(prev["close"]) if len(df) >= 2 else float(curr["open"])
+        price_change = round(spot_close - prev_close, 2)
         atr14 = max(float(curr["atr14"]), cfg.get("tick_size", 0.05) * 2)
         curr_tr = float(curr.get("tr", atr14))
         fuel = float(curr["fuel"])
@@ -1839,7 +1841,7 @@ class IntradayV3Engine:
         high20 = curr.get("high20")
         low20 = curr.get("low20")
 
-        # Intraday Opening Range (first 15 mins = 3 bars on 5m, 1 bar on 15m) & Day % Change
+        # Intraday Opening Range (first 15 mins = 3 bars on 5m) & Day % Change
         today_s = now_ist.strftime("%Y-%m-%d")
         today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today_s]
         orb_bars = 3 if tf_min == 5 else 1
@@ -1889,7 +1891,6 @@ class IntradayV3Engine:
                     "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
                     "short_status": f"ACTIVE #{pos['trade_no']} (₹{pos_mtm:+.0f})",
                 }
-            # Position was just closed in this cycle -> return immediately so it NEVER re-enters in the same cycle!
             return {
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
@@ -1897,7 +1898,18 @@ class IntradayV3Engine:
                 "short_status": "COOLDOWN (15m)",
             }
 
-        # Enforce Cooldown & Single Active Position Guard before evaluating any new entry
+        # Startup warm-up guard (prevents blind bottom/top chasing immediately on script deploy)
+        uptime_sec = time.time() - self.engine_boot_ts
+        if uptime_sec < STARTUP_WARMUP_SEC:
+            rem_w = max(1, int(STARTUP_WARMUP_SEC - uptime_sec))
+            return {
+                "idx": idx, "is_mcx": is_mcx,
+                "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
+                "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
+                "short_status": f"WARMUP ({rem_w}s)",
+            }
+
+        # Enforce Per-Symbol Cooldown & Max Concurrent Limit
         sec_since_exit = time.time() - self.last_exit_ts.get(idx, 0.0)
         same_candle_as_exit = (curr_candle_ts == self.last_exit_candle_ts.get(idx, ""))
         if sec_since_exit < REENTRY_COOLDOWN_SEC or same_candle_as_exit:
@@ -1941,18 +1953,22 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # VWAP + EMA Trend Alignment
+        # VWAP + EMA Trend Alignment & Anti-Overextension Filter
         vwap_ema_bull = (spot_close > vwap) and (spot_close > ema20)
         vwap_ema_bear = (spot_close < vwap) and (spot_close < ema20)
+        dist_from_ema20 = abs(spot_close - ema20)
+        not_overextended = dist_from_ema20 <= (MAX_EMA20_EXTENSION_ATR * atr14)
 
         new_signal = None
         immediate_fasttrack = False
 
-        # Trigger 1: Crash / Rally Fast-Track (15m ORB Breakdown/Breakout + >1.15% Day Move or 1.5x ATR Expansion)
-        if len(today_df) > orb_bars:
+        # Trigger 1: Fresh Crash / Rally Fast-Track (ONLY when current/recent bar freshly breaks ORB or 20-bar level, not hours late)
+        if len(today_df) > orb_bars and not_overextended:
+            fresh_orb_dn = (orb_low is not None) and (spot_close < orb_low) and (prev_close >= orb_low - 0.15 * atr14)
+            fresh_orb_up = (orb_high is not None) and (spot_close > orb_high) and (prev_close <= orb_high + 0.15 * atr14)
+
             if (
-                orb_low is not None
-                and spot_close < orb_low
+                fresh_orb_dn
                 and vwap_ema_bear
                 and ema20 <= ema50
                 and (day_chg_pct <= -CRASH_DAY_PCT_THRESHOLD or curr_tr >= CRASH_FASTTRACK_ATR * atr14)
@@ -1967,8 +1983,7 @@ class IntradayV3Engine:
                 }
                 immediate_fasttrack = True
             elif (
-                orb_high is not None
-                and spot_close > orb_high
+                fresh_orb_up
                 and vwap_ema_bull
                 and ema20 >= ema50
                 and (day_chg_pct >= CRASH_DAY_PCT_THRESHOLD or curr_tr >= CRASH_FASTTRACK_ATR * atr14)
@@ -1983,8 +1998,46 @@ class IntradayV3Engine:
                 }
                 immediate_fasttrack = True
 
-        # Trigger 2: 20-Bar Breakout with TR >= 1.2x ATR (Arms Retest Setup)
+        # Trigger 2: VWAP / 20 EMA Pullback Rejection (Catches early 17:15-style trend pullbacks cleanly!)
         if new_signal is None and not pending:
+            touched_vwap_ema_up = (float(curr["high"]) >= min(vwap, ema20) - 0.25 * atr14)
+            touched_vwap_ema_dn = (float(curr["low"]) <= max(vwap, ema20) + 0.25 * atr14)
+
+            if (
+                vwap_ema_bear
+                and ema20 <= ema50
+                and touched_vwap_ema_up
+                and float(curr["close"]) < float(curr["open"])
+                and price_change < 0
+                and oi_pcr_bear_ok
+            ):
+                side_label = "SELL" if is_mcx else "PE"
+                new_signal = {
+                    "side": "PE", "display_side": side_label,
+                    "name": f"VWAP_EMA_PULLBACK_{side_label}",
+                    "gann_level": round(vwap, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
+                }
+                immediate_fasttrack = True
+            elif (
+                vwap_ema_bull
+                and ema20 >= ema50
+                and touched_vwap_ema_dn
+                and float(curr["close"]) > float(curr["open"])
+                and price_change > 0
+                and oi_pcr_bull_ok
+            ):
+                side_label = "BUY" if is_mcx else "CE"
+                new_signal = {
+                    "side": "CE", "display_side": side_label,
+                    "name": f"VWAP_EMA_PULLBACK_{side_label}",
+                    "gann_level": round(vwap, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
+                }
+                immediate_fasttrack = True
+
+        # Trigger 3: 20-Bar Breakout with TR >= 1.2x ATR (Arms Retest Setup)
+        if new_signal is None and not pending and not_overextended:
             if pd.notna(high20) and spot_close > float(high20) and curr_tr >= BREAKOUT_EXPANSION_ATR * atr14 and vwap_ema_bull and ema20 > ema50 and oi_pcr_bull_ok:
                 side_label = "BUY" if is_mcx else "CE"
                 new_signal = {
@@ -2002,7 +2055,7 @@ class IntradayV3Engine:
                     "is_retest": True, "retest_level": float(low20),
                 }
 
-        # Trigger 3: Gann Level + 6 Chart Patterns + VWAP/EMA Confirmation
+        # Trigger 4: Gann Level + 6 Chart Patterns + VWAP/EMA Confirmation
         if new_signal is None:
             if near_gann is not None and bull_pattern is not None and price_change > 0 and vwap_ema_bull and oi_pcr_bull_ok:
                 side_label = "BUY" if is_mcx else "CE"
@@ -2020,7 +2073,7 @@ class IntradayV3Engine:
                     "gann_level": near_gann, "trigger": round(spot_close, 2), "armed_at": now_ist,
                     "is_retest": False,
                 }
-            # Trigger 4: Expiry Slope 75-Candle Breakout
+            # Trigger 5: Expiry Slope 75-Candle Breakout
             elif in_expiry_slope and (broke_box_up or broke_box_dn):
                 if broke_box_up and price_change > 0 and spot_close > vwap and oi_pcr_bull_ok:
                     new_signal = {
@@ -2043,8 +2096,11 @@ class IntradayV3Engine:
 
         if pending and idx not in self.active_positions and self.is_within_trade_window(idx, now_ist):
             sym_ov = self.tuned_params.get("symbol_overrides", {}).get(idx, {})
+            in_open_window = ("09:15" <= hhmm_now <= "09:45") or ("17:00" <= hhmm_now <= "17:35")
             if in_expiry_slope:
                 req_fuel = float(self.tuned_params.get("expiry_slope_fuel_score", 32.0))
+            elif in_open_window:
+                req_fuel = 42.0
             elif is_mcx:
                 morn_mcx = float(self.tuned_params.get("mcx_morning_fuel_score", MCX_MORNING_FUEL_SCORE))
                 eve_mcx = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
@@ -2098,7 +2154,7 @@ class IntradayV3Engine:
 
     def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, atr14, now_ist, mem_tag, trade_mode):
         with self.pos_lock:
-            if len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+            if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
                 return
 
         inst_key = cfg["spot_key"]
@@ -2112,7 +2168,7 @@ class IntradayV3Engine:
         sl_points = max(round_to_tick(spot_risk, tick_sz), min_mcx_sl, tick_sz * 4)
 
         mcx_cap = self.get_active_mcx_capital()
-        max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.01, 2)))
+        max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.025, 2)))
         est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, lot_size, True).get("total", 180.0)
         risk_1_lot = (sl_points * lot_size) + est_ch
         if risk_1_lot > max_risk_cap:
@@ -2156,7 +2212,7 @@ class IntradayV3Engine:
 
     def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode, in_expiry_slope=False):
         with self.pos_lock:
-            if len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+            if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
                 return
 
         if not chain:
@@ -2398,6 +2454,7 @@ class IntradayV3Engine:
         self.load_active_positions_state()
         self.bot_status_text = "BOT LIVE"
         session_start_ts = time.time()
+        self.engine_boot_ts = session_start_ts
         holiday_checked_0916 = False
 
         if self.session_sched["is_muhurat"]:
@@ -2405,7 +2462,7 @@ class IntradayV3Engine:
         elif self.session_sched["is_holiday"] and not self.session_sched["nse_open"] and self.session_sched["mcx_open"]:
             sess_banner = f"🛢️ NSE HOLIDAY • MCX EVENING SESSION ({self.session_sched['mcx_start']}–{self.session_sched['mcx_exit']} IST)"
         else:
-            sess_banner = "5m IDX / 15m MCX (09:15 AM – 11:20 PM IST)"
+            sess_banner = "5m IDX / 5m MCX (09:15 AM – 11:30 PM IST)"
 
         notify(
             f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
@@ -2456,7 +2513,7 @@ class IntradayV3Engine:
                 self.ai_agent.think_and_adapt_live_strategy()
             self.manage_open_positions(now_ist)
 
-            if hhmm >= "23:20":
+            if hhmm >= "23:35":
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
