@@ -1,6 +1,6 @@
 {
-  "brain_version": "v2026.11.24.2221",
-  "target_session_date": "2026-11-25",
+  "brain_version": "v2026.11.25.0144",
+  "target_session_date": "2026-11-26",
   "is_expiry_day": false,
   "driver_gear": 1,
   "capital_per_trade": 25000.0,
@@ -8,7 +8,7 @@
   "max_daily_loss_inr": 3750.0,
   "index_max_risk_inr": 1062.5,
   "mcx_max_risk_inr": 1275.0,
-  "min_fuel_score": 48.0,
+  "min_fuel_score": 51.0,
   "expiry_slope_fuel_score": 32.0,
   "expiry_slope_start": "13:45",
   "expiry_slope_end": "14:45",
