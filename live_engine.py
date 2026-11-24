@@ -77,6 +77,14 @@ SETUP_EXPIRY_SEC = 900
 DASHBOARD_PULSE_SEC = 5.0
 MACRO_REFRESH_SEC = 180
 
+# Hybrid Multi-Trigger & Greeks Filter Constants
+BREAKOUT_EXPANSION_ATR = 1.20
+CRASH_FASTTRACK_ATR = 1.50
+CRASH_DAY_PCT_THRESHOLD = 1.15
+RETEST_TOLERANCE_ATR = 0.35
+MAX_OPTION_SPREAD_PCT = 1.50
+THETA_BURN_RATIO_MAX = 0.30
+
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
 PARAMS_FILE = "live_journal/strategy_params.json"
@@ -200,7 +208,6 @@ def inspect_special_session_schedule(now_ist: datetime) -> dict:
                     info["nse_open"] = True
                     if st_hhmm and en_hhmm:
                         info["nse_start"] = st_hhmm
-                        # Leave 5 min buffer before session close for auto square-off
                         en_dt = datetime.strptime(f"{d_str} {en_hhmm}", "%Y-%m-%d %H:%M")
                         info["nse_end"] = (en_dt - timedelta(minutes=8)).strftime("%H:%M")
                         info["nse_exit"] = (en_dt - timedelta(minutes=3)).strftime("%H:%M")
@@ -218,7 +225,6 @@ def inspect_special_session_schedule(now_ist: datetime) -> dict:
     except Exception as e:
         log.warning(f"Holiday/Muhurat schedule check warning: {e}")
 
-    # Fallback check if Upstox holiday list didn't return an entry but MCX live status is open in evening
     if info["is_holiday"] and not info["mcx_open"]:
         mcx_live = check_live_exchange_status("MCX")
         if mcx_live in ("NORMAL_OPEN", "OPEN", "PRE_OPEN"):
@@ -660,7 +666,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. REGIME INTELLIGENCE, GANN LEVELS & GRADUAL FUEL SCORE
+# 4. REGIME INTELLIGENCE, GANN LEVELS, VWAP/EMA & GRADUAL FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 6:
@@ -798,6 +804,16 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
     else:
         spot_df["active_vol"] = spot_df["volume"]
 
+    # Add Intraday VWAP, 20/50 EMA & 20-Bar High/Low
+    spot_df["ema20"] = spot_df["close"].ewm(span=20, adjust=False).mean()
+    spot_df["ema50"] = spot_df["close"].ewm(span=50, adjust=False).mean()
+    tp = (spot_df["high"] + spot_df["low"] + spot_df["close"]) / 3.0
+    day_ser = spot_df["timestamp"].dt.date
+    vol_safe = spot_df["active_vol"].replace(0, 1.0)
+    spot_df["vwap"] = (tp * vol_safe).groupby(day_ser).cumsum() / vol_safe.groupby(day_ser).cumsum()
+    spot_df["high20"] = spot_df["high"].rolling(20, min_periods=5).max().shift(1)
+    spot_df["low20"] = spot_df["low"].rolling(20, min_periods=5).min().shift(1)
+
     fuel_scores = []
     for i in range(len(spot_df)):
         row = spot_df.iloc[i]
@@ -857,7 +873,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (DUAL-TF + ADAPTIVE HYBRID + GSHEET RESTORE)
+# 6. SELF-MATURING V3 ENGINE (4-GATE HYBRID + VWAP/EMA + SMART OTM + GSHEET)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -1668,6 +1684,16 @@ class IntradayV3Engine:
         r_unit = max(pos.get("r_unit", 1.0), 1e-6)
         cushion = float(self.tuned_params.get("trail_cushion_mult", 1.0))
 
+        # 1. Underlying Structural Stop-Loss Invalidation
+        spot_sl = float(pos.get("spot_sl", 0.0))
+        if spot_sl > 0:
+            if pos["side"] == "CE" and spot_close <= spot_sl:
+                self.close_position_now(idx, ltp, "UNDERLYING_SL_HIT", now_ist)
+                return
+            if pos["side"] == "PE" and spot_close >= spot_sl:
+                self.close_position_now(idx, ltp, "UNDERLYING_SL_HIT", now_ist)
+                return
+
         curr_gain = (entry - ltp) if is_short else (ltp - entry)
         peak_gain = max(pos.get("peak_gain", 0.0), curr_gain)
         if peak_gain > pos.get("peak_gain", 0.0):
@@ -1676,6 +1702,7 @@ class IntradayV3Engine:
 
         peak_r = peak_gain / r_unit
         curr_r = curr_gain / r_unit
+        curr_vwap = float(df.iloc[-1].get("vwap", spot_close))
 
         scalp_gate_r = float(self.tuned_params.get("scalp_target_r", 1.80))
         if curr_r >= scalp_gate_r:
@@ -1683,6 +1710,13 @@ class IntradayV3Engine:
             c_range = max(float(c_curr["high"]) - float(c_curr["low"]), 1e-6)
             upper_wick = float(c_curr["high"]) - max(float(c_curr["open"]), float(c_curr["close"]))
             lower_wick = min(float(c_curr["open"]), float(c_curr["close"])) - float(c_curr["low"])
+
+            # VWAP Reversal Profit Lock
+            if (pos["side"] == "CE" and spot_close < curr_vwap and price_change < 0) or (
+                pos["side"] == "PE" and spot_close > curr_vwap and price_change > 0
+            ):
+                self.close_position_now(idx, ltp, "VWAP_REVERSAL_EXIT", now_ist)
+                return
 
             if pos["side"] == "CE" and abs(spot_close - gann_res) <= (atr14 * 0.35) and (upper_wick / c_range) >= 0.45:
                 self.close_position_now(idx, ltp, "GANN_RES_PROFIT_BOOK", now_ist)
@@ -1783,7 +1817,22 @@ class IntradayV3Engine:
         ref_close = float(prev["close"]) if len(df) >= 2 else float(curr["open"])
         price_change = round(spot_close - ref_close, 2)
         atr14 = max(float(curr["atr14"]), cfg.get("tick_size", 0.05) * 2)
+        curr_tr = float(curr.get("tr", atr14))
         fuel = float(curr["fuel"])
+        vwap = float(curr.get("vwap", spot_close))
+        ema20 = float(curr.get("ema20", spot_close))
+        ema50 = float(curr.get("ema50", spot_close))
+        high20 = curr.get("high20")
+        low20 = curr.get("low20")
+
+        # Intraday Opening Range (first 15 mins = 3 bars on 5m, 1 bar on 15m) & Day % Change
+        today_s = now_ist.strftime("%Y-%m-%d")
+        today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today_s]
+        orb_bars = 3 if tf_min == 5 else 1
+        orb_high = float(today_df.iloc[:orb_bars]["high"].max()) if len(today_df) >= orb_bars else None
+        orb_low = float(today_df.iloc[:orb_bars]["low"].min()) if len(today_df) >= orb_bars else None
+        day_open = float(today_df.iloc[0]["open"]) if not today_df.empty else spot_close
+        day_chg_pct = ((spot_close - day_open) / max(day_open, 1e-6)) * 100.0
 
         regime_info = compute_market_regime(
             df,
@@ -1848,36 +1897,103 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
+        # VWAP + EMA Trend Alignment
+        vwap_ema_bull = (spot_close > vwap) and (spot_close > ema20)
+        vwap_ema_bear = (spot_close < vwap) and (spot_close < ema20)
+
         new_signal = None
-        if near_gann is not None and bull_pattern is not None and price_change > 0 and oi_pcr_bull_ok:
-            side_label = "BUY" if is_mcx else "CE"
-            new_signal = {
-                "side": "CE", "display_side": side_label,
-                "name": f"GANN_{int(near_gann)}_{bull_pattern}_{side_label}",
-                "gann_level": near_gann, "trigger": round(spot_close, 2), "armed_at": now_ist,
-            }
-        elif near_gann is not None and bear_pattern is not None and price_change < 0 and oi_pcr_bear_ok:
-            side_label = "SELL" if is_mcx else "PE"
-            new_signal = {
-                "side": "PE", "display_side": side_label,
-                "name": f"GANN_{int(near_gann)}_{bear_pattern}_{side_label}",
-                "gann_level": near_gann, "trigger": round(spot_close, 2), "armed_at": now_ist,
-            }
-        elif in_expiry_slope and (broke_box_up or broke_box_dn):
-            if broke_box_up and price_change > 0 and oi_pcr_bull_ok:
+        immediate_fasttrack = False
+
+        # Trigger 1: Crash / Rally Fast-Track (15m ORB Breakdown/Breakout + >1.15% Day Move or 1.5x ATR Expansion)
+        if len(today_df) > orb_bars:
+            if (
+                orb_low is not None
+                and spot_close < orb_low
+                and vwap_ema_bear
+                and ema20 <= ema50
+                and (day_chg_pct <= -CRASH_DAY_PCT_THRESHOLD or curr_tr >= CRASH_FASTTRACK_ATR * atr14)
+                and oi_pcr_bear_ok
+            ):
+                side_label = "SELL" if is_mcx else "PE"
                 new_signal = {
-                    "side": "CE", "display_side": "CE",
-                    "name": "EXPIRY_SLOPE_BREAKOUT_CE",
-                    "gann_level": res, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "side": "PE", "display_side": side_label,
+                    "name": f"CRASH_RALLY_FASTTRACK_{side_label}",
+                    "gann_level": round(orb_low, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
                 }
-            elif broke_box_dn and price_change < 0 and oi_pcr_bear_ok:
+                immediate_fasttrack = True
+            elif (
+                orb_high is not None
+                and spot_close > orb_high
+                and vwap_ema_bull
+                and ema20 >= ema50
+                and (day_chg_pct >= CRASH_DAY_PCT_THRESHOLD or curr_tr >= CRASH_FASTTRACK_ATR * atr14)
+                and oi_pcr_bull_ok
+            ):
+                side_label = "BUY" if is_mcx else "CE"
                 new_signal = {
-                    "side": "PE", "display_side": "PE",
-                    "name": "EXPIRY_SLOPE_BREAKDOWN_PE",
-                    "gann_level": sup, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "side": "CE", "display_side": side_label,
+                    "name": f"CRASH_RALLY_FASTTRACK_{side_label}",
+                    "gann_level": round(orb_high, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
+                }
+                immediate_fasttrack = True
+
+        # Trigger 2: 20-Bar Breakout with TR >= 1.2x ATR (Arms Retest Setup)
+        if new_signal is None and not pending:
+            if pd.notna(high20) and spot_close > float(high20) and curr_tr >= BREAKOUT_EXPANSION_ATR * atr14 and vwap_ema_bull and ema20 > ema50 and oi_pcr_bull_ok:
+                side_label = "BUY" if is_mcx else "CE"
+                new_signal = {
+                    "side": "CE", "display_side": side_label,
+                    "name": f"20BAR_BREAKOUT_RETEST_{side_label}",
+                    "gann_level": round(float(high20), 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": True, "retest_level": float(high20),
+                }
+            elif pd.notna(low20) and spot_close < float(low20) and curr_tr >= BREAKOUT_EXPANSION_ATR * atr14 and vwap_ema_bear and ema20 < ema50 and oi_pcr_bear_ok:
+                side_label = "SELL" if is_mcx else "PE"
+                new_signal = {
+                    "side": "PE", "display_side": side_label,
+                    "name": f"20BAR_BREAKOUT_RETEST_{side_label}",
+                    "gann_level": round(float(low20), 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": True, "retest_level": float(low20),
                 }
 
-        if new_signal and not pending:
+        # Trigger 3: Gann Level + 6 Chart Patterns + VWAP/EMA Confirmation
+        if new_signal is None:
+            if near_gann is not None and bull_pattern is not None and price_change > 0 and vwap_ema_bull and oi_pcr_bull_ok:
+                side_label = "BUY" if is_mcx else "CE"
+                new_signal = {
+                    "side": "CE", "display_side": side_label,
+                    "name": f"GANN_REVERSAL_ENTRY|{int(near_gann)}_{bull_pattern}_{side_label}",
+                    "gann_level": near_gann, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
+                }
+            elif near_gann is not None and bear_pattern is not None and price_change < 0 and vwap_ema_bear and oi_pcr_bear_ok:
+                side_label = "SELL" if is_mcx else "PE"
+                new_signal = {
+                    "side": "PE", "display_side": side_label,
+                    "name": f"GANN_REVERSAL_ENTRY|{int(near_gann)}_{bear_pattern}_{side_label}",
+                    "gann_level": near_gann, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "is_retest": False,
+                }
+            # Trigger 4: Expiry Slope 75-Candle Breakout
+            elif in_expiry_slope and (broke_box_up or broke_box_dn):
+                if broke_box_up and price_change > 0 and spot_close > vwap and oi_pcr_bull_ok:
+                    new_signal = {
+                        "side": "CE", "display_side": "CE",
+                        "name": "EXPIRY_SLOPE_BREAKOUT_CE",
+                        "gann_level": res, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                        "is_retest": False,
+                    }
+                elif broke_box_dn and price_change < 0 and spot_close < vwap and oi_pcr_bear_ok:
+                    new_signal = {
+                        "side": "PE", "display_side": "PE",
+                        "name": "EXPIRY_SLOPE_BREAKDOWN_PE",
+                        "gann_level": sup, "trigger": round(spot_close, 2), "armed_at": now_ist,
+                        "is_retest": False,
+                    }
+
+        if new_signal and (not pending or immediate_fasttrack):
             self.pending_setups[idx] = new_signal
             pending = new_signal
 
@@ -1892,13 +2008,25 @@ class IntradayV3Engine:
             else:
                 req_fuel = float(sym_ov.get("min_fuel", self.tuned_params.get("min_fuel_score", MIN_FUEL_SCORE)))
 
-            if (regime_info["is_sideways"] or self.macro_context.get("event_caution", False)) and not in_expiry_slope:
+            if (regime_info["is_sideways"] or self.macro_context.get("event_caution", False)) and not in_expiry_slope and not immediate_fasttrack:
                 req_fuel += 3.0
 
-            dir_confirmed = (
-                (pending["side"] == "CE" and price_change > 0 and oi_pcr_bull_ok and spot_close >= pending["trigger"])
-                or (pending["side"] == "PE" and price_change < 0 and oi_pcr_bear_ok and spot_close <= pending["trigger"])
-            )
+            # Retest Confirmation vs Direct Confirmation
+            if pending.get("is_retest"):
+                rlvl = float(pending["retest_level"])
+                tol = RETEST_TOLERANCE_ATR * atr14
+                if pending["side"] == "CE":
+                    dir_confirmed = (float(curr["low"]) <= rlvl + tol) and (spot_close > rlvl) and (spot_close > float(prev["high"])) and vwap_ema_bull and oi_pcr_bull_ok
+                else:
+                    dir_confirmed = (float(curr["high"]) >= rlvl - tol) and (spot_close < rlvl) and (spot_close < float(prev["low"])) and vwap_ema_bear and oi_pcr_bear_ok
+            elif immediate_fasttrack:
+                dir_confirmed = True
+            else:
+                dir_confirmed = (
+                    (pending["side"] == "CE" and price_change > 0 and vwap_ema_bull and oi_pcr_bull_ok and spot_close >= pending["trigger"])
+                    or (pending["side"] == "PE" and price_change < 0 and vwap_ema_bear and oi_pcr_bear_ok and spot_close <= pending["trigger"])
+                )
+
             if dir_confirmed and fuel >= req_fuel:
                 mem_ok, mem_tag = self.consult_market_memory(idx, pending["side"], regime_info, fuel)
                 if not mem_ok:
@@ -1910,7 +2038,8 @@ class IntradayV3Engine:
 
         slope_tag = " [SLOPE]" if in_expiry_slope else ""
         if pending:
-            short_status = f"ARMED {pending['display_side']}{slope_tag}"
+            r_tag = " RETEST" if pending.get("is_retest") else ""
+            short_status = f"ARMED {pending['display_side']}{r_tag}{slope_tag}"
         elif not self.is_within_trade_window(idx, now_ist) and hhmm_now < (self.session_sched.get("mcx_start", MCX_START_TIME) if is_mcx else self.session_sched.get("nse_start", INDEX_START_TIME)):
             st_t = self.session_sched.get("mcx_start", MCX_START_TIME) if is_mcx else self.session_sched.get("nse_start", INDEX_START_TIME)
             short_status = f"OPENS {st_t}"
@@ -1984,61 +2113,86 @@ class IntradayV3Engine:
         step = cfg.get("step", 50)
         tick_sz = cfg.get("tick_size", 0.05)
 
-        offset = int(
+        base_offset = int(
             self.tuned_params.get("expiry_strike_offset", 1)
             if in_expiry_slope
             else self.tuned_params.get("strike_offset", 0)
         )
-        strike_shift = (offset * step) if setup["side"] == "CE" else (-offset * step)
-        target_strike = (round(spot_close / step) * step) + strike_shift
         opt_field = "call_options" if setup["side"] == "CE" else "put_options"
-
-        chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
-        if not chosen:
-            target_strike = round(spot_close / step) * step
-            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
-        if not chosen:
-            return
-
-        inst_key = chosen.get("instrument_key")
-        mkt = chosen.get("market_data", {})
-        greeks = chosen.get("option_greeks", {})
-        ltp = float(mkt.get("ltp", 0))
-
-        min_opt_premium = max(tick_sz * 20, round(spot_close * 0.00012, 2))
-        if ltp < min_opt_premium:
-            return
-
-        raw_delta = abs(float(greeks.get("delta", 0.0)))
+        spot_risk, spot_sl_equiv = self.compute_true_fractal_swing_sl(df, setup["side"], spot_close, atr14)
+        cap = self.get_active_capital()
+        max_idx_risk = float(self.tuned_params.get("index_max_risk_inr", round(cap * 0.05, 2)))
         min_req_delta = float(
             self.tuned_params.get("expiry_slope_min_delta", 0.30)
             if in_expiry_slope
             else self.tuned_params.get("min_option_delta", 0.45)
         )
-        if raw_delta > 0 and raw_delta < min_req_delta:
-            self.pending_setups[idx] = None
-            return
-
-        theta_val = abs(float(greeks.get("theta", 0.0)))
         max_theta_pct = float(self.tuned_params.get("max_theta_decay_pct", 8.0))
-        if theta_val > 0 and ((theta_val / 6.25) / max(ltp, 1.0)) * 100.0 > max_theta_pct:
+
+        # Smart Strike Selection with OTM Risk-Fit Fallback (tries primary strike, then 1-2 steps OTM if 1-lot risk > max_idx_risk)
+        selected_candidate = None
+        for extra_otm in (0, 1, 2):
+            eff_offset = base_offset + extra_otm
+            strike_shift = (eff_offset * step) if setup["side"] == "CE" else (-eff_offset * step)
+            cand_strike = (round(spot_close / step) * step) + strike_shift
+            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == cand_strike), None)
+            if not chosen:
+                continue
+
+            inst_key = chosen.get("instrument_key")
+            mkt = chosen.get("market_data", {})
+            greeks = chosen.get("option_greeks", {})
+            ltp = float(mkt.get("ltp", 0))
+            bid = float(mkt.get("bid_price", 0) or 0)
+            ask = float(mkt.get("ask_price", 0) or 0)
+
+            min_opt_premium = max(tick_sz * 20, round(spot_close * 0.00012, 2))
+            if ltp < min_opt_premium:
+                continue
+
+            # Bid-Ask Spread Filter
+            if bid > 0 and ask >= bid and ((ask - bid) / ltp * 100.0) > MAX_OPTION_SPREAD_PCT:
+                continue
+
+            raw_delta = abs(float(greeks.get("delta", 0.0)))
+            eff_min_delta = 0.32 if extra_otm > 0 else min_req_delta
+            if raw_delta > 0 and raw_delta < eff_min_delta:
+                continue
+
+            # Theta Burn vs Expected Directional Gain Filter
+            theta_val = abs(float(greeks.get("theta", 0.0)))
+            if theta_val > 0 and ((theta_val / 6.25) / max(ltp, 1.0)) * 100.0 > max_theta_pct:
+                continue
+
+            live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else eff_min_delta
+            raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.12), ltp * 0.35)
+            sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 4)
+            est_ch_1 = fetch_exact_trade_charges(inst_key, ltp, ltp, cfg["lot_size"], False).get("total", 65.0)
+            risk_1_lot = (sl_points * cfg["lot_size"]) + est_ch_1
+
+            if risk_1_lot <= max_idx_risk:
+                selected_candidate = {
+                    "strike": cand_strike,
+                    "inst_key": inst_key,
+                    "ltp": ltp,
+                    "live_delta": live_delta,
+                    "sl_points": sl_points,
+                    "risk_1_lot": risk_1_lot,
+                    "otm_fit": extra_otm > 0,
+                }
+                break
+
+        if not selected_candidate:
             self.pending_setups[idx] = None
             return
 
-        live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else min_req_delta
-
-        spot_risk, spot_sl_equiv = self.compute_true_fractal_swing_sl(df, setup["side"], spot_close, atr14)
-        raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.12), ltp * 0.35)
-        sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 4)
+        target_strike = selected_candidate["strike"]
+        inst_key = selected_candidate["inst_key"]
+        ltp = selected_candidate["ltp"]
+        live_delta = selected_candidate["live_delta"]
+        sl_points = selected_candidate["sl_points"]
+        risk_1_lot = selected_candidate["risk_1_lot"]
         sl_price = round_to_tick(ltp - sl_points, tick_sz)
-
-        cap = self.get_active_capital()
-        max_idx_risk = float(self.tuned_params.get("index_max_risk_inr", round(cap * 0.05, 2)))
-        est_ch_1 = fetch_exact_trade_charges(inst_key, ltp, ltp, cfg["lot_size"], False).get("total", 65.0)
-        risk_1_lot = (sl_points * cfg["lot_size"]) + est_ch_1
-        if risk_1_lot > max_idx_risk:
-            self.pending_setups[idx] = None
-            return
 
         gear = int(self.tuned_params.get("driver_gear", 3))
         eff_cap = cap * (0.65 if gear <= 2 else 1.0)
@@ -2055,7 +2209,7 @@ class IntradayV3Engine:
             self.trade_counter += 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else mem_tag
+            mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else ("OTM_RISK_FIT" if selected_candidate["otm_fit"] else mem_tag)
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "INDEX_OPT", "instrument_key": inst_key,
@@ -2171,7 +2325,6 @@ class IntradayV3Engine:
                 self.session_sched["is_holiday"] = True
                 self.session_sched["description"] = learned_reason
                 self.session_sched["nse_open"] = False
-                # On NSE holidays, MCX evening session still opens at 17:00 IST unless explicitly closed
                 self.session_sched["mcx_open"] = True
                 self.session_sched["mcx_start"] = "17:00"
 
@@ -2232,7 +2385,6 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
                 break
 
-            # Live fallback at 09:16 IST: if NIFTY has zero today candles on a non-Muhurat morning, switch to MCX Evening mode
             if not holiday_checked_0916 and self.session_sched["nse_open"] and not self.session_sched["is_muhurat"] and "09:16" <= hhmm <= "09:30":
                 holiday_checked_0916 = True
                 nifty_check_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
