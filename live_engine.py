@@ -26,7 +26,7 @@ except ImportError:
     HAS_MACRO_RADAR = False
 
 try:
-    from auto_tuner import get_market_closed_reason, detect_expiry_for_date
+    from auto_tuner import get_market_closed_reason, detect_expiry_for_date, record_learned_holiday
     HAS_AUTO_TUNER = True
 except ImportError:
     HAS_AUTO_TUNER = False
@@ -129,6 +129,38 @@ def is_scheduled_handover_window(now_ist: datetime) -> bool:
     """Covers Session 1->2 (14:35-15:05 IST) and Session 2->3 (20:30-21:05 IST) cron handovers cleanly."""
     hhmm = now_ist.strftime("%H:%M")
     return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "21:05")
+
+
+def is_overnight_dead_hours(now_ist: datetime) -> bool:
+    """Blocks delayed GitHub cron jobs that wake up between 23:20 IST and 07:30 IST."""
+    hhmm = now_ist.strftime("%H:%M")
+    return hhmm >= "23:20" or hhmm < "07:30"
+
+
+def check_upstox_exchange_holiday(now_ist: datetime) -> tuple[bool, str, bool]:
+    """
+    Queries official Upstox /v2/market/holidays/{date} API:
+    Returns (is_nse_closed, holiday_description, is_mcx_evening_open).
+    """
+    d_str = now_ist.strftime("%Y-%m-%d")
+    try:
+        res = requests.get(
+            f"https://api.upstox.com/v2/market/holidays/{d_str}",
+            headers=upstox_headers(),
+            timeout=8,
+        ).json()
+        data = res.get("data", [])
+        if isinstance(data, list) and data:
+            item = data[0]
+            closed_ex = [str(x).upper() for x in item.get("closed_exchanges", [])]
+            open_ex = item.get("open_exchanges", [])
+            desc = str(item.get("description", "EXCHANGE HOLIDAY")).strip()
+            nse_closed = ("NSE" in closed_ex) or ("NFO" in closed_ex)
+            mcx_evening_open = any(str(o.get("exchange", "")).upper() == "MCX" for o in open_ex if isinstance(o, dict))
+            return nse_closed, desc, mcx_evening_open
+    except Exception as e:
+        log.warning(f"Holiday API check skipped: {e}")
+    return False, "", False
 
 
 def push_trade_to_google_sheet(trade_row: dict):
@@ -787,6 +819,7 @@ class IntradayV3Engine:
         self.subscribed_keys = set()
         self.bot_status_text = "BOT LIVE"
         self.stop_requested = False
+        self.nse_holiday_today = False
         self.ai_agent = TickByTickAITradingAgent(self) if HAS_AI_AGENT else None
 
         init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
@@ -2013,11 +2046,31 @@ class IntradayV3Engine:
             sys.exit(1)
 
         now_ist = datetime.now(IST)
+
+        # 1. Dead-Hours Guard: immediately exit if a delayed GitHub cron starts between 23:20 and 07:30 IST
+        if is_overnight_dead_hours(now_ist):
+            log.info(f"Outside market hours ({now_ist.strftime('%H:%M')} IST). Standing down cleanly.")
+            return
+
+        # 2. Weekend + Official Upstox Exchange Holiday Check
         live_nse_status = check_live_exchange_status("NSE") if now_ist.weekday() < 5 else ""
         if HAS_AUTO_TUNER:
             closed_reason = get_market_closed_reason(now_ist, live_nse_status)
         else:
             closed_reason = "SATURDAY (WEEKEND)" if now_ist.weekday() == 5 else ("SUNDAY (WEEKEND)" if now_ist.weekday() == 6 else "")
+
+        mcx_evening_only = False
+        if not closed_reason and now_ist.weekday() < 5:
+            is_hol, hol_desc, mcx_eve_open = check_upstox_exchange_holiday(now_ist)
+            if is_hol:
+                if HAS_AUTO_TUNER:
+                    record_learned_holiday(now_ist.strftime("%Y-%m-%d"))
+                if mcx_eve_open:
+                    self.nse_holiday_today = True
+                    mcx_evening_only = True
+                    log.info(f"[HOLIDAY DETECTED] {hol_desc}: NSE/BSE Closed today; MCX Evening Session (17:00-23:15 IST) active.")
+                else:
+                    closed_reason = f"HOLIDAY ({hol_desc})"
 
         if closed_reason:
             self.bot_status_text = f"MARKET CLOSED ({closed_reason})"
@@ -2039,13 +2092,15 @@ class IntradayV3Engine:
         self.load_active_positions_state()
         self.bot_status_text = "BOT LIVE"
         session_start_ts = time.time()
+        holiday_checked_0916 = False
 
+        mode_note = "MCX Evening Session Only (NSE Holiday)" if mcx_evening_only else "5m IDX / 15m MCX"
         notify(
             f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
-            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>  |  📊 <code>5m IDX / 15m MCX</code>"
+            f"🕒 <b>Session:</b> <code>09:15 AM – 11:20 PM IST</code>  |  📊 <code>{mode_note}</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
@@ -2062,6 +2117,25 @@ class IntradayV3Engine:
             if (time.time() - session_start_ts) >= SESSION_MAX_RUNTIME_SEC:
                 self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
                 break
+
+            # Live fallback check at 09:16 IST: if NIFTY has zero today candles, auto-mark NSE Holiday
+            if not holiday_checked_0916 and not self.nse_holiday_today and "09:16" <= hhmm <= "09:30":
+                holiday_checked_0916 = True
+                nifty_check_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
+                today_s = now_ist.strftime("%Y-%m-%d")
+                has_today_candle = (
+                    not nifty_check_df.empty
+                    and str(nifty_check_df["timestamp"].iloc[-1])[:10] == today_s
+                )
+                if not has_today_candle:
+                    self.nse_holiday_today = True
+                    if HAS_AUTO_TUNER:
+                        record_learned_holiday(today_s)
+                    notify(
+                        f"🟡 <b>NSE/BSE HOLIDAY DETECTED ({today_s})</b>\n"
+                        f"────────────────────────────\n"
+                        f"📉 <i>No NSE live candles after 09:15 IST. Index trading disabled; MCX evening session monitored.</i>"
+                    )
 
             self.refresh_live_macro_news(force=False)
             if self.ai_agent:
@@ -2082,13 +2156,14 @@ class IntradayV3Engine:
             else:
                 self.bot_status_text = "BOT LIVE"
                 for idx, cfg in INDICES.items():
-                    if cfg["type"] == "INDEX_OPT" and hhmm > "15:20":
+                    if cfg["type"] == "INDEX_OPT" and (hhmm > "15:20" or self.nse_holiday_today):
                         if idx not in self.last_summaries:
                             spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
                             if not spot_df.empty:
                                 self.last_summaries[idx] = {
                                     "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
-                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0, "short_status": "CLOSED",
+                                    "fuel": 0, "pcr": 0.0, "cum_pcr_diff": 0.0,
+                                    "short_status": "HOLIDAY" if self.nse_holiday_today else "CLOSED",
                                 }
                         continue
                     res = self.evaluate_instrument(idx, cfg, now_ist)
