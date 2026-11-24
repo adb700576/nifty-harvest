@@ -74,6 +74,8 @@ MCX_EXIT_TIME = "23:15"
 GANN_ZONE_ATR_MULT = 0.40
 PIVOT_BUFFER_ATR_MULT = 0.12
 SETUP_EXPIRY_SEC = 900
+REENTRY_COOLDOWN_SEC = 900          # Minimum 15 minutes cooldown after closing a trade on same symbol
+MAX_ACTIVE_TRADES_TOTAL = 1         # Strict 1 open trade at a time across all scripts
 DASHBOARD_PULSE_SEC = 5.0
 MACRO_REFRESH_SEC = 180
 
@@ -157,12 +159,6 @@ def ms_to_ist_hhmm(epoch_ms) -> str:
 
 
 def inspect_special_session_schedule(now_ist: datetime) -> dict:
-    """
-    Dynamically inspects Upstox /v2/market/holidays/{date} & live exchange status for:
-    1. Full Holiday (both NSE & MCX closed)
-    2. Holiday with Evening MCX Session (e.g., Gurunanak Jayanti: MCX opens 17:00-23:15 IST)
-    3. Muhurat Trading Session (Special evening NSE/NFO + MCX window)
-    """
     d_str = now_ist.strftime("%Y-%m-%d")
     info = {
         "is_holiday": False,
@@ -873,13 +869,15 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (4-GATE HYBRID + VWAP/EMA + SMART OTM + GSHEET)
+# 6. SELF-MATURING V3 ENGINE (ANTI-IMMEDIATE-REENTRY + 4-GATE HYBRID)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
         self.expiries = {}
         self.fut_contracts = {}
         self.pending_setups = {idx: None for idx in INDICES}
+        self.last_exit_ts = {idx: 0.0 for idx in INDICES}
+        self.last_exit_candle_ts = {idx: "" for idx in INDICES}
         self.open_pcr = {idx: None for idx in INDICES}
         self.pcr_history = {idx: deque(maxlen=5) for idx in INDICES}
         self.oi_history = {idx: None for idx in INDICES}
@@ -1210,6 +1208,13 @@ class IntradayV3Engine:
                         self.trade_counter = max(self.trade_counter, t_no)
             self.closed_trades.sort(key=lambda x: x["trade_no"])
             if self.closed_trades:
+                # Seed cooldown from last closed trade on restart so cron handover never double-enters
+                last_t = self.closed_trades[-1]
+                try:
+                    ex_dt = datetime.strptime(f"{today_str} {last_t['exit_time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+                    self.last_exit_ts[last_t["symbol"]] = ex_dt.timestamp()
+                except Exception:
+                    pass
                 log.info(f"[STATE LOADED] {len(self.closed_trades)} today's trade(s) loaded | Net PnL: ₹{self.day_pnl:+.2f}")
         except Exception:
             pass
@@ -1631,6 +1636,13 @@ class IntradayV3Engine:
         if not pos:
             return
 
+        # Record strict cooldown and candle timestamp so same script cannot immediately re-enter
+        self.last_exit_ts[idx] = time.time()
+        self.pending_setups[idx] = None
+        df_curr = self.latest_dfs.get(idx)
+        if df_curr is not None and not df_curr.empty:
+            self.last_exit_candle_ts[idx] = str(df_curr["timestamp"].iloc[-1])
+
         self.unsubscribe_tick_instrument(pos["instrument_key"])
         self.save_active_positions_state()
 
@@ -1780,6 +1792,7 @@ class IntradayV3Engine:
             self.close_position_now(idx, ltp, "FUEL_EXHAUSTED", now_ist)
             return
 
+        # Only trigger NO_MOMENTUM_EXIT if trade has NOT moved meaningfully in profit (curr_r < 0.30R)
         now_ts = time.time()
         ltp_hist = pos.setdefault("ltp_window", deque())
         ltp_hist.append((now_ts, ltp))
@@ -1793,7 +1806,7 @@ class IntradayV3Engine:
             prices_in_win = [p for _, p in ltp_hist]
             win_range = max(prices_in_win) - min(prices_in_win)
             flat_threshold = max(r_unit * 0.50, entry * (0.002 if is_mcx else 0.03))
-            if win_range <= flat_threshold and curr_r < STAGE1_BE_R:
+            if win_range <= flat_threshold and curr_r < 0.30:
                 self.close_position_now(idx, ltp, "NO_MOMENTUM_EXIT", now_ist)
 
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
@@ -1813,6 +1826,7 @@ class IntradayV3Engine:
 
         curr = df.iloc[-1]
         prev = df.iloc[-2] if len(df) >= 2 else curr
+        curr_candle_ts = str(curr["timestamp"])
         spot_close = float(curr["close"])
         ref_close = float(prev["close"]) if len(df) >= 2 else float(curr["open"])
         price_change = round(spot_close - ref_close, 2)
@@ -1861,19 +1875,49 @@ class IntradayV3Engine:
             self.pending_setups[idx] = None
             self.evaluate_active_candle_exits(idx, df, spot_close, price_change, fuel, atr14, now_ist, sup, res, d_pe, d_ce)
 
-        with self.pos_lock:
-            pos = self.active_positions.get(idx)
+            with self.pos_lock:
+                pos = self.active_positions.get(idx)
 
-        if pos:
-            ltp_now = pos.get("last_ltp", spot_close if is_mcx else pos["entry_price"])
-            is_short = pos["tx_side"] == "SELL"
-            est_ch = float(pos.get("est_charges", 180.0 if is_mcx else 65.0))
-            pos_mtm = ((pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]) - est_ch
+            if pos:
+                ltp_now = pos.get("last_ltp", spot_close if is_mcx else pos["entry_price"])
+                is_short = pos["tx_side"] == "SELL"
+                est_ch = float(pos.get("est_charges", 180.0 if is_mcx else 65.0))
+                pos_mtm = ((pos["entry_price"] - ltp_now) * pos["qty"] if is_short else (ltp_now - pos["entry_price"]) * pos["qty"]) - est_ch
+                return {
+                    "idx": idx, "is_mcx": is_mcx,
+                    "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
+                    "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
+                    "short_status": f"ACTIVE #{pos['trade_no']} (₹{pos_mtm:+.0f})",
+                }
+            # Position was just closed in this cycle -> return immediately so it NEVER re-enters in the same cycle!
             return {
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
                 "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
-                "short_status": f"ACTIVE #{pos['trade_no']} (₹{pos_mtm:+.0f})",
+                "short_status": "COOLDOWN (15m)",
+            }
+
+        # Enforce Cooldown & Single Active Position Guard before evaluating any new entry
+        sec_since_exit = time.time() - self.last_exit_ts.get(idx, 0.0)
+        same_candle_as_exit = (curr_candle_ts == self.last_exit_candle_ts.get(idx, ""))
+        if sec_since_exit < REENTRY_COOLDOWN_SEC or same_candle_as_exit:
+            rem_min = max(1, int(math.ceil((REENTRY_COOLDOWN_SEC - sec_since_exit) / 60.0)))
+            self.pending_setups[idx] = None
+            return {
+                "idx": idx, "is_mcx": is_mcx,
+                "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
+                "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
+                "short_status": f"COOLDOWN ({rem_min}m)",
+            }
+
+        with self.pos_lock:
+            total_open_trades = len(self.active_positions)
+        if total_open_trades >= MAX_ACTIVE_TRADES_TOTAL:
+            return {
+                "idx": idx, "is_mcx": is_mcx,
+                "spot": round(spot_close, 2) if spot_close < 1000 else int(round(spot_close)),
+                "fuel": int(round(fuel)), "pcr": pcr, "cum_pcr_diff": cum_pcr_diff,
+                "short_status": f"Gann {int(sup)}-{int(res)}",
             }
 
         hhmm_now = now_ist.strftime("%H:%M")
@@ -2011,7 +2055,6 @@ class IntradayV3Engine:
             if (regime_info["is_sideways"] or self.macro_context.get("event_caution", False)) and not in_expiry_slope and not immediate_fasttrack:
                 req_fuel += 3.0
 
-            # Retest Confirmation vs Direct Confirmation
             if pending.get("is_retest"):
                 rlvl = float(pending["retest_level"])
                 tol = RETEST_TOLERANCE_ATR * atr14
@@ -2054,6 +2097,10 @@ class IntradayV3Engine:
         }
 
     def try_execute_mcx_fut_entry(self, idx, cfg, setup, df, fut_price, atr14, now_ist, mem_tag, trade_mode):
+        with self.pos_lock:
+            if len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+                return
+
         inst_key = cfg["spot_key"]
         lot_size = cfg["lot_size"]
         tick_sz = cfg.get("tick_size", 0.05)
@@ -2108,6 +2155,10 @@ class IntradayV3Engine:
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def try_execute_option_entry(self, idx, cfg, setup, df, spot_close, chain, atr14, now_ist, is_today_exp, mem_tag, trade_mode, in_expiry_slope=False):
+        with self.pos_lock:
+            if len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+                return
+
         if not chain:
             return
         step = cfg.get("step", 50)
@@ -2129,7 +2180,6 @@ class IntradayV3Engine:
         )
         max_theta_pct = float(self.tuned_params.get("max_theta_decay_pct", 8.0))
 
-        # Smart Strike Selection with OTM Risk-Fit Fallback (tries primary strike, then 1-2 steps OTM if 1-lot risk > max_idx_risk)
         selected_candidate = None
         for extra_otm in (0, 1, 2):
             eff_offset = base_offset + extra_otm
@@ -2150,7 +2200,6 @@ class IntradayV3Engine:
             if ltp < min_opt_premium:
                 continue
 
-            # Bid-Ask Spread Filter
             if bid > 0 and ask >= bid and ((ask - bid) / ltp * 100.0) > MAX_OPTION_SPREAD_PCT:
                 continue
 
@@ -2159,7 +2208,6 @@ class IntradayV3Engine:
             if raw_delta > 0 and raw_delta < eff_min_delta:
                 continue
 
-            # Theta Burn vs Expected Directional Gain Filter
             theta_val = abs(float(greeks.get("theta", 0.0)))
             if theta_val > 0 and ((theta_val / 6.25) / max(ltp, 1.0)) * 100.0 > max_theta_pct:
                 continue
@@ -2299,12 +2347,10 @@ class IntradayV3Engine:
 
         now_ist = datetime.now(IST)
 
-        # 1. Dead-Hours Guard: immediately exit if a delayed GitHub cron starts between 23:20 and 07:30 IST
         if is_overnight_dead_hours(now_ist):
             log.info(f"Outside market hours ({now_ist.strftime('%H:%M')} IST). Standing down cleanly.")
             return
 
-        # 2. Weekend Guard (Saturday / Sunday — zero trading on all exchanges)
         if now_ist.weekday() >= 5:
             wk_label = "SATURDAY (WEEKEND)" if now_ist.weekday() == 5 else "SUNDAY (WEEKEND)"
             self.bot_status_text = f"MARKET CLOSED ({wk_label})"
@@ -2316,7 +2362,6 @@ class IntradayV3Engine:
             )
             return
 
-        # 3. Dynamic Holiday + Evening Commodity (17:00 IST) + Muhurat Trading Schedule Inspector
         self.session_sched = inspect_special_session_schedule(now_ist)
         live_nse_status = check_live_exchange_status("NSE")
         if HAS_AUTO_TUNER:
