@@ -99,6 +99,7 @@ PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
 MACRO_FILE = "live_journal/macro_context.json"
 DASHBOARD_STATE_FILE = "live_journal/dashboard_state.json"
+LOCK_FILE = "live_journal/engine.lock"
 
 JOURNAL_FIELDNAMES = [
     "trade_no", "date", "entry_time", "exit_time", "symbol", "contract", "side",
@@ -117,8 +118,8 @@ FUEL_FINISH_THRESHOLD = 18.0
 FLAT_LTP_NORMAL_SEC = 900
 FLAT_LTP_EXPIRY_SEC = 600
 
-DAILY_PROFIT_LOCK_PCT = 1.00
-DAILY_LOSS_LOCK_PCT = -0.15
+DAILY_PROFIT_LOCK_PCT = 0.05        # 5% Net Profit (after brokerage & taxes) -> ₹1,250 (Index) / ₹7,500 (MCX)
+DAILY_LOSS_LOCK_PCT = -0.15         # -15% Max Daily Loss
 MAX_CONSECUTIVE_LOSSES = 3
 
 INDICES = {
@@ -134,7 +135,7 @@ INDICES = {
     "COPPER":     {"type": "MCX_FUT", "tf_min": 5},
 }
 
-# Target MCX Mini symbols (lot_size, tick_size & expiry are fetched 100% dynamically from Upstox BOD Master)
+# Target MCX Mini symbols (lot_size, tick_size & expiry are fetched dynamically from Upstox BOD Master)
 MCX_MINI_SYMBOLS = {
     "CRUDEOIL":   "CRUDEOILM",
     "NATURALGAS": "NATGASMINI",
@@ -363,13 +364,12 @@ def restore_journal_from_google_sheet():
 
 
 # ==============================================================================
-# 2. TELEGRAM UI (SINGLE PINNED MESSAGE + SILENT NIGHT MODE) & AUTO-CHARGES
+# 2. TELEGRAM UI (CLASSIC CLEAN LIST FORMAT + SILENT NIGHT MODE) & CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
     log.info(f"[MIRROR] {' | '.join(clean_lines)}")
 
-    # Do not disturb sleep between 23:36 IST and 08:30 IST
     if is_overnight_dead_hours(datetime.now(IST)):
         return
 
@@ -469,15 +469,15 @@ def check_live_exchange_status(exchange: str = "NSE") -> str:
         return ""
 
 
-def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, qty: int, is_mcx: bool) -> dict:
-    if buy_price > 0 and sell_price > 0 and qty > 0:
+def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, eff_qty: int, is_mcx: bool) -> dict:
+    if buy_price > 0 and sell_price > 0 and eff_qty > 0:
         if HAS_UPSTOX_SDK:
             try:
                 cfg = upstox_client.Configuration()
                 cfg.access_token = UPSTOX_ACCESS_TOKEN
                 charge_api = upstox_client.ChargeApi(upstox_client.ApiClient(cfg))
-                buy_resp = charge_api.get_brokerage(instrument_key, int(qty), "I", "BUY", round(float(buy_price), 2), "2.0")
-                sell_resp = charge_api.get_brokerage(instrument_key, int(qty), "I", "SELL", round(float(sell_price), 2), "2.0")
+                buy_resp = charge_api.get_brokerage(instrument_key, int(eff_qty), "I", "BUY", round(float(buy_price), 2), "2.0")
+                sell_resp = charge_api.get_brokerage(instrument_key, int(eff_qty), "I", "SELL", round(float(sell_price), 2), "2.0")
                 b_brk = float(buy_resp.data.charges.brokerage or 0.0)
                 s_brk = float(sell_resp.data.charges.brokerage or 0.0)
                 b_tot = float(buy_resp.data.charges.total or 0.0)
@@ -494,7 +494,7 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
         for tx_type, price in (("BUY", buy_price), ("SELL", sell_price)):
             params = {
                 "instrument_token": instrument_key,
-                "quantity": int(qty),
+                "quantity": int(eff_qty),
                 "product": "I",
                 "transaction_type": tx_type,
                 "price": round(float(price), 2),
@@ -517,16 +517,16 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
             brk = round(brk_sum, 2)
             return {"brokerage": brk, "taxes_other": round(tot - brk, 2), "total": tot}
 
-    turnover = (buy_price + sell_price) * qty
+    turnover = (buy_price + sell_price) * eff_qty
     brokerage = 40.0
     if is_mcx:
-        stt_ctt = (sell_price * qty) * 0.0001
+        stt_ctt = (sell_price * eff_qty) * 0.0001
         txn_charges = turnover * 0.000021
-        stamp_duty = (buy_price * qty) * 0.00002
+        stamp_duty = (buy_price * eff_qty) * 0.00002
     else:
-        stt_ctt = (sell_price * qty) * 0.000625
+        stt_ctt = (sell_price * eff_qty) * 0.000625
         txn_charges = turnover * 0.0005
-        stamp_duty = (buy_price * qty) * 0.00003
+        stamp_duty = (buy_price * eff_qty) * 0.00003
     sebi_charges = turnover * 0.000001
     gst = (brokerage + txn_charges + sebi_charges) * 0.18
     taxes_other = round(stt_ctt + txn_charges + stamp_duty + sebi_charges + gst, 2)
@@ -550,7 +550,7 @@ def record_trade_journal(row: dict):
 
 
 # ==============================================================================
-# 3. UPSTOX V3 API HELPERS (100% DYNAMIC BOD MCX MASTER + 7-DAY AUTO-ROLLOVER)
+# 3. UPSTOX V3 API HELPERS (DYNAMIC BOD MCX MASTER + 7-DAY AUTO-ROLLOVER)
 # ==============================================================================
 def load_upstox_mcx_master() -> list:
     global _MCX_BOD_CACHE
@@ -589,7 +589,6 @@ def get_active_future_contract(idx: str) -> dict:
 
     all_candidates = []
 
-    # 1. Primary: Official Upstox BOD MCX.json.gz (exact lot_size, minimum_lot & price_quote_unit)
     if is_mcx:
         for item in load_upstox_mcx_master():
             name_u = str(item.get("name", "")).upper()
@@ -598,7 +597,6 @@ def get_active_future_contract(idx: str) -> dict:
             if asset_u == target_sym or name_u == target_sym or tsym_u.startswith(f"{target_sym} FUT"):
                 all_candidates.append(item)
 
-    # 2. Secondary: Upstox Instrument Search API
     if not all_candidates:
         exchange = "BSE" if idx == "SENSEX" else ("MCX" if is_mcx else "NSE")
         url = "https://api.upstox.com/v2/instruments/search"
@@ -639,7 +637,6 @@ def get_active_future_contract(idx: str) -> dict:
     min_lot = int(top.get("minimum_lot", 1) or 1)
     order_lot_size = raw_lot if raw_lot > 1 else (min_lot if min_lot > 1 else 1)
 
-    # Derive exact 1-point P&L multiplier from price_quote_unit / contract quote standard (GOLDM: 100g / 10g quote = ₹10/pt)
     quote_unit = str(top.get("price_quote_unit", "")).upper()
     tsym_top = str(top.get("trading_symbol", "")).upper()
     quote_denom = 1
@@ -1028,8 +1025,8 @@ class IntradayV3Engine:
         }
         self.ai_agent = TickByTickAITradingAgent(self) if HAS_AI_AGENT else None
 
-        init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
-        init_mcx_cap = float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000")
+        init_cap = max(float(os.getenv("CAPITAL_PER_TRADE") or "25000"), 25000.0)
+        init_mcx_cap = max(float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000"), 150000.0)
         self.tuned_params = {
             "brain_version": "v1.0",
             "driver_gear": 3,
@@ -1080,11 +1077,48 @@ class IntradayV3Engine:
             "summary": "Normal Market",
         }
 
+    def acquire_single_instance_lock(self) -> bool:
+        os.makedirs("live_journal", exist_ok=True)
+        curr_run_id = os.getenv("GITHUB_RUN_ID", str(os.getpid()))
+        curr_pid = os.getpid()
+
+        if os.path.isfile(LOCK_FILE):
+            try:
+                with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                old_pid = int(st.get("pid", 0))
+                old_ts = float(st.get("ts", 0))
+                if old_pid > 0 and old_pid != curr_pid and (time.time() - old_ts) < 21600:
+                    try:
+                        os.kill(old_pid, 0)
+                        log.warning(f"[OVERLAP GUARD] Another engine instance (PID {old_pid}) is already running. Exiting cleanly.")
+                        return False
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            with open(LOCK_FILE, "w", encoding="utf-8") as f:
+                json.dump({"pid": curr_pid, "run_id": curr_run_id, "ts": time.time()}, f)
+        except Exception:
+            pass
+        return True
+
+    def release_single_instance_lock(self):
+        try:
+            if os.path.isfile(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
+
     def get_active_capital(self) -> float:
-        return float(os.getenv("CAPITAL_PER_TRADE") or self.tuned_params.get("capital_per_trade", 25000.0))
+        val = float(os.getenv("CAPITAL_PER_TRADE") or self.tuned_params.get("capital_per_trade", 25000.0))
+        return max(val, 25000.0)
 
     def get_active_mcx_capital(self) -> float:
-        return float(os.getenv("MCX_CAPITAL_PER_TRADE") or self.tuned_params.get("mcx_capital_per_trade", 150000.0))
+        val = float(os.getenv("MCX_CAPITAL_PER_TRADE") or self.tuned_params.get("mcx_capital_per_trade", 150000.0))
+        return max(val, 150000.0)
 
     def load_self_tuned_intelligence(self):
         if os.path.isfile(PARAMS_FILE):
@@ -1093,6 +1127,8 @@ class IntradayV3Engine:
                     loaded = json.load(f)
                 self.tuned_params.update(loaded)
                 self.tuned_params["morning_wait_until"] = "09:15"
+                self.tuned_params["capital_per_trade"] = self.get_active_capital()
+                self.tuned_params["mcx_capital_per_trade"] = self.get_active_mcx_capital()
                 if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
                     self.tuned_params["min_fuel_score"] = 45.0
                 if float(self.tuned_params.get("mcx_evening_fuel_score", 44.0)) > 46.0:
@@ -1233,6 +1269,10 @@ class IntradayV3Engine:
                     entry_time_str = pos.get("entry_time", "09:15:00")
                     tf_m = INDICES.get(idx, {}).get("tf_min", 5)
 
+                    if str(pos.get("strike", "")).upper().startswith("GOLDM") and int(pos.get("qty", 1)) == 100:
+                        pos["pnl_units"] = 10
+                        pos["est_charges"] = fetch_exact_trade_charges(inst_key, entry, entry, 10, True).get("total", 215.0)
+
                     inst_df = fetch_intraday_candles(inst_key, tf_m)
                     if not inst_df.empty:
                         inst_df["hhmmss"] = inst_df["timestamp"].dt.strftime("%H:%M:%S")
@@ -1283,7 +1323,7 @@ class IntradayV3Engine:
                             pos["trail_stage"] = "COST-TO-COST"
 
                     self.active_positions[idx] = pos
-                    self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)))
+                    self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)), len(self.closed_trades))
 
                     if (not is_short and curr_ltp <= pos["sl"]) or (is_short and curr_ltp >= pos["sl"]):
                         reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
@@ -1331,6 +1371,7 @@ class IntradayV3Engine:
                         self.day_pnl = round(self.day_pnl + pnl_val, 2)
                         self.trade_counter = max(self.trade_counter, t_no)
             self.closed_trades.sort(key=lambda x: x["trade_no"])
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades))
             if self.closed_trades:
                 for t in self.closed_trades:
                     try:
@@ -1639,8 +1680,13 @@ class IntradayV3Engine:
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
             now_ist = datetime.now(IST)
-            live_mtm = self.compute_live_mtm()
-            net_pnl = round(self.day_pnl + live_mtm, 2)
+            live_gross_mtm = self.compute_live_mtm()
+            with self.pos_lock:
+                open_charges = sum(float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0)) for p in self.active_positions.values())
+                active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
+
+            live_net_mtm = round(live_gross_mtm - open_charges, 2) if active_snap else 0.0
+            net_pnl = round(self.day_pnl + live_net_mtm, 2)
             mode_badge = "<code>PAPER</code>" if PAPER_MODE else "<code>LIVE</code>"
             gear_badge = f"<code>G{self.tuned_params.get('driver_gear', 3)}</code>"
             net_icon = "🟢" if net_pnl >= 0 else "🔴"
@@ -1649,7 +1695,7 @@ class IntradayV3Engine:
             if "CLOSED" in self.bot_status_text or "STOPPED" in self.bot_status_text:
                 status_header = "🔴 <b>MARKET CLOSED</b>"
             elif "PAUSED" in self.bot_status_text:
-                status_header = "🟡 <b>BOT PAUSED</b>"
+                status_header = f"🟡 <b>{self.bot_status_text}</b>"
             elif "STANDBY" in self.bot_status_text:
                 status_header = f"🟠 <b>{self.bot_status_text}</b>"
             else:
@@ -1665,12 +1711,9 @@ class IntradayV3Engine:
                 f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} {gear_badge}",
                 f"────────────────────────────",
                 f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
-                f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
+                f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_net_mtm:+,.2f}</b>",
                 f"• Trades: <b>{tot_closed}</b> ({total_wins}W / {total_losses}L)  |  Win Rate: <b>{day_wr}%</b>",
             ]
-
-            with self.pos_lock:
-                active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
 
             if active_snap:
                 lines.append(f"\n🔥 <b>ACTIVE POSITIONS ({len(active_snap)})</b>")
@@ -1736,7 +1779,7 @@ class IntradayV3Engine:
                         lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
 
             lines.append("\n📊 <b>PERFORMANCE SUMMARY (NET ₹)</b>")
-            lines.extend(self.get_performance_summary_lines(now_ist, live_mtm))
+            lines.extend(self.get_performance_summary_lines(now_ist, live_net_mtm))
 
             self.dashboard_msg_id = upsert_telegram_dashboard("\n".join(lines), self.dashboard_msg_id)
 
@@ -1799,7 +1842,7 @@ class IntradayV3Engine:
 
         buy_px = ltp if is_short else pos["entry_price"]
         sell_px = pos["entry_price"] if is_short else ltp
-        ch_info = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, pos["qty"], is_mcx)
+        ch_info = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, int(eff_units), is_mcx)
         net_pnl = round(gross_pnl - ch_info["total"], 2)
 
         self.day_pnl = round(self.day_pnl + net_pnl, 2)
@@ -2320,7 +2363,7 @@ class IntradayV3Engine:
 
         mcx_cap = self.get_active_mcx_capital()
         max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.025, 2)))
-        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, lot_size, True).get("total", 180.0)
+        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
         risk_1_lot = (sl_points * pnl_mult) + est_ch
         if risk_1_lot > max_risk_cap:
             self.pending_setups[idx] = None
@@ -2333,7 +2376,7 @@ class IntradayV3Engine:
         qty = min(lots * lot_size, cfg["freeze_qty"])
         eff_lots = max(1, qty // max(lot_size, 1))
         pnl_units = eff_lots * pnl_mult
-        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, True).get("total", 180.0)
+        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_units, True).get("total", 180.0)
 
         sl_price = round_to_tick((ltp - sl_points) if tx_side == "BUY" else (ltp + sl_points), tick_sz)
 
@@ -2342,7 +2385,7 @@ class IntradayV3Engine:
             fill = order_res["fill_price"]
             sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
             now_ts = time.time()
-            self.trade_counter += 1
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
             with self.pos_lock:
@@ -2465,7 +2508,7 @@ class IntradayV3Engine:
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
             now_ts = time.time()
-            self.trade_counter += 1
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
             mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else ("OTM_RISK_FIT" if selected_candidate["otm_fit"] else mem_tag)
@@ -2551,16 +2594,21 @@ class IntradayV3Engine:
                 f"────────────────────────────\n"
                 f"💼 <b>Day Net P&amp;L:</b> <b>₹{self.day_pnl:+,.2f}</b>  |  <b>Trades:</b> {len(self.closed_trades)}"
             )
+        self.release_single_instance_lock()
 
     def run(self):
         if not UPSTOX_ACCESS_TOKEN:
             log.error("UPSTOX_ACCESS_TOKEN missing! Exiting.")
             sys.exit(1)
 
+        if not self.acquire_single_instance_lock():
+            return
+
         now_ist = datetime.now(IST)
 
         if is_overnight_dead_hours(now_ist):
             log.info(f"Outside market hours ({now_ist.strftime('%H:%M')} IST). Standing down cleanly.")
+            self.release_single_instance_lock()
             return
 
         if now_ist.weekday() >= 5:
@@ -2572,6 +2620,7 @@ class IntradayV3Engine:
                 f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
                 f"💤 <i>No live trading session today. Engine standing down cleanly.</i>"
             )
+            self.release_single_instance_lock()
             return
 
         self.load_self_tuned_intelligence()
@@ -2591,7 +2640,6 @@ class IntradayV3Engine:
         self.session_sched = inspect_special_session_schedule(now_ist)
         live_nse_status = check_live_exchange_status("NSE")
 
-        # Verify against live NIFTY candles so stale learned_holidays never override an active market
         nifty_live_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
         nse_has_live_candles = (
             not nifty_live_df.empty
@@ -2620,6 +2668,7 @@ class IntradayV3Engine:
                     f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
                     f"💤 <i>Both NSE/BSE and MCX closed today. Standing down cleanly.</i>"
                 )
+                self.release_single_instance_lock()
                 return
         elif nse_has_live_candles:
             self.session_sched["is_holiday"] = False
@@ -2700,19 +2749,61 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
-            cap = self.get_active_capital()
-            max_profit = cap * DAILY_PROFIT_LOCK_PCT
-            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
-            risk_locked = (self.day_pnl >= max_profit or self.day_pnl <= max_loss or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES)
+            idx_cap = self.get_active_capital()
+            mcx_cap = self.get_active_mcx_capital()
 
-            if risk_locked:
-                self.bot_status_text = "BOT PAUSED"
-            elif not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
-            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
+            has_mcx_activity = any(t.get("symbol") in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER") for t in self.closed_trades) or any(
+                p.get("type") == "MCX_FUT" for p in self.active_positions.values()
+            )
+            active_target_cap = mcx_cap if has_mcx_activity else idx_cap
+            target_net_profit = round(active_target_cap * DAILY_PROFIT_LOCK_PCT, 2)
+            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(idx_cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
+
+            live_gross_mtm = self.compute_live_mtm()
+            with self.pos_lock:
+                open_charges = sum(float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0)) for p in self.active_positions.values())
+            live_net_mtm = round(live_gross_mtm - open_charges, 2) if self.active_positions else 0.0
+            total_net_day_pnl = round(self.day_pnl + live_net_mtm, 2)
+
+            profit_goal_hit = (self.day_pnl >= target_net_profit) or (total_net_day_pnl >= target_net_profit)
+
+            if profit_goal_hit and self.active_positions:
+                with self.pos_lock:
+                    needed_from_open = max(0.0, target_net_profit - self.day_pnl)
+                    per_pos_floor_net = needed_from_open / max(len(self.active_positions), 1)
+                    for p_idx, pos in self.active_positions.items():
+                        is_short = pos["tx_side"] == "SELL"
+                        eff_units = max(int(pos.get("pnl_units", pos["qty"])), 1)
+                        est_ch = float(pos.get("est_charges", 180.0 if pos["type"] == "MCX_FUT" else 65.0))
+                        tick_sz = float(pos.get("tick_size", 0.05))
+                        req_pts = (per_pos_floor_net + est_ch) / eff_units
+                        floor_sl = round_to_tick((pos["entry_price"] - req_pts) if is_short else (pos["entry_price"] + req_pts), tick_sz)
+                        ltp_now = float(pos.get("last_ltp", pos["entry_price"]))
+                        if is_short and floor_sl < pos["sl"] and floor_sl > ltp_now + tick_sz:
+                            pos["sl"] = floor_sl
+                            pos["trail_stage"] = "5% PROFIT FLOOR"
+                        elif not is_short and floor_sl > pos["sl"] and floor_sl < ltp_now - tick_sz:
+                            pos["sl"] = floor_sl
+                            pos["trail_stage"] = "5% PROFIT FLOOR"
+                self.save_active_positions_state()
+
+            if profit_goal_hit:
+                risk_locked = True
+                self.bot_status_text = f"PAUSED (5% TARGET ₹{target_net_profit:,.0f} HIT)"
+            elif self.day_pnl <= max_loss:
+                risk_locked = True
+                self.bot_status_text = "PAUSED (DAILY LOSS CAP)"
+            elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                risk_locked = True
+                self.bot_status_text = "PAUSED (3 LOSSES)"
             else:
-                self.bot_status_text = "BOT LIVE"
+                risk_locked = False
+                if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                    self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
+                elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                    self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
+                else:
+                    self.bot_status_text = "BOT LIVE"
 
             if not risk_locked:
                 for idx, cfg in INDICES.items():
