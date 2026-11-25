@@ -1,121 +1,81 @@
-name: Daily Harvest Vault
+name: V3 Quant Trading Engine
 
 on:
+  workflow_dispatch: # Manual run button only when you want it
   schedule:
-    - cron: '25 3 * * 1-5'   # Session 1: 08:55 AM IST (Exits cleanly at 02:40 PM IST)
-    - cron: '16 9 * * 1-5'   # Session 2: 02:46 PM IST (Exits cleanly at 08:31 PM IST)
-    - cron: '08 15 * * 1-5'  # Session 3: 08:38 PM IST (Runs till 11:20 PM IST + Nightly Forensics)
-  workflow_dispatch:
-
-concurrency:
-  group: v3-trading-engine-singleton
-  cancel-in-progress: true
+    # 08:45 AM IST (03:15 UTC) - Morning Session Start (Mon-Fri)
+    - cron: '15 3 * * 1-5'
+    # 02:45 PM IST (09:15 UTC) - Afternoon Handover (Mon-Fri)
+    - cron: '15 9 * * 1-5'
+    # 08:45 PM IST (15:15 UTC) - Evening MCX Handover (Mon-Fri)
+    - cron: '15 15 * * 1-5'
 
 permissions:
   contents: write
 
 jobs:
-  harvest:
+  run-trading-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 358
+    timeout-minutes: 360
+
     steps:
-      - name: Checkout Code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          pip install requests pandas numpy pytz urllib3 pyotp playwright openpyxl matplotlib upstox-python-sdk
-          playwright install --with-deps chromium
+          pip install -r requirements.txt
 
-      - name: Auto-Generate Fresh Upstox Token
+      - name: Generate Upstox Token (Daytime Market Hours Only)
         env:
           UPSTOX_API_KEY: ${{ secrets.UPSTOX_API_KEY }}
           UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
           UPSTOX_REDIRECT_URI: ${{ secrets.UPSTOX_REDIRECT_URI }}
           UPSTOX_MOBILE: ${{ secrets.UPSTOX_MOBILE }}
           UPSTOX_PIN: ${{ secrets.UPSTOX_PIN }}
-          UPSTOX_TOTP_KEY: ${{ secrets.UPSTOX_TOTP_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          UPSTOX_TOTP_SECRET: ${{ secrets.UPSTOX_TOTP_SECRET }}
         run: |
-          python -u get_token_auto.py
-          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
-            TOKEN_VAL=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-            echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
-          fi
+          python auto_login.py
 
-      - name: Run Self-Maturing V3 Live Engine (with Tick-by-Tick AI Trading Agent)
+      - name: Run V3 Live Engine
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PAPER_MODE: ${{ secrets.PAPER_MODE }}
           CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
           MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
-          PAPER_MODE: ${{ secrets.PAPER_MODE || 'true' }}
         run: |
-          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
-            FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-            if [ -n "$FILE_TOKEN" ]; then
-              export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
-            fi
-          fi
-          python -u live_engine.py
+          python live_engine.py
 
-      - name: Run Nightly Vault Harvester, Brain Calibration, AI Code Architect & Journal Report
+      - name: Run Auto Tuner & Journal Sync (Only After 23:30 IST EOD)
         if: always()
-        continue-on-error: true
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          CAPITAL_PER_TRADE: ${{ secrets.CAPITAL_PER_TRADE }}
-          MCX_CAPITAL_PER_TRADE: ${{ secrets.MCX_CAPITAL_PER_TRADE }}
-          VAULT_DB_PATH: live_journal/nifty_vault.db
         run: |
-          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
-            FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
-            if [ -n "$FILE_TOKEN" ]; then
-              export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
-            fi
-          fi
-          if [ -f harvester.py ]; then
-            python -u harvester.py
-          fi
-          if [ -f auto_tuner.py ]; then
-            python -u -c "import json, os, auto_tuner; vix_chg = float(json.load(open('live_journal/macro_context.json')).get('vix_chg_pct', 0.0)) if os.path.isfile('live_journal/macro_context.json') else 0.0; exp_str = str(json.load(open('live_journal/strategy_params.json')).get('nearest_option_expiry', '')) if os.path.isfile('live_journal/strategy_params.json') else ''; auto_tuner.run_nightly_calibration(nearest_option_expiry_str=exp_str, vix_change_pct=vix_chg)"
-          fi
-          if [ -f ai_trading_agent.py ]; then
-            python -u ai_trading_agent.py
-          fi
-          if [ -f generate_journal_analytics.py ]; then
-            python -u generate_journal_analytics.py
-          fi
+          python -c "
+          from datetime import datetime, timezone, timedelta
+          ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+          if '23:30' <= ist.strftime('%H:%M') <= '23:55':
+              import subprocess
+              subprocess.run(['python', 'auto_tuner.py'], check=False)
+          else:
+              print('Skipping EOD report outside 23:30-23:55 IST window.')
+          "
 
-      - name: Upload Live Trade Journal & Memory Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: live-trades-journal
-          path: live_journal/
-
-      - name: Commit & Push Journal, Vault, AI Code Upgrades & Self-Tuned Params
+      - name: Commit updated journal & brain state
         if: always()
         run: |
-          git config --global user.name "AI_TRADING_AGENT"
-          git config --global user.email "bot@nifty-harvest.local"
-          git add live_journal/* *.py || true
-          if ! git diff --quiet || ! git diff --staged --quiet; then
-            git commit -m "🤖 AI_TRADING_AGENT: update journal, vault, driver gear & self-upgraded code [skip ci]"
-            git pull --rebase origin main || git pull --rebase origin master
-            git push
-            echo "✅ Journal, Vault, Macro Context, Driver Gear & AI Code Upgrades committed."
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add live_journal/ || true
+          git diff --staged --quiet || git commit -m "Auto-sync journal & brain state"
+          git push || true
