@@ -117,8 +117,8 @@ FUEL_FINISH_THRESHOLD = 18.0
 FLAT_LTP_NORMAL_SEC = 900
 FLAT_LTP_EXPIRY_SEC = 600
 
-DAILY_PROFIT_LOCK_PCT = 1.00
-DAILY_LOSS_LOCK_PCT = -0.15
+DAILY_PROFIT_LOCK_PCT = 0.05        # 5% Net Profit (after brokerage & taxes) -> ₹1,250 (Index) / ₹7,500 (MCX)
+DAILY_LOSS_LOCK_PCT = -0.15         # -15% Max Daily Loss
 MAX_CONSECUTIVE_LOSSES = 3
 
 INDICES = {
@@ -134,7 +134,7 @@ INDICES = {
     "COPPER":     {"type": "MCX_FUT", "tf_min": 5},
 }
 
-# Target MCX Mini symbols (lot_size, tick_size & expiry are fetched 100% dynamically from Upstox BOD Master)
+# Target MCX Mini symbols (lot_size, tick_size & expiry are fetched dynamically from Upstox BOD Master)
 MCX_MINI_SYMBOLS = {
     "CRUDEOIL":   "CRUDEOILM",
     "NATURALGAS": "NATGASMINI",
@@ -363,13 +363,12 @@ def restore_journal_from_google_sheet():
 
 
 # ==============================================================================
-# 2. TELEGRAM UI (SINGLE PINNED MESSAGE + SILENT NIGHT MODE) & AUTO-CHARGES
+# 2. TELEGRAM UI (BLOOMBERG TERMINAL GRAPHICS + SILENT NIGHT MODE) & CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
     log.info(f"[MIRROR] {' | '.join(clean_lines)}")
 
-    # Do not disturb sleep between 23:36 IST and 08:30 IST
     if is_overnight_dead_hours(datetime.now(IST)):
         return
 
@@ -469,15 +468,15 @@ def check_live_exchange_status(exchange: str = "NSE") -> str:
         return ""
 
 
-def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, qty: int, is_mcx: bool) -> dict:
-    if buy_price > 0 and sell_price > 0 and qty > 0:
+def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price: float, eff_qty: int, is_mcx: bool) -> dict:
+    if buy_price > 0 and sell_price > 0 and eff_qty > 0:
         if HAS_UPSTOX_SDK:
             try:
                 cfg = upstox_client.Configuration()
                 cfg.access_token = UPSTOX_ACCESS_TOKEN
                 charge_api = upstox_client.ChargeApi(upstox_client.ApiClient(cfg))
-                buy_resp = charge_api.get_brokerage(instrument_key, int(qty), "I", "BUY", round(float(buy_price), 2), "2.0")
-                sell_resp = charge_api.get_brokerage(instrument_key, int(qty), "I", "SELL", round(float(sell_price), 2), "2.0")
+                buy_resp = charge_api.get_brokerage(instrument_key, int(eff_qty), "I", "BUY", round(float(buy_price), 2), "2.0")
+                sell_resp = charge_api.get_brokerage(instrument_key, int(eff_qty), "I", "SELL", round(float(sell_price), 2), "2.0")
                 b_brk = float(buy_resp.data.charges.brokerage or 0.0)
                 s_brk = float(sell_resp.data.charges.brokerage or 0.0)
                 b_tot = float(buy_resp.data.charges.total or 0.0)
@@ -494,7 +493,7 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
         for tx_type, price in (("BUY", buy_price), ("SELL", sell_price)):
             params = {
                 "instrument_token": instrument_key,
-                "quantity": int(qty),
+                "quantity": int(eff_qty),
                 "product": "I",
                 "transaction_type": tx_type,
                 "price": round(float(price), 2),
@@ -517,16 +516,16 @@ def fetch_exact_trade_charges(instrument_key: str, buy_price: float, sell_price:
             brk = round(brk_sum, 2)
             return {"brokerage": brk, "taxes_other": round(tot - brk, 2), "total": tot}
 
-    turnover = (buy_price + sell_price) * qty
+    turnover = (buy_price + sell_price) * eff_qty
     brokerage = 40.0
     if is_mcx:
-        stt_ctt = (sell_price * qty) * 0.0001
+        stt_ctt = (sell_price * eff_qty) * 0.0001
         txn_charges = turnover * 0.000021
-        stamp_duty = (buy_price * qty) * 0.00002
+        stamp_duty = (buy_price * eff_qty) * 0.00002
     else:
-        stt_ctt = (sell_price * qty) * 0.000625
+        stt_ctt = (sell_price * eff_qty) * 0.000625
         txn_charges = turnover * 0.0005
-        stamp_duty = (buy_price * qty) * 0.00003
+        stamp_duty = (buy_price * eff_qty) * 0.00003
     sebi_charges = turnover * 0.000001
     gst = (brokerage + txn_charges + sebi_charges) * 0.18
     taxes_other = round(stt_ctt + txn_charges + stamp_duty + sebi_charges + gst, 2)
@@ -550,7 +549,7 @@ def record_trade_journal(row: dict):
 
 
 # ==============================================================================
-# 3. UPSTOX V3 API HELPERS (100% DYNAMIC BOD MCX MASTER + 7-DAY AUTO-ROLLOVER)
+# 3. UPSTOX V3 API HELPERS (DYNAMIC BOD MCX MASTER + 7-DAY AUTO-ROLLOVER)
 # ==============================================================================
 def load_upstox_mcx_master() -> list:
     global _MCX_BOD_CACHE
@@ -589,7 +588,6 @@ def get_active_future_contract(idx: str) -> dict:
 
     all_candidates = []
 
-    # 1. Primary: Official Upstox BOD MCX.json.gz (exact lot_size, minimum_lot & price_quote_unit)
     if is_mcx:
         for item in load_upstox_mcx_master():
             name_u = str(item.get("name", "")).upper()
@@ -598,7 +596,6 @@ def get_active_future_contract(idx: str) -> dict:
             if asset_u == target_sym or name_u == target_sym or tsym_u.startswith(f"{target_sym} FUT"):
                 all_candidates.append(item)
 
-    # 2. Secondary: Upstox Instrument Search API
     if not all_candidates:
         exchange = "BSE" if idx == "SENSEX" else ("MCX" if is_mcx else "NSE")
         url = "https://api.upstox.com/v2/instruments/search"
@@ -639,7 +636,6 @@ def get_active_future_contract(idx: str) -> dict:
     min_lot = int(top.get("minimum_lot", 1) or 1)
     order_lot_size = raw_lot if raw_lot > 1 else (min_lot if min_lot > 1 else 1)
 
-    # Derive exact 1-point P&L multiplier from price_quote_unit / contract quote standard (GOLDM: 100g / 10g quote = ₹10/pt)
     quote_unit = str(top.get("price_quote_unit", "")).upper()
     tsym_top = str(top.get("trading_symbol", "")).upper()
     quote_denom = 1
@@ -1028,8 +1024,8 @@ class IntradayV3Engine:
         }
         self.ai_agent = TickByTickAITradingAgent(self) if HAS_AI_AGENT else None
 
-        init_cap = float(os.getenv("CAPITAL_PER_TRADE") or "25000")
-        init_mcx_cap = float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000")
+        init_cap = max(float(os.getenv("CAPITAL_PER_TRADE") or "25000"), 25000.0)
+        init_mcx_cap = max(float(os.getenv("MCX_CAPITAL_PER_TRADE") or "150000"), 150000.0)
         self.tuned_params = {
             "brain_version": "v1.0",
             "driver_gear": 3,
@@ -1081,10 +1077,12 @@ class IntradayV3Engine:
         }
 
     def get_active_capital(self) -> float:
-        return float(os.getenv("CAPITAL_PER_TRADE") or self.tuned_params.get("capital_per_trade", 25000.0))
+        val = float(os.getenv("CAPITAL_PER_TRADE") or self.tuned_params.get("capital_per_trade", 25000.0))
+        return max(val, 25000.0)
 
     def get_active_mcx_capital(self) -> float:
-        return float(os.getenv("MCX_CAPITAL_PER_TRADE") or self.tuned_params.get("mcx_capital_per_trade", 150000.0))
+        val = float(os.getenv("MCX_CAPITAL_PER_TRADE") or self.tuned_params.get("mcx_capital_per_trade", 150000.0))
+        return max(val, 150000.0)
 
     def load_self_tuned_intelligence(self):
         if os.path.isfile(PARAMS_FILE):
@@ -1093,6 +1091,8 @@ class IntradayV3Engine:
                     loaded = json.load(f)
                 self.tuned_params.update(loaded)
                 self.tuned_params["morning_wait_until"] = "09:15"
+                self.tuned_params["capital_per_trade"] = self.get_active_capital()
+                self.tuned_params["mcx_capital_per_trade"] = self.get_active_mcx_capital()
                 if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
                     self.tuned_params["min_fuel_score"] = 45.0
                 if float(self.tuned_params.get("mcx_evening_fuel_score", 44.0)) > 46.0:
@@ -1233,6 +1233,11 @@ class IntradayV3Engine:
                     entry_time_str = pos.get("entry_time", "09:15:00")
                     tf_m = INDICES.get(idx, {}).get("tf_min", 5)
 
+                    # Reconcile GOLDM multiplier & charges on restored state
+                    if str(pos.get("strike", "")).upper().startswith("GOLDM") and int(pos.get("qty", 1)) == 100:
+                        pos["pnl_units"] = 10
+                        pos["est_charges"] = fetch_exact_trade_charges(inst_key, entry, entry, 10, True).get("total", 215.0)
+
                     inst_df = fetch_intraday_candles(inst_key, tf_m)
                     if not inst_df.empty:
                         inst_df["hhmmss"] = inst_df["timestamp"].dt.strftime("%H:%M:%S")
@@ -1283,7 +1288,7 @@ class IntradayV3Engine:
                             pos["trail_stage"] = "COST-TO-COST"
 
                     self.active_positions[idx] = pos
-                    self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)))
+                    self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)), len(self.closed_trades))
 
                     if (not is_short and curr_ltp <= pos["sl"]) or (is_short and curr_ltp >= pos["sl"]):
                         reason = "TRAIL_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
@@ -1331,6 +1336,7 @@ class IntradayV3Engine:
                         self.day_pnl = round(self.day_pnl + pnl_val, 2)
                         self.trade_counter = max(self.trade_counter, t_no)
             self.closed_trades.sort(key=lambda x: x["trade_no"])
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades))
             if self.closed_trades:
                 for t in self.closed_trades:
                     try:
@@ -1587,6 +1593,26 @@ class IntradayV3Engine:
             total_mtm += (pos["entry_price"] - ltp) * eff_units if is_short else (ltp - pos["entry_price"]) * eff_units
         return round(total_mtm, 2)
 
+    @staticmethod
+    def _build_fuel_bar(fuel_val: float) -> str:
+        filled = max(0, min(5, int(round(fuel_val / 20.0))))
+        return ("▰" * filled) + ("▱" * (5 - filled))
+
+    @staticmethod
+    def _build_gann_slider(spot: float, status_txt: str) -> str:
+        if not status_txt.startswith("Gann ") or "-" not in status_txt:
+            return status_txt
+        try:
+            parts = status_txt.replace("Gann ", "").split("[")[0].strip().split("-")
+            sup, res = float(parts[0]), float(parts[1])
+            span = max(res - sup, 1e-6)
+            pos_idx = max(0, min(4, int(round(((spot - sup) / span) * 4))))
+            track = ["─"] * 5
+            track[pos_idx] = "●"
+            return f"{int(sup)}{''.join(track)}{int(res)}"
+        except Exception:
+            return status_txt
+
     def get_performance_summary_lines(self, now_ist: datetime, live_mtm: float) -> list:
         today_str = now_ist.strftime("%Y-%m-%d")
         curr_year, curr_week, _ = now_ist.isocalendar()
@@ -1624,23 +1650,25 @@ class IntradayV3Engine:
         m_tot, m_wr, m_net = calc([r for r in rows if r["date"].startswith(curr_month_prefix)])
         y_tot, y_wr, y_net = calc([r for r in rows if r["year"] == curr_year])
 
-        d_live = round(d_net + live_mtm, 2)
-        w_live = round(w_net + live_mtm, 2)
-        m_live = round(m_net + live_mtm, 2)
-        y_live = round(y_net + live_mtm, 2)
-
-        return [
-            f"• <b>Daily:</b> <b>₹{d_live:+,.2f}</b> ({d_tot}T | {d_wr}% Win)",
-            f"• <b>Weekly:</b> <b>₹{w_live:+,.2f}</b> ({w_tot}T | {w_wr}% Win)",
-            f"• <b>Monthly:</b> <b>₹{m_live:+,.2f}</b> ({m_tot}T | {m_wr}% Win)",
-            f"• <b>Yearly:</b> <b>₹{y_live:+,.2f}</b> ({y_tot}T | {y_wr}% Win)",
+        table_rows = [
+            f"{'PERIOD':<8} {'NET P&L':<12} {'TRADES':<6} {'WIN%'}",
+            f"{'Daily':<8} ₹{d_net + live_mtm:+9,.2f}   {d_tot:>3}T   {d_wr:>3}%",
+            f"{'Weekly':<8} ₹{w_net + live_mtm:+9,.2f}   {w_tot:>3}T   {w_wr:>3}%",
+            f"{'Monthly':<8} ₹{m_net + live_mtm:+9,.2f}   {m_tot:>3}T   {m_wr:>3}%",
+            f"{'Yearly':<8} ₹{y_net + live_mtm:+9,.2f}   {y_tot:>3}T   {y_wr:>3}%",
         ]
+        return ["<pre>" + "\n".join(table_rows) + "</pre>"]
 
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
             now_ist = datetime.now(IST)
-            live_mtm = self.compute_live_mtm()
-            net_pnl = round(self.day_pnl + live_mtm, 2)
+            live_gross_mtm = self.compute_live_mtm()
+            with self.pos_lock:
+                open_charges = sum(float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0)) for p in self.active_positions.values())
+                active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
+
+            live_net_mtm = round(live_gross_mtm - open_charges, 2) if active_snap else 0.0
+            net_pnl = round(self.day_pnl + live_net_mtm, 2)
             mode_badge = "<code>PAPER</code>" if PAPER_MODE else "<code>LIVE</code>"
             gear_badge = f"<code>G{self.tuned_params.get('driver_gear', 3)}</code>"
             net_icon = "🟢" if net_pnl >= 0 else "🔴"
@@ -1649,12 +1677,12 @@ class IntradayV3Engine:
             if "CLOSED" in self.bot_status_text or "STOPPED" in self.bot_status_text:
                 status_header = "🔴 <b>MARKET CLOSED</b>"
             elif "PAUSED" in self.bot_status_text:
-                status_header = "🟡 <b>BOT PAUSED</b>"
+                status_header = f"🟡 <b>{self.bot_status_text}</b>"
             elif "STANDBY" in self.bot_status_text:
                 status_header = f"🟠 <b>{self.bot_status_text}</b>"
             else:
                 pulse_dot = "🟢" if self.dashboard_pulse else "⚪"
-                status_header = f"{pulse_dot} <b>BOT LIVE</b>"
+                status_header = f"{pulse_dot} <b>V3 QUANT TERMINAL</b>"
 
             tot_closed = len(self.closed_trades)
             total_wins = sum(1 for t in self.closed_trades if t["pnl"] > 0)
@@ -1662,15 +1690,13 @@ class IntradayV3Engine:
             day_wr = int(round((total_wins / tot_closed) * 100.0)) if tot_closed > 0 else 0
 
             lines = [
-                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} {gear_badge}",
-                f"────────────────────────────",
-                f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
-                f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_mtm:+,.2f}</b>",
-                f"• Trades: <b>{tot_closed}</b> ({total_wins}W / {total_losses}L)  |  Win Rate: <b>{day_wr}%</b>",
+                f"{status_header} • <code>{hhmm} IST</code> • {mode_badge} {gear_badge}",
+                f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓",
+                f"┃ 💼 <b>DAY NET P&amp;L</b>   {net_icon} <b>₹{net_pnl:+,.2f}</b>",
+                f"┃ 💵 Realized: <code>₹{self.day_pnl:+,.2f}</code> │ Net MTM: <code>₹{live_net_mtm:+,.2f}</code>",
+                f"┃ 🎯 Accuracy: <code>{day_wr}%</code> (<code>{total_wins}W</code> / <code>{total_losses}L</code> • <code>{tot_closed}T</code>)",
+                f"┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛",
             ]
-
-            with self.pos_lock:
-                active_snap = sorted(self.active_positions.items(), key=lambda item: item[1]["trade_no"])
 
             if active_snap:
                 lines.append(f"\n🔥 <b>ACTIVE POSITIONS ({len(active_snap)})</b>")
@@ -1685,8 +1711,8 @@ class IntradayV3Engine:
                     sl_gross = (pos["entry_price"] - pos["sl"]) * eff_units if is_short else (pos["sl"] - pos["entry_price"]) * eff_units
                     sl_net_pnl = round(sl_gross - est_charges, 0)
                     t_mode = pos.get("trade_mode", "HYBRID")
-                    tgt_txt = pos.get("target_label", "SMART HYBRID ∞")
-                    trail_tag = f"🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{t_mode}</code>"
+                    tgt_txt = pos.get("target_label", "HYBRID ∞")
+                    trail_tag = f"🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"⚡ <code>{t_mode}</code>"
                     p_icon = "🟢" if pnl >= 0 else "🔴"
                     sl_label = f"Locked <b>₹{sl_net_pnl:+,.0f}</b>" if sl_net_pnl >= 0 else f"Max Risk <b>₹{abs(sl_net_pnl):,.0f}</b>"
 
@@ -1699,44 +1725,61 @@ class IntradayV3Engine:
                     )
 
                     lines.extend([
-                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)  |  {trail_tag}",
-                        f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
-                        f"  PnL: <code>{pts_diff:.2f} pt × {eff_units} = ₹{gross_val:,.0f}</code>",
-                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
-                        f"  Live Net P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                        f"┌ <b>#{pos['trade_no']} {p_idx}</b> • <code>{pos['strike']} {pos['display_side']}</code>",
+                        f"│ 📦 <b>Size:</b> <code>{lot_spec_txt}</code> │ {trail_tag}",
+                        f"│ ⏱️ <b>Entry:</b> <code>₹{pos['entry_price']:.2f}</code> (<code>{pos['entry_time'][:5]}</code>) → <b>LTP:</b> <code>₹{ltp:.2f}</code>",
+                        f"│ 📐 <b>PnL:</b> <code>{pts_diff:.2f} pt × {eff_units} = ₹{gross_val:,.0f}</code>",
+                        f"│ 🛑 <b>SL:</b> <code>₹{pos['sl']:.2f}</code> ({sl_label}) │ 🎯 <code>{tgt_txt}</code>",
+                        f"└ 💰 <b>Live Net P&amp;L:</b> {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
 
-            lines.append("\n📒 <b>TODAY'S CLOSED TRADES</b>")
+            if self.last_summaries:
+                ai_stance = self.macro_context.get("stance_label", "ADAPTIVE_TWO_WAY")
+                lines.append(f"\n📡 <b>NSE INDICES RADAR (5m)</b> • 🧠 <code>{ai_stance}</code>")
+                idx_rows = [f"{'INDEX':<9} {'SPOT':<6} {'PCR':<4} {'FUEL':<9} {'GANN ZONE'}"]
+                short_names = {"MIDCPNIFTY": "MIDCPNFTY"}
+                for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+                    s = self.last_summaries.get(idx)
+                    if s:
+                        nm = short_names.get(idx, idx)
+                        f_bar = self._build_fuel_bar(s["fuel"])
+                        g_slider = self._build_gann_slider(s["spot"], s["short_status"])
+                        idx_rows.append(f"{nm:<9} {str(s['spot']):<6} {s['pcr']:<4.2f} {f_bar} {s['fuel']:>2}% {g_slider}")
+                lines.append("<pre>" + "\n".join(idx_rows) + "</pre>")
+
+                lines.append("🛢️ <b>MCX MINI COMMODITIES (5m)</b>")
+                mcx_rows = [f"{'COMMODITY':<10} {'SPOT':<7} {'FUEL':<9} {'STATUS / GANN'}"]
+                for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
+                    s = self.last_summaries.get(idx)
+                    if s:
+                        f_bar = self._build_fuel_bar(s["fuel"])
+                        st_txt = s["short_status"]
+                        if st_txt.startswith("Gann "):
+                            st_txt = self._build_gann_slider(s["spot"], st_txt)
+                        elif st_txt.startswith("ACTIVE"):
+                            st_txt = "🔥 " + st_txt
+                        elif st_txt.startswith("ARMED"):
+                            st_txt = "⚡ " + st_txt
+                        mcx_rows.append(f"{idx:<10} {str(s['spot']):<7} {f_bar} {s['fuel']:>2}% {st_txt}")
+                lines.append("<pre>" + "\n".join(mcx_rows) + "</pre>")
+
+            lines.append("📒 <b>CLOSED TRADES (LATEST 5)</b>")
             if self.closed_trades:
-                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"]):
+                recent_closed = sorted(self.closed_trades, key=lambda x: x["trade_no"], reverse=True)[:5]
+                for t in recent_closed:
                     icon = "✅" if t["pnl"] >= 0 else "❌"
                     pts_t = float(t.get("points", 0.0))
                     units_t = int(float(t.get("pnl_units") or t.get("qty", 1)))
                     gross_t = float(t.get("gross_pnl", round(pts_t * units_t, 2)))
                     lines.append(
-                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} Net <b>₹{t['pnl']:+,.2f}</b>\n"
-                        f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> | In: ₹{t['entry_price']:.2f} → Exit: ₹{t['exit_price']:.2f}\n"
-                        f"  PnL: <code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code> | <i>{t['exit_reason']}</i>"
+                        f"• <b>#{t['trade_no']}</b> <code>{t['contract']} {t['side']}</code> {icon} <b>₹{t['pnl']:+,.0f}</b> "
+                        f"(<code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code> • <i>{t['exit_reason']}</i>)"
                     )
             elif not active_snap:
                 lines.append("<i>No closed trades yet today.</i>")
 
-            if self.last_summaries:
-                ai_stance = self.macro_context.get("stance_label", "ADAPTIVE_TWO_WAY")
-                lines.append(f"\n📡 <b>INDICES LIVE (5m)</b>  |  🧠 <code>{ai_stance}</code>")
-                for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
-                    s = self.last_summaries.get(idx)
-                    if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
-
-                lines.append("\n🛢️ <b>MCX MINI LIVE (5m)</b>")
-                for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
-                    s = self.last_summaries.get(idx)
-                    if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Fuel <b>{s['fuel']}</b> | <code>{s['short_status']}</code>")
-
-            lines.append("\n📊 <b>PERFORMANCE SUMMARY (NET ₹)</b>")
-            lines.extend(self.get_performance_summary_lines(now_ist, live_mtm))
+            lines.append("\n📊 <b>PERFORMANCE LEDGER (NET ₹)</b>")
+            lines.extend(self.get_performance_summary_lines(now_ist, live_net_mtm))
 
             self.dashboard_msg_id = upsert_telegram_dashboard("\n".join(lines), self.dashboard_msg_id)
 
@@ -1799,7 +1842,7 @@ class IntradayV3Engine:
 
         buy_px = ltp if is_short else pos["entry_price"]
         sell_px = pos["entry_price"] if is_short else ltp
-        ch_info = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, pos["qty"], is_mcx)
+        ch_info = fetch_exact_trade_charges(pos["instrument_key"], buy_px, sell_px, int(eff_units), is_mcx)
         net_pnl = round(gross_pnl - ch_info["total"], 2)
 
         self.day_pnl = round(self.day_pnl + net_pnl, 2)
@@ -2320,7 +2363,7 @@ class IntradayV3Engine:
 
         mcx_cap = self.get_active_mcx_capital()
         max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.025, 2)))
-        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, lot_size, True).get("total", 180.0)
+        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
         risk_1_lot = (sl_points * pnl_mult) + est_ch
         if risk_1_lot > max_risk_cap:
             self.pending_setups[idx] = None
@@ -2333,7 +2376,7 @@ class IntradayV3Engine:
         qty = min(lots * lot_size, cfg["freeze_qty"])
         eff_lots = max(1, qty // max(lot_size, 1))
         pnl_units = eff_lots * pnl_mult
-        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, True).get("total", 180.0)
+        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_units, True).get("total", 180.0)
 
         sl_price = round_to_tick((ltp - sl_points) if tx_side == "BUY" else (ltp + sl_points), tick_sz)
 
@@ -2342,7 +2385,7 @@ class IntradayV3Engine:
             fill = order_res["fill_price"]
             sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
             now_ts = time.time()
-            self.trade_counter += 1
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
             with self.pos_lock:
@@ -2355,7 +2398,7 @@ class IntradayV3Engine:
                     "est_charges": total_est_ch, "gann_level": setup["gann_level"], "last_ltp": fill,
                     "sl": sl_price, "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": False,
-                    "trade_mode": trade_mode, "target_label": "SMART HYBRID ∞",
+                    "trade_mode": trade_mode, "target_label": "HYBRID ∞",
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mem_tag}",
                     "entry_time": entry_time_str,
                 }
@@ -2465,7 +2508,7 @@ class IntradayV3Engine:
         if order_res.get("status") == "success":
             fill = order_res["fill_price"]
             now_ts = time.time()
-            self.trade_counter += 1
+            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
             mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else ("OTM_RISK_FIT" if selected_candidate["otm_fit"] else mem_tag)
@@ -2480,7 +2523,7 @@ class IntradayV3Engine:
                     "gann_level": setup["gann_level"], "last_ltp": fill, "sl": sl_price,
                     "peak_gain": 0.0, "entry_ts": now_ts, "last_peak_ts": now_ts,
                     "trail_stage": None, "low_fuel_streak": 0, "is_expiry_day": is_today_exp,
-                    "trade_mode": trade_mode, "target_label": "SMART HYBRID ∞",
+                    "trade_mode": trade_mode, "target_label": "HYBRID ∞",
                     "ltp_window": deque([(now_ts, fill)]), "setup_name": f"{setup['name']}|{mode_suffix}",
                     "entry_time": entry_time_str,
                 }
@@ -2591,7 +2634,6 @@ class IntradayV3Engine:
         self.session_sched = inspect_special_session_schedule(now_ist)
         live_nse_status = check_live_exchange_status("NSE")
 
-        # Verify against live NIFTY candles so stale learned_holidays never override an active market
         nifty_live_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
         nse_has_live_candles = (
             not nifty_live_df.empty
@@ -2647,7 +2689,7 @@ class IntradayV3Engine:
             sess_banner = "5m IDX / 5m MCX MINI (09:15 AM – 11:30 PM IST)"
 
         notify(
-            f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
+            f"🌅 <b>V3 QUANT TERMINAL • ONLINE</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"🧠 <b>Brain:</b> <code>{self.tuned_params.get('brain_version')}</code>  |  ⚙️ <b>Gear:</b> <code>{self.tuned_params.get('driver_gear')}</code>\n"
@@ -2700,19 +2742,63 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
-            cap = self.get_active_capital()
-            max_profit = cap * DAILY_PROFIT_LOCK_PCT
-            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
-            risk_locked = (self.day_pnl >= max_profit or self.day_pnl <= max_loss or self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES)
+            idx_cap = self.get_active_capital()
+            mcx_cap = self.get_active_mcx_capital()
 
-            if risk_locked:
-                self.bot_status_text = "BOT PAUSED"
-            elif not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
-            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
+            # Target Net Profit (after brokerage & taxes): 5% of Index (₹1,250) or 5% of MCX (₹7,500)
+            has_mcx_activity = any(t.get("symbol") in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER") for t in self.closed_trades) or any(
+                p.get("type") == "MCX_FUT" for p in self.active_positions.values()
+            )
+            active_target_cap = mcx_cap if has_mcx_activity else idx_cap
+            target_net_profit = round(active_target_cap * DAILY_PROFIT_LOCK_PCT, 2)
+            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(idx_cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
+
+            live_gross_mtm = self.compute_live_mtm()
+            with self.pos_lock:
+                open_charges = sum(float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0)) for p in self.active_positions.values())
+            live_net_mtm = round(live_gross_mtm - open_charges, 2) if self.active_positions else 0.0
+            total_net_day_pnl = round(self.day_pnl + live_net_mtm, 2)
+
+            profit_goal_hit = (self.day_pnl >= target_net_profit) or (total_net_day_pnl >= target_net_profit)
+
+            # If 5% Net Profit is achieved while trades are still open: lock SL to protect ₹1,250 / ₹7,500 floor
+            if profit_goal_hit and self.active_positions:
+                with self.pos_lock:
+                    needed_from_open = max(0.0, target_net_profit - self.day_pnl)
+                    per_pos_floor_net = needed_from_open / max(len(self.active_positions), 1)
+                    for p_idx, pos in self.active_positions.items():
+                        is_short = pos["tx_side"] == "SELL"
+                        eff_units = max(int(pos.get("pnl_units", pos["qty"])), 1)
+                        est_ch = float(pos.get("est_charges", 180.0 if pos["type"] == "MCX_FUT" else 65.0))
+                        tick_sz = float(pos.get("tick_size", 0.05))
+                        req_pts = (per_pos_floor_net + est_ch) / eff_units
+                        floor_sl = round_to_tick((pos["entry_price"] - req_pts) if is_short else (pos["entry_price"] + req_pts), tick_sz)
+                        ltp_now = float(pos.get("last_ltp", pos["entry_price"]))
+                        if is_short and floor_sl < pos["sl"] and floor_sl > ltp_now + tick_sz:
+                            pos["sl"] = floor_sl
+                            pos["trail_stage"] = "5% PROFIT FLOOR"
+                        elif not is_short and floor_sl > pos["sl"] and floor_sl < ltp_now - tick_sz:
+                            pos["sl"] = floor_sl
+                            pos["trail_stage"] = "5% PROFIT FLOOR"
+                self.save_active_positions_state()
+
+            if profit_goal_hit:
+                risk_locked = True
+                self.bot_status_text = f"PAUSED (5% TARGET ₹{target_net_profit:,.0f} HIT)"
+            elif self.day_pnl <= max_loss:
+                risk_locked = True
+                self.bot_status_text = "PAUSED (DAILY LOSS CAP)"
+            elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                risk_locked = True
+                self.bot_status_text = "PAUSED (3 LOSSES)"
             else:
-                self.bot_status_text = "BOT LIVE"
+                risk_locked = False
+                if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                    self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
+                elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                    self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
+                else:
+                    self.bot_status_text = "BOT LIVE"
 
             if not risk_locked:
                 for idx, cfg in INDICES.items():
