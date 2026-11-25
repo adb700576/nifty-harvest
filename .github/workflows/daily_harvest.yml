@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: v3-trading-engine-singleton
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -17,7 +17,7 @@ permissions:
 jobs:
   harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 358
+    timeout-minutes: 335
     steps:
       - name: Check Market Hours Gate (Block 23:36 - 08:30 IST Sleep Window)
         id: time_gate
