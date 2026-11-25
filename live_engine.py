@@ -57,8 +57,8 @@ GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 MIN_FUEL_SCORE = 45.0
-MCX_MORNING_FUEL_SCORE = 48.0
-MCX_EVENING_FUEL_SCORE = 46.0
+MCX_MORNING_FUEL_SCORE = 46.0
+MCX_EVENING_FUEL_SCORE = 44.0
 MIN_ADX_TREND = 19.0
 MAX_CHOP_INDEX = 60.0
 SESSION_MAX_RUNTIME_SEC = 20700
@@ -68,7 +68,7 @@ INDEX_END_TIME = "15:10"
 INDEX_EXIT_TIME = "15:15"
 
 MCX_START_TIME = "09:15"
-MCX_END_TIME = "23:10"
+MCX_END_TIME = "22:30"              # Stop late-night entries after 22:30 IST; trail open trades till 23:25
 MCX_EXIT_TIME = "23:25"
 
 GANN_ZONE_ATR_MULT = 0.40
@@ -85,7 +85,9 @@ BREAKOUT_EXPANSION_ATR = 1.20
 CRASH_FASTTRACK_ATR = 1.45
 CRASH_DAY_PCT_THRESHOLD = 1.15
 RETEST_TOLERANCE_ATR = 0.35
-MAX_EMA20_EXTENSION_ATR = 2.60
+MAX_EMA20_EXTENSION_ATR = 4.20
+SILVER_MAX_EMA20_EXT_ATR = 2.60     # Anti-trap guard: block Silver bottom traps when > 2.6x ATR from 20 EMA
+MAX_PULLBACK_BASE_DIST_ATR = 2.50   # Prevent chasing late moves > 2.5x ATR away from Gann Support/VWAP
 MAX_OPTION_SPREAD_PCT = 1.50
 THETA_BURN_RATIO_MAX = 0.30
 
@@ -144,7 +146,7 @@ def is_scheduled_handover_window(now_ist: datetime) -> bool:
 
 def is_overnight_dead_hours(now_ist: datetime) -> bool:
     hhmm = now_ist.strftime("%H:%M")
-    return hhmm >= "23:35" or hhmm < "07:30"
+    return hhmm >= "23:36" or hhmm < "08:30"
 
 
 def ms_to_ist_hhmm(epoch_ms) -> str:
@@ -214,7 +216,7 @@ def inspect_special_session_schedule(now_ist: datetime) -> dict:
                     if st_hhmm and en_hhmm:
                         info["mcx_start"] = st_hhmm
                         en_dt = datetime.strptime(f"{d_str} {en_hhmm}", "%Y-%m-%d %H:%M")
-                        info["mcx_end"] = (en_dt - timedelta(minutes=25)).strftime("%H:%M")
+                        info["mcx_end"] = (en_dt - timedelta(minutes=35)).strftime("%H:%M")
                         info["mcx_exit"] = (en_dt - timedelta(minutes=15)).strftime("%H:%M")
                         if st_hhmm >= "16:30" and "MUHURAT" in info["description"].upper():
                             info["is_muhurat"] = True
@@ -345,11 +347,15 @@ def restore_journal_from_google_sheet():
 
 
 # ==============================================================================
-# 2. TELEGRAM UI (SINGLE PINNED MESSAGE) & AUTO-CHARGES
+# 2. TELEGRAM UI (SINGLE PINNED MESSAGE + SILENT NIGHT MODE) & AUTO-CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
     log.info(f"[MIRROR] {' | '.join(clean_lines)}")
+
+    # Do not disturb sleep between 23:36 IST and 08:30 IST
+    if is_overnight_dead_hours(datetime.now(IST)):
+        return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -393,6 +399,9 @@ def save_dashboard_id(msg_id: int):
 
 
 def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
+    if is_overnight_dead_hours(datetime.now(IST)):
+        return message_id
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return message_id
 
@@ -525,12 +534,15 @@ def record_trade_journal(row: dict):
 
 
 # ==============================================================================
-# 3. UPSTOX V3 API HELPERS
+# 3. UPSTOX V3 API HELPERS (7-DAY EXPIRY AUTO-ROLLOVER FOR LIQUID FUTURES)
 # ==============================================================================
 def get_active_future_contract(idx: str) -> dict:
     exchange = "BSE" if idx == "SENSEX" else ("MCX" if INDICES[idx]["type"] == "MCX_FUT" else "NSE")
     url = "https://api.upstox.com/v2/instruments/search"
+    today_date = datetime.now(IST).date()
+    safe_min_expiry = (today_date + timedelta(days=7)).strftime("%Y-%m-%d")
 
+    all_candidates = []
     for expiry_kw in ("current_month", "next_month"):
         try:
             params = {"query": idx, "exchanges": exchange, "segments": "FUT", "expiry": expiry_kw, "page_number": 1, "records": 30}
@@ -542,24 +554,35 @@ def get_active_future_contract(idx: str) -> dict:
                 if str(it.get("instrument_type", "")).upper() == "FUT"
                 and str(it.get("trading_symbol", "")).upper().startswith(f"{idx} FUT")
             ]
-            candidates = exact if exact else [it for it in items if str(it.get("instrument_type", "")).upper() == "FUT"]
-            if not candidates:
-                continue
-            candidates.sort(key=lambda x: str(x.get("expiry", "9999-12-31")))
-            top = candidates[0]
-            raw_tick = float(top.get("tick_size", 0.05))
-            tick_size = round(raw_tick / 100.0, 4) if raw_tick >= 5.0 else raw_tick
-            return {
-                "instrument_key": str(top.get("instrument_key", "")),
-                "lot_size": int(top.get("lot_size", 1)),
-                "freeze_quantity": int(top.get("freeze_quantity", 10000)),
-                "tick_size": tick_size if tick_size > 0 else 0.05,
-                "trading_symbol": str(top.get("trading_symbol", idx)),
-                "expiry": str(top.get("expiry", "")),
-            }
+            cands = exact if exact else [it for it in items if str(it.get("instrument_type", "")).upper() == "FUT"]
+            all_candidates.extend(cands)
         except Exception as e:
             log.warning(f"[{idx}] Instrument search error ({expiry_kw}): {e}")
-    return {}
+
+    if not all_candidates:
+        return {}
+
+    dedup = {}
+    for c in all_candidates:
+        ik = str(c.get("instrument_key", ""))
+        if ik:
+            dedup[ik] = c
+    sorted_cands = sorted(dedup.values(), key=lambda x: str(x.get("expiry", "9999-12-31")))
+
+    # Auto-rollover to next_month if nearest contract expires within 7 days
+    liquid_cands = [c for c in sorted_cands if str(c.get("expiry", "")) >= safe_min_expiry]
+    top = liquid_cands[0] if liquid_cands else sorted_cands[0]
+
+    raw_tick = float(top.get("tick_size", 0.05))
+    tick_size = round(raw_tick / 100.0, 4) if raw_tick >= 5.0 else raw_tick
+    return {
+        "instrument_key": str(top.get("instrument_key", "")),
+        "lot_size": int(top.get("lot_size", 1)),
+        "freeze_quantity": int(top.get("freeze_quantity", 10000)),
+        "tick_size": tick_size if tick_size > 0 else 0.05,
+        "trading_symbol": str(top.get("trading_symbol", idx)),
+        "expiry": str(top.get("expiry", "")),
+    }
 
 
 def get_dynamic_option_specs(spot_key: str) -> dict:
@@ -662,7 +685,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. REGIME INTELLIGENCE, GANN LEVELS, VWAP/EMA & GRADUAL FUEL SCORE
+# 4. REGIME INTELLIGENCE, DYNAMIC GANN LEVELS, VWAP/EMA & GRADUAL FUEL SCORE
 # ==============================================================================
 def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> dict:
     if df.empty or len(df) < 6:
@@ -706,12 +729,21 @@ def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> 
 
 
 def compute_gann_levels(price: float, step: float) -> dict:
+    # Scale root step by price magnitude so high-priced contracts (Silver ~145k, Sensex ~82k)
+    # get clean ~0.8%-1.0% structural Gann spacing instead of crowded 0.25% micro-lines.
+    if price >= 100000:
+        root_inc = 1.50
+    elif price >= 50000:
+        root_inc = 1.00
+    else:
+        root_inc = 0.50
+
     root = math.sqrt(price)
-    base_floor = math.floor(root * 2) / 2.0
-    levels = [round((base_floor + k * 0.5) ** 2, 2) for k in range(-3, 5)]
+    base_floor = math.floor(root / root_inc) * root_inc
+    levels = [round((base_floor + k * root_inc) ** 2, 2) for k in range(-3, 5)]
     supports = [lvl for lvl in levels if lvl <= price]
     resistances = [lvl for lvl in levels if lvl > price]
-    fallback_step = step if step and step > 0 else max(round(price * 0.002, 2), 1.0)
+    fallback_step = step if step and step > 0 else max(round(price * 0.005, 2), 1.0)
     return {
         "support": supports[-1] if supports else round(price - fallback_step, 2),
         "resistance": resistances[0] if resistances else round(price + fallback_step, 2),
@@ -800,7 +832,6 @@ def compute_fuel_with_fut_volume(spot_df: pd.DataFrame, fut_df: pd.DataFrame) ->
     else:
         spot_df["active_vol"] = spot_df["volume"]
 
-    # Add Intraday VWAP, 20/50 EMA & 20-Bar High/Low
     spot_df["ema20"] = spot_df["close"].ewm(span=20, adjust=False).mean()
     spot_df["ema50"] = spot_df["close"].ewm(span=50, adjust=False).mean()
     tp = (spot_df["high"] + spot_df["low"] + spot_df["close"]) / 3.0
@@ -869,7 +900,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. SELF-MATURING V3 ENGINE (5-SCRIPT PARALLEL + VWAP PULLBACK + ANTI-CHASE)
+# 6. SELF-MATURING V3 ENGINE
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -981,8 +1012,8 @@ class IntradayV3Engine:
                 self.tuned_params["morning_wait_until"] = "09:15"
                 if float(self.tuned_params.get("min_fuel_score", 45.0)) > 48.0:
                     self.tuned_params["min_fuel_score"] = 45.0
-                if float(self.tuned_params.get("mcx_evening_fuel_score", 46.0)) > 48.0:
-                    self.tuned_params["mcx_evening_fuel_score"] = 46.0
+                if float(self.tuned_params.get("mcx_evening_fuel_score", 44.0)) > 46.0:
+                    self.tuned_params["mcx_evening_fuel_score"] = 44.0
                 min_mcx_risk = round(self.get_active_mcx_capital() * 0.025, 2)
                 if float(self.tuned_params.get("mcx_max_risk_inr", 1500.0)) < min_mcx_risk:
                     self.tuned_params["mcx_max_risk_inr"] = min_mcx_risk
@@ -1841,7 +1872,6 @@ class IntradayV3Engine:
         high20 = curr.get("high20")
         low20 = curr.get("low20")
 
-        # Intraday Opening Range (first 15 mins = 3 bars on 5m) & Day % Change
         today_s = now_ist.strftime("%Y-%m-%d")
         today_df = df[df["timestamp"].dt.strftime("%Y-%m-%d") == today_s]
         orb_bars = 3 if tf_min == 5 else 1
@@ -1898,7 +1928,6 @@ class IntradayV3Engine:
                 "short_status": "COOLDOWN (15m)",
             }
 
-        # Startup warm-up guard (prevents blind bottom/top chasing immediately on script deploy)
         uptime_sec = time.time() - self.engine_boot_ts
         if uptime_sec < STARTUP_WARMUP_SEC:
             rem_w = max(1, int(STARTUP_WARMUP_SEC - uptime_sec))
@@ -1909,7 +1938,6 @@ class IntradayV3Engine:
                 "short_status": f"WARMUP ({rem_w}s)",
             }
 
-        # Enforce Per-Symbol Cooldown & Max Concurrent Limit
         sec_since_exit = time.time() - self.last_exit_ts.get(idx, 0.0)
         same_candle_as_exit = (curr_candle_ts == self.last_exit_candle_ts.get(idx, ""))
         if sec_since_exit < REENTRY_COOLDOWN_SEC or same_candle_as_exit:
@@ -1953,16 +1981,21 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # VWAP + EMA Trend Alignment & Anti-Overextension Filter
+        # VWAP + 20-EMA Trend Alignment & Silver Anti-Trap Extension Guard
         vwap_ema_bull = (spot_close > vwap) and (spot_close > ema20)
         vwap_ema_bear = (spot_close < vwap) and (spot_close < ema20)
         dist_from_ema20 = abs(spot_close - ema20)
-        not_overextended = dist_from_ema20 <= (MAX_EMA20_EXTENSION_ATR * atr14)
+        max_ext_atr = SILVER_MAX_EMA20_EXT_ATR if idx == "SILVER" else MAX_EMA20_EXTENSION_ATR
+        not_overextended = dist_from_ema20 <= (max_ext_atr * atr14)
+
+        # Gann Support / VWAP Proximity Guard (<= 2.5 x ATR from structural base)
+        near_bull_base = min(abs(spot_close - sup), abs(spot_close - vwap)) <= (MAX_PULLBACK_BASE_DIST_ATR * atr14)
+        near_bear_base = min(abs(res - spot_close), abs(vwap - spot_close)) <= (MAX_PULLBACK_BASE_DIST_ATR * atr14)
 
         new_signal = None
         immediate_fasttrack = False
 
-        # Trigger 1: Fresh Crash / Rally Fast-Track (ONLY when current/recent bar freshly breaks ORB or 20-bar level, not hours late)
+        # Trigger 1: Fresh Crash / Rally Fast-Track
         if len(today_df) > orb_bars and not_overextended:
             fresh_orb_dn = (orb_low is not None) and (spot_close < orb_low) and (prev_close >= orb_low - 0.15 * atr14)
             fresh_orb_up = (orb_high is not None) and (spot_close > orb_high) and (prev_close <= orb_high + 0.15 * atr14)
@@ -1998,15 +2031,24 @@ class IntradayV3Engine:
                 }
                 immediate_fasttrack = True
 
-        # Trigger 2: VWAP / 20 EMA Pullback Rejection (Catches early 17:15-style trend pullbacks cleanly!)
+        # Trigger 2: 20-EMA / VWAP Pullback Touch & Rejection (Only within <= 2.5 x ATR of Gann/VWAP base)
         if new_signal is None and not pending:
-            touched_vwap_ema_up = (float(curr["high"]) >= min(vwap, ema20) - 0.25 * atr14)
-            touched_vwap_ema_dn = (float(curr["low"]) <= max(vwap, ema20) + 0.25 * atr14)
+            touched_ema20_or_vwap_up = (
+                float(curr["high"]) >= (ema20 - 0.35 * atr14)
+                or float(prev["high"]) >= (ema20 - 0.25 * atr14)
+                or float(curr["high"]) >= (vwap - 0.35 * atr14)
+            )
+            touched_ema20_or_vwap_dn = (
+                float(curr["low"]) <= (ema20 + 0.35 * atr14)
+                or float(prev["low"]) <= (ema20 + 0.25 * atr14)
+                or float(curr["low"]) <= (vwap + 0.35 * atr14)
+            )
 
             if (
                 vwap_ema_bear
                 and ema20 <= ema50
-                and touched_vwap_ema_up
+                and near_bear_base
+                and touched_ema20_or_vwap_up
                 and float(curr["close"]) < float(curr["open"])
                 and price_change < 0
                 and oi_pcr_bear_ok
@@ -2014,15 +2056,16 @@ class IntradayV3Engine:
                 side_label = "SELL" if is_mcx else "PE"
                 new_signal = {
                     "side": "PE", "display_side": side_label,
-                    "name": f"VWAP_EMA_PULLBACK_{side_label}",
-                    "gann_level": round(vwap, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "name": f"EMA20_VWAP_PULLBACK_{side_label}",
+                    "gann_level": round(ema20, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
                     "is_retest": False,
                 }
                 immediate_fasttrack = True
             elif (
                 vwap_ema_bull
                 and ema20 >= ema50
-                and touched_vwap_ema_dn
+                and near_bull_base
+                and touched_ema20_or_vwap_dn
                 and float(curr["close"]) > float(curr["open"])
                 and price_change > 0
                 and oi_pcr_bull_ok
@@ -2030,13 +2073,13 @@ class IntradayV3Engine:
                 side_label = "BUY" if is_mcx else "CE"
                 new_signal = {
                     "side": "CE", "display_side": side_label,
-                    "name": f"VWAP_EMA_PULLBACK_{side_label}",
-                    "gann_level": round(vwap, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
+                    "name": f"EMA20_VWAP_PULLBACK_{side_label}",
+                    "gann_level": round(ema20, 2), "trigger": round(spot_close, 2), "armed_at": now_ist,
                     "is_retest": False,
                 }
                 immediate_fasttrack = True
 
-        # Trigger 3: 20-Bar Breakout with TR >= 1.2x ATR (Arms Retest Setup)
+        # Trigger 3: 20-Bar Breakout with TR >= 1.2x ATR (Blocked on Silver if > 2.6x ATR from 20 EMA)
         if new_signal is None and not pending and not_overextended:
             if pd.notna(high20) and spot_close > float(high20) and curr_tr >= BREAKOUT_EXPANSION_ATR * atr14 and vwap_ema_bull and ema20 > ema50 and oi_pcr_bull_ok:
                 side_label = "BUY" if is_mcx else "CE"
@@ -2056,7 +2099,7 @@ class IntradayV3Engine:
                 }
 
         # Trigger 4: Gann Level + 6 Chart Patterns + VWAP/EMA Confirmation
-        if new_signal is None:
+        if new_signal is None and (idx != "SILVER" or not_overextended):
             if near_gann is not None and bull_pattern is not None and price_change > 0 and vwap_ema_bull and oi_pcr_bull_ok:
                 side_label = "BUY" if is_mcx else "CE"
                 new_signal = {
@@ -2100,7 +2143,7 @@ class IntradayV3Engine:
             if in_expiry_slope:
                 req_fuel = float(self.tuned_params.get("expiry_slope_fuel_score", 32.0))
             elif in_open_window:
-                req_fuel = 42.0
+                req_fuel = 40.0
             elif is_mcx:
                 morn_mcx = float(self.tuned_params.get("mcx_morning_fuel_score", MCX_MORNING_FUEL_SCORE))
                 eve_mcx = float(self.tuned_params.get("mcx_evening_fuel_score", MCX_EVENING_FUEL_SCORE))
