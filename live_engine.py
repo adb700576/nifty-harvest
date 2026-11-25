@@ -99,6 +99,7 @@ PARAMS_FILE = "live_journal/strategy_params.json"
 MEMORY_FILE = "live_journal/market_memory.json"
 MACRO_FILE = "live_journal/macro_context.json"
 DASHBOARD_STATE_FILE = "live_journal/dashboard_state.json"
+LOCK_FILE = "live_journal/engine.lock"
 
 JOURNAL_FIELDNAMES = [
     "trade_no", "date", "entry_time", "exit_time", "symbol", "contract", "side",
@@ -1075,6 +1076,41 @@ class IntradayV3Engine:
             "india_vix": 15.0,
             "summary": "Normal Market",
         }
+
+    def acquire_single_instance_lock(self) -> bool:
+        os.makedirs("live_journal", exist_ok=True)
+        curr_run_id = os.getenv("GITHUB_RUN_ID", str(os.getpid()))
+        curr_pid = os.getpid()
+
+        if os.path.isfile(LOCK_FILE):
+            try:
+                with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                    st = json.load(f)
+                old_pid = int(st.get("pid", 0))
+                old_ts = float(st.get("ts", 0))
+                if old_pid > 0 and old_pid != curr_pid and (time.time() - old_ts) < 21600:
+                    try:
+                        os.kill(old_pid, 0)
+                        log.warning(f"[OVERLAP GUARD] Another engine instance (PID {old_pid}) is already running. Exiting cleanly.")
+                        return False
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            with open(LOCK_FILE, "w", encoding="utf-8") as f:
+                json.dump({"pid": curr_pid, "run_id": curr_run_id, "ts": time.time()}, f)
+        except Exception:
+            pass
+        return True
+
+    def release_single_instance_lock(self):
+        try:
+            if os.path.isfile(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
+            pass
 
     def get_active_capital(self) -> float:
         val = float(os.getenv("CAPITAL_PER_TRADE") or self.tuned_params.get("capital_per_trade", 25000.0))
@@ -2594,16 +2630,21 @@ class IntradayV3Engine:
                 f"────────────────────────────\n"
                 f"💼 <b>Day Net P&amp;L:</b> <b>₹{self.day_pnl:+,.2f}</b>  |  <b>Trades:</b> {len(self.closed_trades)}"
             )
+        self.release_single_instance_lock()
 
     def run(self):
         if not UPSTOX_ACCESS_TOKEN:
             log.error("UPSTOX_ACCESS_TOKEN missing! Exiting.")
             sys.exit(1)
 
+        if not self.acquire_single_instance_lock():
+            return
+
         now_ist = datetime.now(IST)
 
         if is_overnight_dead_hours(now_ist):
             log.info(f"Outside market hours ({now_ist.strftime('%H:%M')} IST). Standing down cleanly.")
+            self.release_single_instance_lock()
             return
 
         if now_ist.weekday() >= 5:
@@ -2615,6 +2656,7 @@ class IntradayV3Engine:
                 f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
                 f"💤 <i>No live trading session today. Engine standing down cleanly.</i>"
             )
+            self.release_single_instance_lock()
             return
 
         self.load_self_tuned_intelligence()
@@ -2662,6 +2704,7 @@ class IntradayV3Engine:
                     f"📅 <b>Date:</b> <code>{now_ist.strftime('%d-%b-%Y (%A)')}</code>\n"
                     f"💤 <i>Both NSE/BSE and MCX closed today. Standing down cleanly.</i>"
                 )
+                self.release_single_instance_lock()
                 return
         elif nse_has_live_candles:
             self.session_sched["is_holiday"] = False
