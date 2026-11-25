@@ -2461,6 +2461,21 @@ class IntradayV3Engine:
             )
             return
 
+        self.load_self_tuned_intelligence()
+
+        # Clear any accidental learned_holiday entry for today before checking schedule
+        today_clean = now_ist.strftime("%Y-%m-%d")
+        if today_clean in self.tuned_params.get("learned_holidays", []):
+            self.tuned_params["learned_holidays"] = [
+                d for d in self.tuned_params["learned_holidays"] if d != today_clean
+            ]
+            os.makedirs(os.path.dirname(PARAMS_FILE), exist_ok=True)
+            try:
+                with open(PARAMS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(self.tuned_params, f, indent=2)
+            except Exception:
+                pass
+
         self.session_sched = inspect_special_session_schedule(now_ist)
         live_nse_status = check_live_exchange_status("NSE")
         if HAS_AUTO_TUNER:
@@ -2490,7 +2505,6 @@ class IntradayV3Engine:
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, "stop_requested", True))
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, "stop_requested", True))
 
-        self.load_self_tuned_intelligence()
         self.refresh_live_macro_news(force=True)
         self.load_today_state_from_journal()
         self.init_contracts()
@@ -2498,7 +2512,7 @@ class IntradayV3Engine:
         self.bot_status_text = "BOT LIVE"
         session_start_ts = time.time()
         self.engine_boot_ts = session_start_ts
-        holiday_checked_0916 = False
+        holiday_checked_0922 = False
 
         if self.session_sched["is_muhurat"]:
             sess_banner = f"🪔 MUHURAT TRADING • NSE {self.session_sched['nse_start']}–{self.session_sched['nse_exit']} | MCX {self.session_sched['mcx_start']}–{self.session_sched['mcx_exit']}"
@@ -2530,15 +2544,16 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "SESSION HANDOVER")
                 break
 
-            if not holiday_checked_0916 and self.session_sched["nse_open"] and not self.session_sched["is_muhurat"] and "09:16" <= hhmm <= "09:30":
-                holiday_checked_0916 = True
+            if not holiday_checked_0922 and self.session_sched["nse_open"] and not self.session_sched["is_muhurat"] and "09:22" <= hhmm <= "09:35":
+                holiday_checked_0922 = True
                 nifty_check_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
                 today_s = now_ist.strftime("%Y-%m-%d")
                 has_today_candle = (
                     not nifty_check_df.empty
                     and str(nifty_check_df["timestamp"].iloc[-1])[:10] == today_s
                 )
-                if not has_today_candle:
+                nse_live_now = check_live_exchange_status("NSE")
+                if not has_today_candle and nse_live_now in ("CLOSED", "CLOSING", ""):
                     self.session_sched["is_holiday"] = True
                     self.session_sched["nse_open"] = False
                     self.session_sched["mcx_open"] = True
