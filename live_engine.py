@@ -729,8 +729,6 @@ def compute_market_regime(df: pd.DataFrame, min_adx: float, max_chop: float) -> 
 
 
 def compute_gann_levels(price: float, step: float) -> dict:
-    # Scale root step by price magnitude so high-priced contracts (Silver ~145k, Sensex ~82k)
-    # get clean ~0.8%-1.0% structural Gann spacing instead of crowded 0.25% micro-lines.
     if price >= 100000:
         root_inc = 1.50
     elif price >= 50000:
@@ -1981,14 +1979,12 @@ class IntradayV3Engine:
                 self.pending_setups[idx] = None
                 pending = None
 
-        # VWAP + 20-EMA Trend Alignment & Silver Anti-Trap Extension Guard
         vwap_ema_bull = (spot_close > vwap) and (spot_close > ema20)
         vwap_ema_bear = (spot_close < vwap) and (spot_close < ema20)
         dist_from_ema20 = abs(spot_close - ema20)
         max_ext_atr = SILVER_MAX_EMA20_EXT_ATR if idx == "SILVER" else MAX_EMA20_EXTENSION_ATR
         not_overextended = dist_from_ema20 <= (max_ext_atr * atr14)
 
-        # Gann Support / VWAP Proximity Guard (<= 2.5 x ATR from structural base)
         near_bull_base = min(abs(spot_close - sup), abs(spot_close - vwap)) <= (MAX_PULLBACK_BASE_DIST_ATR * atr14)
         near_bear_base = min(abs(res - spot_close), abs(vwap - spot_close)) <= (MAX_PULLBACK_BASE_DIST_ATR * atr14)
 
@@ -2463,7 +2459,6 @@ class IntradayV3Engine:
 
         self.load_self_tuned_intelligence()
 
-        # Clear any accidental learned_holiday entry for today before checking schedule
         today_clean = now_ist.strftime("%Y-%m-%d")
         if today_clean in self.tuned_params.get("learned_holidays", []):
             self.tuned_params["learned_holidays"] = [
@@ -2478,7 +2473,15 @@ class IntradayV3Engine:
 
         self.session_sched = inspect_special_session_schedule(now_ist)
         live_nse_status = check_live_exchange_status("NSE")
-        if HAS_AUTO_TUNER:
+
+        # Verify against live NIFTY candles so stale learned_holidays never override an active market
+        nifty_live_df = fetch_intraday_candles(INDICES["NIFTY"]["spot_key"], 5)
+        nse_has_live_candles = (
+            not nifty_live_df.empty
+            and str(nifty_live_df["timestamp"].iloc[-1])[:10] == today_clean
+        )
+
+        if HAS_AUTO_TUNER and not nse_has_live_candles and live_nse_status not in ("OPEN", "NORMAL_OPEN", "PRE_OPEN"):
             learned_reason = get_market_closed_reason(now_ist, live_nse_status)
             if learned_reason and not self.session_sched["is_holiday"]:
                 self.session_sched["is_holiday"] = True
@@ -2487,7 +2490,7 @@ class IntradayV3Engine:
                 self.session_sched["mcx_open"] = True
                 self.session_sched["mcx_start"] = "17:00"
 
-        if self.session_sched["is_holiday"]:
+        if self.session_sched["is_holiday"] and not nse_has_live_candles:
             if HAS_AUTO_TUNER:
                 record_learned_holiday(now_ist.strftime("%Y-%m-%d"))
 
@@ -2501,6 +2504,11 @@ class IntradayV3Engine:
                     f"💤 <i>Both NSE/BSE and MCX closed today. Standing down cleanly.</i>"
                 )
                 return
+        elif nse_has_live_candles:
+            self.session_sched["is_holiday"] = False
+            self.session_sched["nse_open"] = True
+            self.session_sched["mcx_open"] = True
+            self.session_sched["mcx_start"] = MCX_START_TIME
 
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, "stop_requested", True))
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, "stop_requested", True))
