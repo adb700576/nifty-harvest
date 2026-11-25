@@ -66,6 +66,32 @@ jobs:
             echo "UPSTOX_ACCESS_TOKEN=$TOKEN_VAL" >> $GITHUB_ENV
           fi
 
+      - name: Send 08:55 AM Institutional Quant Homework Briefing
+        if: steps.time_gate.outputs.allow_run == 'true'
+        continue-on-error: true
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN || secrets.UPSTOX_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GSHEET_WEBHOOK_URL: ${{ secrets.GSHEET_WEBHOOK_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -f ACCESS_TOKEN.txt ] && [ -s ACCESS_TOKEN.txt ]; then
+            FILE_TOKEN=$(cat ACCESS_TOKEN.txt | tr -d '\r\n ')
+            if [ -n "$FILE_TOKEN" ]; then
+              export UPSTOX_ACCESS_TOKEN="$FILE_TOKEN"
+            fi
+          fi
+          python -u -c "
+          from datetime import datetime, timezone, timedelta
+          import live_engine, ai_trading_agent
+          live_engine.restore_journal_from_google_sheet()
+          ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+          if '08:35' <= ist.strftime('%H:%M') <= '09:15':
+              agent = ai_trading_agent.TickByTickAITradingAgent()
+              agent.generate_institutional_homework_briefing(send_morning_msg=True)
+          "
+
       - name: Run Self-Maturing V3 Live Engine (with Tick-by-Tick AI Trading Agent)
         if: steps.time_gate.outputs.allow_run == 'true'
         env:
