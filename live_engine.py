@@ -2218,7 +2218,7 @@ class IntradayV3Engine:
             self.pending_setups[idx] = None
             return
 
-        req_margin_1lot = fetch_required_margin(inst_key, 1, tx_side, "I")
+        req_margin_1lot = fetch_required_margin(inst_key, lot_size, tx_side, "I")
         margin_lots = max(1, int(mcx_cap // req_margin_1lot)) if req_margin_1lot > 0 else 1
         risk_lots = max(1, int(max_risk_cap // max(risk_1_lot, 1.0)))
         lots = min(margin_lots, risk_lots)
