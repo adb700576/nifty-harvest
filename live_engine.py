@@ -102,7 +102,7 @@ DASHBOARD_STATE_FILE = "live_journal/dashboard_state.json"
 
 JOURNAL_FIELDNAMES = [
     "trade_no", "date", "entry_time", "exit_time", "symbol", "contract", "side",
-    "qty", "entry_price", "exit_price", "points", "sl", "target", "exit_reason",
+    "qty", "pnl_units", "entry_price", "exit_price", "points", "sl", "target", "exit_reason",
     "gross_pnl", "brokerage", "taxes_other", "charges", "pnl", "day_pnl", "setup",
 ]
 
@@ -321,6 +321,8 @@ def restore_journal_from_google_sheet():
                 continue
             seen_keys.add(key)
 
+            qty_v = int(float(st.get("qty", 0) or 0))
+            units_v = int(float(st.get("pnl_units") or qty_v))
             clean_row = {
                 "trade_no": t_no,
                 "date": d_str,
@@ -329,7 +331,8 @@ def restore_journal_from_google_sheet():
                 "symbol": sym,
                 "contract": str(st.get("contract", "")).strip(),
                 "side": str(st.get("side", "")).strip(),
-                "qty": int(float(st.get("qty", 0) or 0)),
+                "qty": qty_v,
+                "pnl_units": units_v,
                 "entry_price": float(st.get("entry_price", 0.0) or 0.0),
                 "exit_price": float(st.get("exit_price", 0.0) or 0.0),
                 "points": float(st.get("points", 0.0) or 0.0),
@@ -636,10 +639,11 @@ def get_active_future_contract(idx: str) -> dict:
     min_lot = int(top.get("minimum_lot", 1) or 1)
     order_lot_size = raw_lot if raw_lot > 1 else (min_lot if min_lot > 1 else 1)
 
-    # Derive exact 1-point P&L multiplier dynamically from price_quote_unit (e.g. GOLDM: 100g / 10g = 10 per pt)
+    # Derive exact 1-point P&L multiplier from price_quote_unit / contract quote standard (GOLDM: 100g / 10g quote = ₹10/pt)
     quote_unit = str(top.get("price_quote_unit", "")).upper()
+    tsym_top = str(top.get("trading_symbol", "")).upper()
     quote_denom = 1
-    if "10 GRM" in quote_unit or "10GM" in quote_unit or "10 G" in quote_unit:
+    if "10 GRM" in quote_unit or "10GM" in quote_unit or "10 G" in quote_unit or (tsym_top.startswith("GOLDM") and order_lot_size == 100):
         quote_denom = 10
     elif "100 GRM" in quote_unit or "100GM" in quote_unit:
         quote_denom = 100
@@ -1309,11 +1313,14 @@ class IntradayV3Engine:
                     if d_str == today_str:
                         pnl_val = float(r.get("pnl", 0.0))
                         t_no = int(float(r.get("trade_no", len(self.closed_trades) + 1)))
+                        qty_v = int(float(r.get("qty", 0)))
+                        units_v = int(float(r.get("pnl_units") or qty_v))
                         self.closed_trades.append({
                             "trade_no": t_no, "date": d_str, "entry_time": r.get("entry_time", ""),
                             "exit_time": r.get("exit_time", ""), "symbol": r.get("symbol", ""),
                             "contract": r.get("contract", ""), "side": r.get("side", ""),
-                            "qty": int(float(r.get("qty", 0))), "entry_price": float(r.get("entry_price", 0.0)),
+                            "qty": qty_v, "pnl_units": units_v,
+                            "entry_price": float(r.get("entry_price", 0.0)),
                             "exit_price": float(r.get("exit_price", 0.0)), "points": float(r.get("points", 0.0)),
                             "sl": float(r.get("sl", 0.0)), "target": float(r.get("target", 0.0)),
                             "exit_reason": r.get("exit_reason", ""), "gross_pnl": float(r.get("gross_pnl", 0.0)),
@@ -1694,7 +1701,7 @@ class IntradayV3Engine:
                     lines.extend([
                         f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)  |  {trail_tag}",
                         f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
-                        f"  Calc: <code>{pts_diff:+.2f} × {eff_units} = ₹{gross_val:+,.2f}</code> (Chg ₹{est_charges:.0f})",
+                        f"  PnL: <code>{pts_diff:.2f} pt × {eff_units} = ₹{gross_val:,.0f}</code>",
                         f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
                         f"  Live Net P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
@@ -1703,9 +1710,13 @@ class IntradayV3Engine:
             if self.closed_trades:
                 for t in sorted(self.closed_trades, key=lambda x: x["trade_no"]):
                     icon = "✅" if t["pnl"] >= 0 else "❌"
+                    pts_t = float(t.get("points", 0.0))
+                    units_t = int(float(t.get("pnl_units") or t.get("qty", 1)))
+                    gross_t = float(t.get("gross_pnl", round(pts_t * units_t, 2)))
                     lines.append(
-                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code> ({t['qty']} Qty)  {icon} <b>₹{t['pnl']:+,.2f}</b>\n"
-                        f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>  |  ₹{t['entry_price']:.2f}→₹{t['exit_price']:.2f}  |  <i>{t['exit_reason']}</i>"
+                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} Net <b>₹{t['pnl']:+,.2f}</b>\n"
+                        f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> | In: ₹{t['entry_price']:.2f} → Exit: ₹{t['exit_price']:.2f}\n"
+                        f"  PnL: <code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code> | <i>{t['exit_reason']}</i>"
                     )
             elif not active_snap:
                 lines.append("<i>No closed trades yet today.</i>")
@@ -1799,7 +1810,8 @@ class IntradayV3Engine:
             "trade_no": pos["trade_no"], "date": now_ist.strftime("%Y-%m-%d"),
             "entry_time": pos.get("entry_time", ""), "exit_time": exit_time_str,
             "symbol": idx, "contract": str(pos["strike"]), "side": pos["display_side"],
-            "qty": pos["qty"], "entry_price": pos["entry_price"], "exit_price": ltp,
+            "qty": pos["qty"], "pnl_units": int(eff_units),
+            "entry_price": pos["entry_price"], "exit_price": ltp,
             "points": pts, "sl": pos["sl"], "target": 0.0, "exit_reason": exit_reason,
             "gross_pnl": gross_pnl, "brokerage": ch_info["brokerage"],
             "taxes_other": ch_info["taxes_other"], "charges": ch_info["total"],
@@ -2720,6 +2732,10 @@ class IntradayV3Engine:
                     res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
                         self.last_summaries[idx] = res
+            else:
+                for idx in self.last_summaries:
+                    if idx not in self.active_positions:
+                        self.last_summaries[idx]["short_status"] = "PAUSED"
 
             if not self.dashboard_msg_id and self.last_summaries:
                 self.render_live_dashboard(hhmm)
