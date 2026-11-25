@@ -102,11 +102,11 @@ def apply_event_day_shield(
         params["morning_wait_until"] = "09:45"
         min_floor = round(capital * 0.025, 2)
         params["index_max_risk_inr"] = max(min_floor, round(float(params["index_max_risk_inr"]) * 0.60, 2))
-        params["min_fuel_score"] = max(float(params.get("min_fuel_score", 48.0)), 55.0)
+        params["min_fuel_score"] = max(float(params.get("min_fuel_score", 45.0)), 52.0)
     else:
         params["event_mode"] = False
         params["event_label"] = ""
-        params["morning_wait_until"] = "09:30"
+        params["morning_wait_until"] = "09:15"
     return params
 
 
@@ -122,7 +122,7 @@ def upgrade_for_iv_crush_and_low_delta(params: dict, today_trades: list[dict]) -
         params["strike_offset"] = -1
         params["expiry_strike_offset"] = 0
         params["no_momentum_minutes"] = 10
-        params["min_fuel_score"] = min(62.0, float(params.get("min_fuel_score", 48.0)) + 4.0)
+        params["min_fuel_score"] = min(52.0, float(params.get("min_fuel_score", 45.0)) + 3.0)
         return params, f" | IV-Crush Upgrade ({iv_crush_count} stalls -> ITM/ATM + 10m Timer)"
 
     params.setdefault("strike_offset", 0)
@@ -184,22 +184,23 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
         "mcx_capital_per_trade": mcx_capital,
         "max_daily_loss_inr": round(capital * 0.15, 2),
         "index_max_risk_inr": round(capital * 0.05, 2),
-        "mcx_max_risk_inr": round(mcx_capital * 0.01, 2),
-        "min_fuel_score": 48.0,
+        "mcx_max_risk_inr": round(mcx_capital * 0.025, 2),
+        "min_fuel_score": 45.0,
         "expiry_slope_fuel_score": 32.0,
         "expiry_slope_start": "13:45",
         "expiry_slope_end": "14:45",
         "expiry_strike_offset": 1,
         "strike_offset": 0,
-        "mcx_evening_fuel_score": 56.0,
+        "mcx_morning_fuel_score": 46.0,
+        "mcx_evening_fuel_score": 44.0,
         "min_adx_trend": 19.0,
         "max_chop_index": 60.0,
         "swing_lookback_candles": 75,
         "atr_sl_buffer_mult": 0.12,
         "trail_cushion_mult": 1.0,
-        "scalp_target_r": 1.35,
+        "scalp_target_r": 1.80,
         "no_momentum_minutes": 15,
-        "morning_wait_until": "09:30",
+        "morning_wait_until": "09:15",
         "news_ignition_atr_mult": 2.2,
         "news_ignition_vol_mult": 2.5,
         "min_option_delta": 0.45,
@@ -220,8 +221,10 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
     params["capital_per_trade"] = capital
     params["mcx_capital_per_trade"] = mcx_capital
     params["index_max_risk_inr"] = round(capital * 0.05, 2)
-    params["mcx_max_risk_inr"] = round(mcx_capital * 0.01, 2)
+    params["mcx_max_risk_inr"] = round(mcx_capital * 0.025, 2)
     params["max_daily_loss_inr"] = round(capital * 0.15, 2)
+    params["min_fuel_score"] = min(48.0, float(params.get("min_fuel_score", 45.0)))
+    params["mcx_evening_fuel_score"] = min(46.0, float(params.get("mcx_evening_fuel_score", 44.0)))
 
     all_trades = []
     if os.path.isfile(JOURNAL_FILE):
@@ -234,7 +237,7 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
                     continue
 
     today_str = now_ist.strftime("%Y-%m-%d")
-    today_trades = [t for t in all_trades if t.get("date") == today_str]
+    today_trades = [t for t in all_trades if str(t.get("date", ""))[:10] == today_str]
     recent_10 = all_trades[-10:]
 
     old_gear = int(params.get("driver_gear", 3))
@@ -246,7 +249,7 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
     lesson = f"Ready for {next_session_str} ({'EXPIRY SLOPE ARMED' if params['is_expiry_day'] else 'NORMAL SESSION'})"
 
     idx_risk_floor = round(capital * 0.032, 2)
-    mcx_risk_floor = round(mcx_capital * 0.006, 2)
+    mcx_risk_floor = round(mcx_capital * 0.02, 2)
 
     if recent_10:
         gross_win = sum(t["pnl_val"] for t in recent_10 if t["pnl_val"] > 0)
@@ -269,17 +272,17 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
 
         if major_accident:
             new_gear = min(2, max(1, old_gear - 2))
-            params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.80, 2))
-            params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.80, 2))
-            params["min_fuel_score"] = min(60.0, float(params.get("min_fuel_score", 48.0)) + 4.0)
-            params["expiry_slope_fuel_score"] = min(42.0, float(params.get("expiry_slope_fuel_score", 32.0)) + 3.0)
+            params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.85, 2))
+            params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.85, 2))
+            params["min_fuel_score"] = min(48.0, float(params.get("min_fuel_score", 45.0)) + 2.0)
+            params["expiry_slope_fuel_score"] = min(40.0, float(params.get("expiry_slope_fuel_score", 32.0)) + 2.0)
             lesson = f"SHIELD TRIGGERED -> Gear {old_gear}->{new_gear} | Risk & Fuel tightened (Day ₹{day_net:+.0f})"
         elif len(recent_10) >= 5:
             if wr_10 >= 65.0 and profit_factor >= 2.2:
                 new_gear = min(5, old_gear + 1)
                 params["index_max_risk_inr"] = min(round(capital * 0.05, 2), round(params["index_max_risk_inr"] * 1.10, 2))
-                params["mcx_max_risk_inr"] = min(round(mcx_capital * 0.01, 2), round(params["mcx_max_risk_inr"] * 1.10, 2))
-                params["min_fuel_score"] = max(44.0, float(params.get("min_fuel_score", 48.0)) - 2.0)
+                params["mcx_max_risk_inr"] = min(round(mcx_capital * 0.025, 2), round(params["mcx_max_risk_inr"] * 1.10, 2))
+                params["min_fuel_score"] = max(43.0, float(params.get("min_fuel_score", 45.0)) - 1.0)
                 params["expiry_slope_fuel_score"] = max(30.0, float(params.get("expiry_slope_fuel_score", 32.0)) - 1.0)
                 lesson = f"High Precision -> Upshift Gear {new_gear} (PF {profit_factor})"
             elif wr_10 >= 55.0 and profit_factor >= 1.6 and old_gear < 4:
@@ -287,9 +290,9 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
                 lesson = f"Strong Trend Capture -> Upshift Gear 4 (PF {profit_factor})"
             elif wr_10 < 35.0 or profit_factor < 0.75:
                 new_gear = max(1, old_gear - 1)
-                params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.85, 2))
-                params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.85, 2))
-                params["min_fuel_score"] = min(58.0, float(params.get("min_fuel_score", 48.0)) + 3.0)
+                params["index_max_risk_inr"] = max(idx_risk_floor, round(params["index_max_risk_inr"] * 0.90, 2))
+                params["mcx_max_risk_inr"] = max(mcx_risk_floor, round(params["mcx_max_risk_inr"] * 0.90, 2))
+                params["min_fuel_score"] = min(48.0, float(params.get("min_fuel_score", 45.0)) + 2.0)
                 lesson = f"Drawdown Shield -> Downshift Gear {new_gear} (PF {profit_factor})"
 
     params["driver_gear"] = new_gear
@@ -300,19 +303,18 @@ def run_nightly_calibration(nearest_option_expiry_str: str = "", vix_change_pct:
     params, greeks_note = calibrate_options_chain_brain(params, today_trades)
     lesson += iv_note + greeks_note
 
-    # Dynamic 4% of capital symbol cooldown threshold (zero hardcoded rupee threshold)
-    cooldown_threshold = round(capital * 0.04, 2)
+    cooldown_threshold = round(capital * 0.08, 2)
     sym_ov = params.get("symbol_overrides", {})
     for sym in set(t.get("symbol", "") for t in today_trades if t.get("symbol")):
         sym_today_pnl = sum(t["pnl_val"] for t in today_trades if t.get("symbol") == sym)
         ov = sym_ov.get(sym, {"min_fuel": params["min_fuel_score"], "cooldown": False})
         if sym_today_pnl < -cooldown_threshold:
             ov["cooldown"] = True
-            ov["min_fuel"] = min(65.0, float(ov.get("min_fuel", 48.0)) + 5.0)
+            ov["min_fuel"] = min(52.0, float(ov.get("min_fuel", 45.0)) + 3.0)
             lesson += f" | {sym} Cooldown (Fuel {ov['min_fuel']}+)"
         elif sym_today_pnl > cooldown_threshold:
             ov["cooldown"] = False
-            ov["min_fuel"] = max(44.0, float(ov.get("min_fuel", 48.0)) - 2.0)
+            ov["min_fuel"] = max(43.0, float(ov.get("min_fuel", 45.0)) - 1.0)
         sym_ov[sym] = ov
     params["symbol_overrides"] = sym_ov
 
