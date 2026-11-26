@@ -118,9 +118,10 @@ FUEL_FINISH_THRESHOLD = 18.0
 FLAT_LTP_NORMAL_SEC = 900
 FLAT_LTP_EXPIRY_SEC = 600
 
-DAILY_PROFIT_LOCK_PCT = 0.05        # 5% Net Profit (after brokerage & taxes) -> ₹1,250 (Index) / ₹7,500 (MCX)
-DAILY_LOSS_LOCK_PCT = -0.15         # -15% Max Daily Loss
-MAX_CONSECUTIVE_LOSSES = 3
+DAILY_PROFIT_LOCK_PCT = 0.05        # Ignored while unrestricted signal-only mode is active
+DAILY_LOSS_LOCK_PCT = -0.15         # Ignored while unrestricted signal-only mode is active
+MAX_CONSECUTIVE_LOSSES = 3          # Ignored while unrestricted signal-only mode is active
+ENFORCE_RISK_CAPS = False           # Disable max loss, max profit, 3-loss pause & per-trade risk caps
 
 INDICES = {
     "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "tf_min": 5},
@@ -1039,7 +1040,7 @@ class IntradayV3Engine:
             "expiry_slope_fuel_score": 32.0,
             "expiry_slope_start": "13:45",
             "expiry_slope_end": "14:45",
-            "expiry_strike_offset": 1,
+            "expiry_strike_offset": 0,
             "strike_offset": 0,
             "mcx_morning_fuel_score": MCX_MORNING_FUEL_SCORE,
             "mcx_evening_fuel_score": MCX_EVENING_FUEL_SCORE,
@@ -1133,15 +1134,12 @@ class IntradayV3Engine:
                     self.tuned_params["min_fuel_score"] = 45.0
                 if float(self.tuned_params.get("mcx_evening_fuel_score", 44.0)) > 46.0:
                     self.tuned_params["mcx_evening_fuel_score"] = 44.0
-                min_mcx_risk = round(self.get_active_mcx_capital() * 0.025, 2)
-                if float(self.tuned_params.get("mcx_max_risk_inr", 1500.0)) < min_mcx_risk:
-                    self.tuned_params["mcx_max_risk_inr"] = min_mcx_risk
                 log.info(
                     f"[BRAIN LOADED] {self.tuned_params.get('brain_version')} | "
                     f"Gear={self.tuned_params.get('driver_gear')} | "
                     f"IdxFuel(5m)={self.tuned_params.get('min_fuel_score')} | "
                     f"McxFuel(5m)={self.tuned_params.get('mcx_evening_fuel_score')} | "
-                    f"McxRiskCap=₹{self.tuned_params.get('mcx_max_risk_inr')}"
+                    f"Mode=UNRESTRICTED_1LOT_ATM"
                 )
             except Exception as e:
                 log.warning(f"Failed to load strategy_params.json: {e}")
@@ -1633,16 +1631,18 @@ class IntradayV3Engine:
         curr_year, curr_week, _ = now_ist.isocalendar()
         curr_month_prefix = now_ist.strftime("%Y-%m")
 
-        rows = []
+        past_rows = []
         if os.path.isfile(JOURNAL_FILE):
             try:
                 with open(JOURNAL_FILE, mode="r", encoding="utf-8") as f:
                     for r in csv.DictReader(f):
                         try:
                             d_str = _normalize_date_str(r.get("date"))
+                            if not d_str or d_str == today_str:
+                                continue
                             d_obj = datetime.strptime(d_str, "%Y-%m-%d")
                             y_iso, w_iso, _ = d_obj.isocalendar()
-                            rows.append({
+                            past_rows.append({
                                 "date": d_str,
                                 "year": y_iso,
                                 "week": w_iso,
@@ -1653,22 +1653,23 @@ class IntradayV3Engine:
             except Exception:
                 pass
 
-        def calc(sub):
-            tot = len(sub)
-            wins = sum(1 for x in sub if x["pnl"] > 0)
+        # Sync today's Daily summary directly with top Day Net P&L (self.day_pnl & self.closed_trades)
+        d_tot = len(self.closed_trades)
+        d_wins = sum(1 for x in self.closed_trades if x["pnl"] > 0)
+        d_wr = int(round((d_wins / d_tot) * 100.0)) if d_tot > 0 else 0
+        d_net = round(self.day_pnl, 2)
+
+        def combine_period(sub):
+            tot = len(sub) + d_tot
+            wins = sum(1 for x in sub if x["pnl"] > 0) + d_wins
             wr = int(round((wins / tot) * 100.0)) if tot > 0 else 0
-            net = round(sum(x["pnl"] for x in sub), 2)
+            net = round(sum(x["pnl"] for x in sub) + d_net + live_mtm, 2)
             return tot, wr, net
 
-        d_tot, d_wr, d_net = calc([r for r in rows if r["date"] == today_str])
-        w_tot, w_wr, w_net = calc([r for r in rows if r["year"] == curr_year and r["week"] == curr_week])
-        m_tot, m_wr, m_net = calc([r for r in rows if r["date"].startswith(curr_month_prefix)])
-        y_tot, y_wr, y_net = calc([r for r in rows if r["year"] == curr_year])
-
+        w_tot, w_wr, w_live = combine_period([r for r in past_rows if r["year"] == curr_year and r["week"] == curr_week])
+        m_tot, m_wr, m_live = combine_period([r for r in past_rows if r["date"].startswith(curr_month_prefix)])
+        y_tot, y_wr, y_live = combine_period([r for r in past_rows if r["year"] == curr_year])
         d_live = round(d_net + live_mtm, 2)
-        w_live = round(w_net + live_mtm, 2)
-        m_live = round(m_net + live_mtm, 2)
-        y_live = round(y_net + live_mtm, 2)
 
         return [
             f"• <b>Daily:</b> <b>₹{d_live:+,.2f}</b> ({d_tot}T | {d_wr}% Win)",
@@ -2181,7 +2182,7 @@ class IntradayV3Engine:
                 }
                 immediate_fasttrack = True
 
-        # Trigger 2: 20-EMA / VWAP Pullback Touch & Rejection (Only within <= 2.5 x ATR of Gann/VWAP base)
+        # Trigger 2: 20-EMA / VWAP Pullback Touch & Rejection
         if new_signal is None and not pending:
             touched_ema20_or_vwap_up = (
                 float(curr["high"]) >= (ema20 - 0.35 * atr14)
@@ -2229,7 +2230,7 @@ class IntradayV3Engine:
                 }
                 immediate_fasttrack = True
 
-        # Trigger 3: 20-Bar Breakout with TR >= 1.2x ATR (Blocked on Silver if > 2.6x ATR from 20 EMA)
+        # Trigger 3: 20-Bar Breakout with TR >= 1.2x ATR
         if new_signal is None and not pending and not_overextended:
             if pd.notna(high20) and spot_close > float(high20) and curr_tr >= BREAKOUT_EXPANSION_ATR * atr14 and vwap_ema_bull and ema20 > ema50 and oi_pcr_bull_ok:
                 side_label = "BUY" if is_mcx else "CE"
@@ -2361,20 +2362,9 @@ class IntradayV3Engine:
         min_mcx_sl = round_to_tick(ltp * 0.0012, tick_sz)
         sl_points = max(round_to_tick(spot_risk, tick_sz), min_mcx_sl, tick_sz * 4)
 
-        mcx_cap = self.get_active_mcx_capital()
-        max_risk_cap = float(self.tuned_params.get("mcx_max_risk_inr", round(mcx_cap * 0.025, 2)))
-        est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
-        risk_1_lot = (sl_points * pnl_mult) + est_ch
-        if risk_1_lot > max_risk_cap:
-            self.pending_setups[idx] = None
-            return
-
-        req_margin_1lot = fetch_required_margin(inst_key, lot_size, tx_side, "I")
-        margin_lots = max(1, int(mcx_cap // req_margin_1lot)) if req_margin_1lot > 0 else 1
-        risk_lots = max(1, int(max_risk_cap // max(risk_1_lot, 1.0)))
-        lots = min(margin_lots, risk_lots)
-        qty = min(lots * lot_size, cfg["freeze_qty"])
-        eff_lots = max(1, qty // max(lot_size, 1))
+        # Direct 1-lot MCX execution without max-risk rejection
+        eff_lots = 1
+        qty = min(lot_size, cfg["freeze_qty"])
         pnl_units = eff_lots * pnl_mult
         total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_units, True).get("total", 180.0)
 
@@ -2417,91 +2407,44 @@ class IntradayV3Engine:
         step = cfg.get("step", 50)
         tick_sz = cfg.get("tick_size", 0.05)
 
-        base_offset = int(
-            self.tuned_params.get("expiry_strike_offset", 1)
-            if in_expiry_slope
-            else self.tuned_params.get("strike_offset", 0)
-        )
+        # Always select ATM strike (offset = 0) and execute 1 lot without per-trade risk/delta blocks
         opt_field = "call_options" if setup["side"] == "CE" else "put_options"
         spot_risk, spot_sl_equiv = self.compute_true_fractal_swing_sl(df, setup["side"], spot_close, atr14)
-        cap = self.get_active_capital()
-        max_idx_risk = float(self.tuned_params.get("index_max_risk_inr", round(cap * 0.05, 2)))
-        min_req_delta = float(
-            self.tuned_params.get("expiry_slope_min_delta", 0.30)
-            if in_expiry_slope
-            else self.tuned_params.get("min_option_delta", 0.45)
-        )
-        max_theta_pct = float(self.tuned_params.get("max_theta_decay_pct", 8.0))
 
-        selected_candidate = None
-        for extra_otm in (0, 1, 2):
-            eff_offset = base_offset + extra_otm
-            strike_shift = (eff_offset * step) if setup["side"] == "CE" else (-eff_offset * step)
-            cand_strike = (round(spot_close / step) * step) + strike_shift
-            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == cand_strike), None)
-            if not chosen:
-                continue
+        target_strike = round(spot_close / step) * step
+        chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
+        if not chosen:
+            # Fallback to nearest available strike in chain if exact rounded strike is missing
+            valid_rows = [row for row in chain if row.get(opt_field, {}).get("instrument_key")]
+            if not valid_rows:
+                self.pending_setups[idx] = None
+                return
+            nearest_row = min(valid_rows, key=lambda r: abs(float(r.get("strike_price", 0)) - spot_close))
+            target_strike = nearest_row.get("strike_price", target_strike)
+            chosen = nearest_row.get(opt_field, {})
 
-            inst_key = chosen.get("instrument_key")
-            mkt = chosen.get("market_data", {})
-            greeks = chosen.get("option_greeks", {})
-            ltp = float(mkt.get("ltp", 0))
-            bid = float(mkt.get("bid_price", 0) or 0)
-            ask = float(mkt.get("ask_price", 0) or 0)
-
-            min_opt_premium = max(tick_sz * 20, round(spot_close * 0.00012, 2))
-            if ltp < min_opt_premium:
-                continue
-
-            if bid > 0 and ask >= bid and ((ask - bid) / ltp * 100.0) > MAX_OPTION_SPREAD_PCT:
-                continue
-
-            raw_delta = abs(float(greeks.get("delta", 0.0)))
-            eff_min_delta = 0.32 if extra_otm > 0 else min_req_delta
-            if raw_delta > 0 and raw_delta < eff_min_delta:
-                continue
-
-            theta_val = abs(float(greeks.get("theta", 0.0)))
-            if theta_val > 0 and ((theta_val / 6.25) / max(ltp, 1.0)) * 100.0 > max_theta_pct:
-                continue
-
-            live_delta = min(0.75, max(0.25, raw_delta)) if raw_delta > 0 else eff_min_delta
-            raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.12), ltp * 0.35)
-            sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 4)
-            est_ch_1 = fetch_exact_trade_charges(inst_key, ltp, ltp, cfg["lot_size"], False).get("total", 65.0)
-            risk_1_lot = (sl_points * cfg["lot_size"]) + est_ch_1
-
-            if risk_1_lot <= max_idx_risk:
-                selected_candidate = {
-                    "strike": cand_strike,
-                    "inst_key": inst_key,
-                    "ltp": ltp,
-                    "live_delta": live_delta,
-                    "sl_points": sl_points,
-                    "risk_1_lot": risk_1_lot,
-                    "otm_fit": extra_otm > 0,
-                }
-                break
-
-        if not selected_candidate:
+        inst_key = chosen.get("instrument_key")
+        if not inst_key:
             self.pending_setups[idx] = None
             return
 
-        target_strike = selected_candidate["strike"]
-        inst_key = selected_candidate["inst_key"]
-        ltp = selected_candidate["ltp"]
-        live_delta = selected_candidate["live_delta"]
-        sl_points = selected_candidate["sl_points"]
-        risk_1_lot = selected_candidate["risk_1_lot"]
-        sl_price = round_to_tick(ltp - sl_points, tick_sz)
+        mkt = chosen.get("market_data", {})
+        greeks = chosen.get("option_greeks", {})
+        ltp = float(mkt.get("ltp", 0))
+        if ltp <= 0:
+            ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", 0.0))
+        if ltp <= 0:
+            self.pending_setups[idx] = None
+            return
 
-        gear = int(self.tuned_params.get("driver_gear", 3))
-        eff_cap = cap * (0.65 if gear <= 2 else 1.0)
-        cap_lots = max(1, int(eff_cap // (ltp * cfg["lot_size"])))
-        risk_lots = max(1, int(max_idx_risk // max(risk_1_lot, 1.0)))
-        lots = min(cap_lots, risk_lots)
-        qty = min(lots * cfg["lot_size"], cfg["freeze_qty"])
-        eff_lots = max(1, qty // max(int(cfg["lot_size"]), 1))
+        raw_delta = abs(float(greeks.get("delta", 0.0)))
+        live_delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else 0.50
+        raw_opt_sl = min(max(spot_risk * live_delta, ltp * 0.12), ltp * 0.35)
+        sl_points = max(round_to_tick(raw_opt_sl, tick_sz), tick_sz * 4)
+        sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
+
+        eff_lots = 1
+        qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
         total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
 
         order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
@@ -2511,7 +2454,7 @@ class IntradayV3Engine:
             self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
             t_no = self.trade_counter
             entry_time_str = now_ist.strftime("%H:%M:%S")
-            mode_suffix = "EXPIRY_SLOPE" if in_expiry_slope else ("OTM_RISK_FIT" if selected_candidate["otm_fit"] else mem_tag)
+            mode_suffix = "EXPIRY_SLOPE_ATM" if in_expiry_slope else f"ATM_{mem_tag}"
             with self.pos_lock:
                 self.active_positions[idx] = {
                     "trade_no": t_no, "type": "INDEX_OPT", "instrument_key": inst_key,
@@ -2749,61 +2692,14 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
-            idx_cap = self.get_active_capital()
-            mcx_cap = self.get_active_mcx_capital()
-
-            has_mcx_activity = any(t.get("symbol") in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER") for t in self.closed_trades) or any(
-                p.get("type") == "MCX_FUT" for p in self.active_positions.values()
-            )
-            active_target_cap = mcx_cap if has_mcx_activity else idx_cap
-            target_net_profit = round(active_target_cap * DAILY_PROFIT_LOCK_PCT, 2)
-            max_loss = -abs(float(self.tuned_params.get("max_daily_loss_inr", round(idx_cap * abs(DAILY_LOSS_LOCK_PCT), 2))))
-
-            live_gross_mtm = self.compute_live_mtm()
-            with self.pos_lock:
-                open_charges = sum(float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0)) for p in self.active_positions.values())
-            live_net_mtm = round(live_gross_mtm - open_charges, 2) if self.active_positions else 0.0
-            total_net_day_pnl = round(self.day_pnl + live_net_mtm, 2)
-
-            profit_goal_hit = (self.day_pnl >= target_net_profit) or (total_net_day_pnl >= target_net_profit)
-
-            if profit_goal_hit and self.active_positions:
-                with self.pos_lock:
-                    needed_from_open = max(0.0, target_net_profit - self.day_pnl)
-                    per_pos_floor_net = needed_from_open / max(len(self.active_positions), 1)
-                    for p_idx, pos in self.active_positions.items():
-                        is_short = pos["tx_side"] == "SELL"
-                        eff_units = max(int(pos.get("pnl_units", pos["qty"])), 1)
-                        est_ch = float(pos.get("est_charges", 180.0 if pos["type"] == "MCX_FUT" else 65.0))
-                        tick_sz = float(pos.get("tick_size", 0.05))
-                        req_pts = (per_pos_floor_net + est_ch) / eff_units
-                        floor_sl = round_to_tick((pos["entry_price"] - req_pts) if is_short else (pos["entry_price"] + req_pts), tick_sz)
-                        ltp_now = float(pos.get("last_ltp", pos["entry_price"]))
-                        if is_short and floor_sl < pos["sl"] and floor_sl > ltp_now + tick_sz:
-                            pos["sl"] = floor_sl
-                            pos["trail_stage"] = "5% PROFIT FLOOR"
-                        elif not is_short and floor_sl > pos["sl"] and floor_sl < ltp_now - tick_sz:
-                            pos["sl"] = floor_sl
-                            pos["trail_stage"] = "5% PROFIT FLOOR"
-                self.save_active_positions_state()
-
-            if profit_goal_hit:
-                risk_locked = True
-                self.bot_status_text = f"PAUSED (5% TARGET ₹{target_net_profit:,.0f} HIT)"
-            elif self.day_pnl <= max_loss:
-                risk_locked = True
-                self.bot_status_text = "PAUSED (DAILY LOSS CAP)"
-            elif self.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                risk_locked = True
-                self.bot_status_text = "PAUSED (3 LOSSES)"
+            # Unrestricted signal-only execution: ignore max loss, max profit, and 3-loss pause
+            risk_locked = False
+            if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
+            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
             else:
-                risk_locked = False
-                if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                    self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
-                elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                    self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
-                else:
-                    self.bot_status_text = "BOT LIVE"
+                self.bot_status_text = "BOT LIVE"
 
             if not risk_locked:
                 for idx, cfg in INDICES.items():
@@ -2823,10 +2719,6 @@ class IntradayV3Engine:
                     res = self.evaluate_instrument(idx, cfg, now_ist)
                     if res:
                         self.last_summaries[idx] = res
-            else:
-                for idx in self.last_summaries:
-                    if idx not in self.active_positions:
-                        self.last_summaries[idx]["short_status"] = "PAUSED"
 
             if not self.dashboard_msg_id and self.last_summaries:
                 self.render_live_dashboard(hhmm)
