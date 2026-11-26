@@ -1,206 +1,29 @@
 {
-  "FINNIFTY": {
-    "trade_no": 27,
-    "type": "INDEX_OPT",
-    "instrument_key": "NSE_FO|60770",
-    "strike": 28800,
-    "side": "PE",
-    "tx_side": "BUY",
-    "display_side": "PE",
-    "lots": 1,
-    "lot_size": 60,
-    "qty": 60,
-    "pnl_units": 60,
-    "tick_size": 0.05,
-    "delta": 0.4619,
-    "entry_price": 621.0,
-    "spot_entry": 28806.05,
-    "spot_sl": 28856.27,
-    "r_unit": 74.5,
-    "est_charges": 159.05,
-    "gann_level": 28847.6,
-    "last_ltp": 644.75,
-    "sl": 546.5,
-    "peak_gain": 49.25,
-    "entry_ts": 1795680981.0208025,
-    "last_peak_ts": 1795682653.960789,
-    "trail_stage": null,
-    "low_fuel_streak": 0,
-    "is_expiry_day": false,
-    "trade_mode": "HYBRID",
-    "target_label": "SMART HYBRID \u221e",
-    "ltp_window": [
-      [
-        1795680981.0208025,
-        621.0
-      ],
-      [
-        1795680994.8324056,
-        621.0
-      ],
-      [
-        1795681007.6046157,
-        621.0
-      ],
-      [
-        1795681021.790257,
-        621.0
-      ],
-      [
-        1795681034.7582467,
-        621.0
-      ],
-      [
-        1795681047.4347682,
-        621.0
-      ],
-      [
-        1795681061.6514332,
-        621.0
-      ],
-      [
-        1795681074.463236,
-        621.0
-      ],
-      [
-        1795681087.0736825,
-        621.0
-      ],
-      [
-        1795681101.406451,
-        621.0
-      ],
-      [
-        1795681115.5269048,
-        621.0
-      ],
-      [
-        1795681128.7406404,
-        623.3
-      ],
-      [
-        1795681142.8264184,
-        623.3
-      ],
-      [
-        1795681155.3754888,
-        623.3
-      ],
-      [
-        1795681168.2663133,
-        623.3
-      ],
-      [
-        1795681182.5119278,
-        623.3
-      ],
-      [
-        1795681195.366153,
-        623.3
-      ],
-      [
-        1795681208.9023066,
-        635.0
-      ],
-      [
-        1795681223.0648575,
-        635.0
-      ],
-      [
-        1795681236.0122583,
-        635.0
-      ],
-      [
-        1795681249.3399887,
-        635.0
-      ],
-      [
-        1795681263.3166342,
-        635.0
-      ],
-      [
-        1795681275.965824,
-        635.0
-      ],
-      [
-        1795681289.5925164,
-        635.0
-      ],
-      [
-        1795681303.3119395,
-        635.0
-      ],
-      [
-        1795681317.0859187,
-        635.0
-      ],
-      [
-        1795681331.1396592,
-        653.0
-      ],
-      [
-        1795681344.54885,
-        653.0
-      ],
-      [
-        1795681358.100742,
-        653.0
-      ],
-      [
-        1795681372.4548528,
-        646.8
-      ],
-      [
-        1795681387.1681275,
-        646.8
-      ],
-      [
-        1795681400.2621865,
-        646.8
-      ]
-    ],
-    "setup_name": "EMA20_VWAP_PULLBACK_PE|ATM_ADAPTIVE_HYBRID",
-    "entry_time": "13:46:19"
-  },
-  "CRUDEOIL": {
-    "trade_no": 31,
+  "SILVER": {
+    "trade_no": 42,
     "type": "MCX_FUT",
-    "instrument_key": "MCX_FO|576265",
-    "strike": "CRUDEOILM FUT 18 DEC 26",
-    "side": "PE",
-    "tx_side": "SELL",
-    "display_side": "SELL",
+    "instrument_key": "MCX_FO|564620",
+    "strike": "SILVERM FUT 26 FEB 27",
+    "side": "CE",
+    "tx_side": "BUY",
+    "display_side": "BUY",
     "lots": 1,
-    "lot_size": 10,
-    "qty": 10,
-    "pnl_units": 10,
+    "lot_size": 5,
+    "qty": 5,
+    "pnl_units": 5,
     "tick_size": 1.0,
     "delta": 1.0,
-    "entry_price": 7742.0,
-    "spot_entry": 7740.0,
-    "spot_sl": 7768.0,
-    "r_unit": 26.0,
-    "t1_price": 7716.0,
-    "t2_price": 7690.0,
-    "runner_mode": false,
-    "est_charges": 84.13,
-    "gann_level": 7741.0,
-    "last_ltp": 7743.0,
-    "sl": 7768.0,
-    "peak_gain": 21.0,
-    "entry_ts": 1795683848.0680647,
-    "last_peak_ts": 1795685058.6597717,
-    "trail_stage": null,
+    "entry_price": 152635.0,
+    "fut_entry": 152689.0,
+    "fut_sl": 151649.99,
+    "r_unit": 1542.0,
+    "est_charges": 202.0,
+    "last_ltp": 152519.0,
+    "sl": 151650.0,
+    "peak_gain": 203.0,
+    "trail_stage": "SWING TRAIL \u2192 \u221e",
     "is_expiry_day": false,
-    "trade_mode": "20BO-RT",
-    "target_label": "1R RUN / 2R TGT",
-    "ltp_window": [
-      [
-        1795683848.0680647,
-        7742.0
-      ]
-    ],
-    "setup_name": "1M_20BO_RETEST_SELL",
-    "entry_time": "14:34:02"
+    "setup_name": "VWAP_MORNING_STAR",
+    "entry_time": "20:04:21"
   }
 }
