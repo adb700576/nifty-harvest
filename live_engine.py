@@ -52,20 +52,20 @@ MAX_ACTIVE_TRADES_TOTAL = 5         # Max 5 concurrent symbols (1 per symbol)
 STARTUP_WARMUP_SEC = 45
 DASHBOARD_PULSE_SEC = 5.0
 
-# Strategy 1 (Indices - 1m Trend-Following Breakout + Retest) Parameters
-IDX_VOL_RATIO_MIN = 1.20
-IDX_RANGE_EXPANSION_ATR = 1.20
-IDX_BODY_RATIO_MIN = 0.45
-IDX_RETEST_BUFFER_ATR = 0.30
-IDX_RETEST_MAX_BARS = 15            # 15 x 1m candles = 15 minutes max wait for retest
-IDX_ATR_SL_MULT = 1.20
-IDX_RRR_TARGET = 1.50               # Fixed 1 : 1.5 Risk-to-Reward
+# Logic 1: Trend-Following Breakout + Retest Parameters (Both Index & MCX on 1m)
+BO_VOL_RATIO_MIN = 1.20
+BO_RANGE_EXPANSION_ATR = 1.20
+BO_BODY_RATIO_MIN = 0.45
+BO_RETEST_BUFFER_ATR = 0.30
+BO_RETEST_MAX_BARS = 15             # 15 x 1m candles = 15 minutes max wait for retest
+BO_RRR_TARGET = 1.50                # Fixed 1 : 1.5 Risk-to-Reward
 
-# Strategy 2 (MCX Mini - 5m Reversed / Contrarian) Parameters
-MCX_VOL_RATIO_MIN = 1.30
-MCX_BODY_RATIO_MIN = 0.50
-MCX_ATR_SL_MULT = 1.20
-MCX_RRR_TARGET = 2.00               # Fixed 1 : 2.0 Risk-to-Reward
+# Logic 2: Reversed / Contrarian Parameters (Both Index & MCX on 1m)
+REV_VOL_RATIO_MIN = 1.30
+REV_BODY_RATIO_MIN = 0.50
+REV_RRR_TARGET = 2.00               # Fixed 1 : 2.0 Risk-to-Reward
+
+ATR_SL_MULT = 1.20
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
@@ -78,17 +78,18 @@ JOURNAL_FIELDNAMES = [
     "gross_pnl", "brokerage", "taxes_other", "charges", "pnl", "day_pnl", "setup",
 ]
 
+# Both Indices and MCX Mini run on 1-minute timeframe with Dual Logic
 INDICES = {
     "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "tf_min": 1, "min_sl_pts": 10.0, "default_delta": 0.52},
     "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank", "tf_min": 1, "min_sl_pts": 20.0, "default_delta": 0.52},
     "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service", "tf_min": 1, "min_sl_pts": 10.0, "default_delta": 0.52},
     "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT", "tf_min": 1, "min_sl_pts": 8.0,  "default_delta": 0.50},
     "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX", "tf_min": 1, "min_sl_pts": 25.0, "default_delta": 0.52},
-    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 5},
-    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 5},
-    "GOLD":       {"type": "MCX_FUT", "tf_min": 5},
-    "SILVER":     {"type": "MCX_FUT", "tf_min": 5},
-    "COPPER":     {"type": "MCX_FUT", "tf_min": 5},
+    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 1},
+    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 1},
+    "GOLD":       {"type": "MCX_FUT", "tf_min": 1},
+    "SILVER":     {"type": "MCX_FUT", "tf_min": 1},
+    "COPPER":     {"type": "MCX_FUT", "tf_min": 1},
 }
 
 MCX_MINI_SYMBOLS = {
@@ -210,7 +211,7 @@ def push_trade_to_google_sheet(trade_row: dict):
             json={"action": "LOG_TRADE", "trade": trade_row},
             timeout=8,
         )
-        log.info(f"[GSHEET] Synced Trade #{trade_row['trade_no']} to Google Sheets.")
+        log.info(f"[GSHEET] Synced Trade #{trade_row['trade_no']} ({trade_row['setup']}) to Google Sheets.")
     except Exception as e:
         log.warning(f"[GSHEET] Sync warning: {e}")
 
@@ -484,7 +485,7 @@ def record_trade_journal(row: dict):
             if not file_exists:
                 writer.writeheader()
             writer.writerow(row)
-        log.info(f"[JOURNAL] Saved #{row['trade_no']} to {JOURNAL_FILE}: {row['contract']} Net PnL ₹{row['pnl']:+.2f}")
+        log.info(f"[JOURNAL] Saved #{row['trade_no']} [{row['setup']}]: {row['contract']} Net PnL ₹{row['pnl']:+.2f}")
     except Exception as e:
         log.error(f"Journal write error: {e}")
 
@@ -750,9 +751,10 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. DUAL STRATEGY ENGINE:
-#    - INDICES (1m): Trend-Following Breakout + Retest (09:15-10:30 & 14:00-15:00 | 1:1.5 R:R + 1R BE Trail)
-#    - MCX MINI (5m): Reversed / Contrarian (17:00-20:00 | 1:2.0 R:R + 1R BE Trail)
+# 6. UNIFIED DUAL-LOGIC ENGINE (1-MIN FOR BOTH INDICES & MCX MINI):
+#    - Logic A: TREND-FOLLOWING BREAKOUT + RETEST (1 : 1.5 R:R + 1R BE Trail)
+#    - Logic B: REVERSED / CONTRARIAN (1 : 2.0 R:R + 1R BE Trail)
+#    - Tags every entry with exact Strategy Name in Dashboard, Journal & Sheets
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -1154,7 +1156,7 @@ class IntradayV3Engine:
         ]
 
     # ==========================================================================
-    # TELEGRAM DASHBOARD
+    # TELEGRAM DASHBOARD (SHOWS EXACT ENTRY LOGIC NAME ON EVERY TRADE)
     # ==========================================================================
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
@@ -1184,7 +1186,7 @@ class IntradayV3Engine:
             day_wr = int(round((total_wins / tot_closed) * 100.0)) if tot_closed > 0 else 0
 
             lines = [
-                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} <code>DUAL-STRAT</code>",
+                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} <code>1m BO+RT &amp; REV</code>",
                 f"────────────────────────────",
                 f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
                 f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_net_mtm:+,.2f}</b>",
@@ -1203,10 +1205,10 @@ class IntradayV3Engine:
                     pnl = round(gross_val - est_charges, 2)
                     sl_gross = (pos["entry_price"] - pos["sl"]) * eff_units if is_short else (pos["sl"] - pos["entry_price"]) * eff_units
                     sl_net_pnl = round(sl_gross - est_charges, 0)
-                    t_mode = pos.get("trade_mode", "TREND-BO-RT")
+                    logic_name = pos.get("trade_mode", "TREND_BO_RETEST")
                     tgt_val = float(pos.get("target", 0.0))
                     tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else "FIXED RRR"
-                    trail_tag = f"🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{t_mode}</code>"
+                    trail_tag = f"<code>{logic_name}</code> | 🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{logic_name}</code>"
                     p_icon = "🟢" if pnl >= 0 else "🔴"
                     sl_label = f"Locked <b>₹{sl_net_pnl:+,.0f}</b>" if sl_net_pnl >= 0 else f"Max Risk <b>₹{abs(sl_net_pnl):,.0f}</b>"
 
@@ -1219,7 +1221,7 @@ class IntradayV3Engine:
                     )
 
                     lines.extend([
-                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)  |  {trail_tag}",
+                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)\n  Logic: {trail_tag}",
                         f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
                         f"  PnL: <code>{pts_diff:.2f} pt × {eff_units} = ₹{gross_val:,.0f}</code>",
                         f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
@@ -1233,22 +1235,23 @@ class IntradayV3Engine:
                     pts_t = float(t.get("points", 0.0))
                     units_t = int(float(t.get("pnl_units") or t.get("qty", 1)))
                     gross_t = float(t.get("gross_pnl", round(pts_t * units_t, 2)))
+                    setup_lbl = t.get("setup", "UNKNOWN")
                     lines.append(
                         f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} Net <b>₹{t['pnl']:+,.2f}</b>\n"
-                        f"  <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> | In: ₹{t['entry_price']:.2f} → Exit: ₹{t['exit_price']:.2f}\n"
-                        f"  PnL: <code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code> | <i>{t['exit_reason']}</i>"
+                        f"  Logic: <code>{setup_lbl}</code> | <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>\n"
+                        f"  In: ₹{t['entry_price']:.2f} → Exit: ₹{t['exit_price']:.2f} (<code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code>) | <i>{t['exit_reason']}</i>"
                     )
             elif not active_snap:
                 lines.append("<i>No closed trades yet today.</i>")
 
             if self.last_summaries:
-                lines.append(f"\n📡 <b>INDICES LIVE (1m • TREND BO+RETEST • 09:15-10:30 &amp; 14:00-15:00)</b>")
+                lines.append(f"\n📡 <b>INDICES LIVE (1m • BO+RETEST &amp; CONTRARIAN)</b>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
                         lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Vol <b>{s['vol_ratio']:.1f}x</b> | ATR <b>{s['atr']}</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX MINI LIVE (5m • REVERSED CONTRARIAN • 17:00-20:00)</b>")
+                lines.append("\n🛢️ <b>MCX MINI LIVE (1m • BO+RETEST &amp; CONTRARIAN)</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
@@ -1340,13 +1343,14 @@ class IntradayV3Engine:
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     # ==========================================================================
-    # STRATEGY DISPATCHER:
-    # 1. INDICES (1m): Trend-Following Breakout + Retest (09:15-10:30 & 14:00-15:00)
-    # 2. MCX MINI (5m): Reversed / Contrarian (17:00-20:00)
+    # UNIFIED DUAL-LOGIC EVALUATOR (1-MIN CANDLES FOR BOTH INDICES & MCX MINI)
+    # Checks:
+    #   1. LOGIC_1: TREND_BO_RETEST  (Breakout + 15-bar Retest -> 1:1.5 R:R)
+    #   2. LOGIC_2: CONTRARIAN_REV   (EMA20/50 + Vol >= 1.3x Reversed -> 1:2.0 R:R)
     # ==========================================================================
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
-        tf_min = int(cfg.get("tf_min", 5 if is_mcx else 1))
+        tf_min = int(cfg.get("tf_min", 1))
 
         fut_key = self.fut_contracts.get(idx, {}).get("instrument_key", "")
         raw_df = fetch_intraday_candles(fut_key, tf_min) if fut_key else pd.DataFrame()
@@ -1381,7 +1385,7 @@ class IntradayV3Engine:
                     "idx": idx, "is_mcx": is_mcx,
                     "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
                     "vol_ratio": vol_ratio, "atr": round(atr14, 1),
-                    "short_status": f"ACTIVE #{pos['trade_no']} (₹{pos_mtm:+.0f})",
+                    "short_status": f"ACTIVE #{pos['trade_no']} [{pos.get('trade_mode','')}] (₹{pos_mtm:+.0f})",
                 }
 
         uptime_sec = time.time() - self.engine_boot_ts
@@ -1425,59 +1429,105 @@ class IntradayV3Engine:
                 "short_status": f"SLOT {slot_txt}",
             }
 
-        # ======================================================================
-        # BRANCH A: MCX MINI (5m) -> REVERSED / CONTRARIAN STRATEGY (17:00-20:00)
-        # ======================================================================
-        if is_mcx:
-            c_range = float(curr["high"]) - float(curr["low"])
-            c_body = abs(float(curr["close"]) - float(curr["open"]))
-            body_ratio = c_body / (c_range if c_range > 0 else 1e-9)
-
-            is_bull_trend = float(curr["close"]) > float(curr["ema20"]) > float(curr["ema50"])
-            is_bear_trend = float(curr["close"]) < float(curr["ema20"]) < float(curr["ema50"])
-            is_vol_spike = vol_ratio >= MCX_VOL_RATIO_MIN
-            is_solid_body = body_ratio >= MCX_BODY_RATIO_MIN
-
-            raw_signal = None
-            if is_vol_spike and is_solid_body:
-                if is_bull_trend and float(curr["close"]) > float(curr["open"]):
-                    raw_signal = "BUY"
-                elif is_bear_trend and float(curr["close"]) < float(curr["open"]):
-                    raw_signal = "SELL"
-
-            # Reverse / Contrarian Execution: Flip BUY -> SELL and SELL -> BUY
-            if raw_signal == "BUY":
-                self.execute_mcx_contrarian_entry(idx, cfg, "SELL", price_now, atr14, now_ist)
-            elif raw_signal == "SELL":
-                self.execute_mcx_contrarian_entry(idx, cfg, "BUY", price_now, atr14, now_ist)
-
-            trend_lbl = "BULL→REV" if is_bull_trend else ("BEAR→REV" if is_bear_trend else "SCANNING")
-            return {
-                "idx": idx, "is_mcx": True,
-                "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                "vol_ratio": vol_ratio, "atr": round(atr14, 1),
-                "short_status": trend_lbl,
-            }
+        c_range = float(curr["high"]) - float(curr["low"])
+        c_body = abs(float(curr["close"]) - float(curr["open"]))
+        body_ratio = c_body / (c_range if c_range > 0 else 1e-9)
 
         # ======================================================================
-        # BRANCH B: INDICES (1m) -> TREND-FOLLOWING BREAKOUT + RETEST (09:15-10:30 & 14:00-15:00)
+        # LOGIC A (PRIORITY 1): TREND-FOLLOWING BREAKOUT + RETEST (1m)
         # ======================================================================
         pending = self.pending_retests.get(idx)
         if pending:
             bars_waited = int((now_ist - pending["armed_at"]).total_seconds() // 60)
-            if bars_waited > IDX_RETEST_MAX_BARS:
+            if bars_waited > BO_RETEST_MAX_BARS:
                 self.pending_retests[idx] = None
                 pending = None
 
-        # Step 1: Detect 1m Breakout Candle (Volume >= 1.2x OR Range >= 1.2x ATR + Body >= 45%)
-        if pending is None:
-            c_range = float(curr["high"]) - float(curr["low"])
-            c_body = abs(float(curr["close"]) - float(curr["open"]))
-            body_ratio = c_body / (c_range if c_range > 0 else 1e-9)
+        if pending is not None and curr_candle_ts != pending["armed_ts"]:
+            lvl = float(pending["level"])
+            buf = BO_RETEST_BUFFER_ATR * float(pending["atr"])
+            retest_confirmed = False
 
-            has_volume = vol_ratio >= IDX_VOL_RATIO_MIN
-            is_range_exp = c_range >= (IDX_RANGE_EXPANSION_ATR * atr14)
-            is_solid = body_ratio >= IDX_BODY_RATIO_MIN
+            if pending["side"] == "CE":
+                if (lvl - buf) <= float(curr["low"]) <= (lvl + buf) and float(curr["close"]) > float(curr["open"]):
+                    retest_confirmed = True
+            else:
+                if (lvl - buf) <= float(curr["high"]) <= (lvl + buf) and float(curr["close"]) < float(curr["open"]):
+                    retest_confirmed = True
+
+            if retest_confirmed:
+                self.dispatch_entry(
+                    idx=idx,
+                    cfg=cfg,
+                    side=pending["side"],
+                    fut_price=price_now,
+                    atr14=float(pending["atr"]),
+                    now_ist=now_ist,
+                    logic_code="TREND_BO_RETEST",
+                    rrr_mult=BO_RRR_TARGET,
+                )
+                return {
+                    "idx": idx, "is_mcx": is_mcx,
+                    "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
+                    "vol_ratio": vol_ratio, "atr": round(atr14, 1),
+                    "short_status": f"ENTERED TREND_BO_RETEST",
+                }
+
+        # ======================================================================
+        # LOGIC B (PRIORITY 2): REVERSED / CONTRARIAN (1m EMA20/50 + VOL >= 1.3x)
+        # ======================================================================
+        is_bull_trend = float(curr["close"]) > float(curr["ema20"]) > float(curr["ema50"])
+        is_bear_trend = float(curr["close"]) < float(curr["ema20"]) < float(curr["ema50"])
+        is_rev_vol = vol_ratio >= REV_VOL_RATIO_MIN
+        is_rev_body = body_ratio >= REV_BODY_RATIO_MIN
+
+        if is_rev_vol and is_rev_body:
+            if is_bull_trend and float(curr["close"]) > float(curr["open"]):
+                # Raw BUY signal -> Flip to PE / SELL (Contrarian)
+                self.pending_retests[idx] = None
+                self.dispatch_entry(
+                    idx=idx,
+                    cfg=cfg,
+                    side="PE",
+                    fut_price=price_now,
+                    atr14=atr14,
+                    now_ist=now_ist,
+                    logic_code="CONTRARIAN_REV",
+                    rrr_mult=REV_RRR_TARGET,
+                )
+                return {
+                    "idx": idx, "is_mcx": is_mcx,
+                    "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
+                    "vol_ratio": vol_ratio, "atr": round(atr14, 1),
+                    "short_status": "ENTERED CONTRARIAN_REV",
+                }
+            elif is_bear_trend and float(curr["close"]) < float(curr["open"]):
+                # Raw SELL signal -> Flip to CE / BUY (Contrarian)
+                self.pending_retests[idx] = None
+                self.dispatch_entry(
+                    idx=idx,
+                    cfg=cfg,
+                    side="CE",
+                    fut_price=price_now,
+                    atr14=atr14,
+                    now_ist=now_ist,
+                    logic_code="CONTRARIAN_REV",
+                    rrr_mult=REV_RRR_TARGET,
+                )
+                return {
+                    "idx": idx, "is_mcx": is_mcx,
+                    "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
+                    "vol_ratio": vol_ratio, "atr": round(atr14, 1),
+                    "short_status": "ENTERED CONTRARIAN_REV",
+                }
+
+        # ======================================================================
+        # ARM NEW BREAKOUT FOR LOGIC A (IF NO CONTRARIAN TRIGGERED)
+        # ======================================================================
+        if pending is None:
+            has_volume = vol_ratio >= BO_VOL_RATIO_MIN
+            is_range_exp = c_range >= (BO_RANGE_EXPANSION_ATR * atr14)
+            is_solid = body_ratio >= BO_BODY_RATIO_MIN
 
             if (has_volume or is_range_exp) and is_solid:
                 if float(curr["close"]) > float(curr["open"]):
@@ -1499,38 +1549,27 @@ class IntradayV3Engine:
                     }
                     self.pending_retests[idx] = pending
 
-        # Step 2: Confirm Retest on subsequent 1m bar and enter ATM Option
-        elif curr_candle_ts != pending["armed_ts"]:
-            lvl = float(pending["level"])
-            buf = IDX_RETEST_BUFFER_ATR * float(pending["atr"])
-            retest_confirmed = False
-
-            if pending["side"] == "CE":
-                if (lvl - buf) <= float(curr["low"]) <= (lvl + buf) and float(curr["close"]) > float(curr["open"]):
-                    retest_confirmed = True
-            else:
-                if (lvl - buf) <= float(curr["high"]) <= (lvl + buf) and float(curr["close"]) < float(curr["open"]):
-                    retest_confirmed = True
-
-            if retest_confirmed:
-                active_expiry, is_today_exp = self.get_smart_expiry(idx, now_ist)
-                chain = fetch_option_chain(cfg["spot_key"], active_expiry)
-                self.execute_index_breakout_retest_entry(
-                    idx, cfg, pending["side"], price_now, chain, float(pending["atr"]), now_ist, is_today_exp
-                )
-
-        short_status = f"ARMED {pending['side']} RETEST" if pending else "SCANNING 1m BO"
+        short_status = f"ARMED {pending['side']} RETEST" if pending else "SCAN 1m BO+REV"
         return {
-            "idx": idx, "is_mcx": False,
+            "idx": idx, "is_mcx": is_mcx,
             "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
             "vol_ratio": vol_ratio, "atr": round(atr14, 1),
             "short_status": short_status,
         }
 
     # ==========================================================================
-    # EXECUTION 1: MCX MINI REVERSED / CONTRARIAN (Fixed 1 : 2.0 R:R)
+    # UNIFIED ENTRY ROUTER (TAGS EXACT LOGIC NAME ON EVERY POSITION)
     # ==========================================================================
-    def execute_mcx_contrarian_entry(self, idx: str, cfg: dict, tx_side: str, fut_price: float, atr14: float, now_ist: datetime):
+    def dispatch_entry(self, idx: str, cfg: dict, side: str, fut_price: float, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
+        if cfg["type"] == "MCX_FUT":
+            tx_side = "BUY" if side == "CE" else "SELL"
+            self.execute_mcx_fut_entry(idx, cfg, tx_side, fut_price, atr14, now_ist, logic_code, rrr_mult)
+        else:
+            active_expiry, _ = self.get_smart_expiry(idx, now_ist)
+            chain = fetch_option_chain(cfg["spot_key"], active_expiry)
+            self.execute_index_opt_entry(idx, cfg, side, fut_price, chain, atr14, now_ist, logic_code, rrr_mult)
+
+    def execute_mcx_fut_entry(self, idx: str, cfg: dict, tx_side: str, fut_price: float, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
         with self.pos_lock:
             if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
                 return
@@ -1542,8 +1581,8 @@ class IntradayV3Engine:
 
         ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
         min_sl = round_to_tick(ltp * 0.0015, tick_sz)
-        sl_points = max(round_to_tick(atr14 * MCX_ATR_SL_MULT, tick_sz), min_sl, tick_sz * 4)
-        target_points = round_to_tick(sl_points * MCX_RRR_TARGET, tick_sz)
+        sl_points = max(round_to_tick(atr14 * ATR_SL_MULT, tick_sz), min_sl, tick_sz * 4)
+        target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
 
         if tx_side == "BUY":
             sl_price = round_to_tick(ltp - sl_points, tick_sz)
@@ -1556,6 +1595,7 @@ class IntradayV3Engine:
 
         qty = min(lot_size, cfg["freeze_qty"])
         total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
+        full_setup_name = f"MCX_1M_{logic_code}_{tx_side}"
 
         order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp, tick_sz)
         if order_res.get("status") == "success":
@@ -1571,17 +1611,20 @@ class IntradayV3Engine:
                     "lots": 1, "lot_size": lot_size, "qty": qty, "pnl_units": pnl_mult,
                     "tick_size": tick_sz, "entry_price": fill, "r_unit": sl_points,
                     "est_charges": total_est_ch, "last_ltp": fill, "sl": sl_price, "target": target_price,
-                    "trail_stage": None, "trade_mode": "CONTRARIAN-REV",
-                    "setup_name": f"MCX_REVERSED_{tx_side}", "entry_time": entry_time_str,
+                    "trail_stage": None, "trade_mode": logic_code,
+                    "setup_name": full_setup_name, "entry_time": entry_time_str,
                 }
+            self.pending_retests[idx] = None
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
+            notify(
+                f"🚀 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
+                f"📌 <b>Logic:</b> <code>{logic_code}</code> (<code>{full_setup_name}</code>)\n"
+                f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+            )
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
-    # ==========================================================================
-    # EXECUTION 2: INDEX TREND-FOLLOWING BREAKOUT + RETEST (Fixed 1 : 1.5 R:R)
-    # ==========================================================================
-    def execute_index_breakout_retest_entry(self, idx: str, cfg: dict, side: str, fut_price: float, chain: list, atr14: float, now_ist: datetime, is_today_exp: bool):
+    def execute_index_opt_entry(self, idx: str, cfg: dict, side: str, fut_price: float, chain: list, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
         with self.pos_lock:
             if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
                 return
@@ -1622,16 +1665,17 @@ class IntradayV3Engine:
         raw_delta = abs(float(greeks.get("delta", 0.0)))
         delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else cfg.get("default_delta", 0.52)
 
-        calc_sl_pts = atr14 * IDX_ATR_SL_MULT * delta
+        calc_sl_pts = atr14 * ATR_SL_MULT * delta
         min_sl_pts = float(cfg.get("min_sl_pts", 10.0))
         sl_points = max(round_to_tick(max(min_sl_pts, calc_sl_pts), tick_sz), tick_sz * 4)
-        target_points = round_to_tick(sl_points * IDX_RRR_TARGET, tick_sz)
+        target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
 
         sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
         target_price = round_to_tick(ltp + target_points, tick_sz)
 
         qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
         total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
+        full_setup_name = f"IDX_1M_{logic_code}_{side}"
 
         order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
         if order_res.get("status") == "success":
@@ -1647,12 +1691,17 @@ class IntradayV3Engine:
                     "qty": qty, "pnl_units": qty, "tick_size": tick_sz,
                     "entry_price": fill, "r_unit": sl_points, "est_charges": total_est_ch,
                     "last_ltp": fill, "sl": sl_price, "target": target_price,
-                    "trail_stage": None, "trade_mode": "TREND-BO-RT",
-                    "setup_name": f"IDX_1M_BO_RETEST_{side}", "entry_time": entry_time_str,
+                    "trail_stage": None, "trade_mode": logic_code,
+                    "setup_name": full_setup_name, "entry_time": entry_time_str,
                 }
             self.pending_retests[idx] = None
             self.subscribe_tick_instrument(inst_key)
             self.save_active_positions_state()
+            notify(
+                f"🚀 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
+                f"📌 <b>Logic:</b> <code>{logic_code}</code> (<code>{full_setup_name}</code>)\n"
+                f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+            )
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def manage_open_positions(self, now_ist: datetime):
@@ -1781,11 +1830,11 @@ class IntradayV3Engine:
         holiday_checked_0922 = False
 
         notify(
-            f"🌅 <b>V3 QUANT ENGINE • ONLINE</b>\n"
+            f"🌅 <b>V3 QUANT ENGINE • ONLINE (1-MIN DUAL LOGIC)</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
-            f"📈 <b>Indices (1m):</b> <code>Breakout+Retest (09:15-10:30 &amp; 14:00-15:00 | 1:1.5)</code>\n"
-            f"🛢️ <b>MCX Mini (5m):</b> <code>Reversed Contrarian (17:00-20:00 | 1:2.0)</code>"
+            f"📈 <b>Indices (1m):</b> <code>TREND_BO_RETEST &amp; CONTRARIAN_REV (09:15-10:30 &amp; 14:00-15:00)</code>\n"
+            f"🛢️ <b>MCX Mini (1m):</b> <code>TREND_BO_RETEST &amp; CONTRARIAN_REV (17:00-20:00)</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
