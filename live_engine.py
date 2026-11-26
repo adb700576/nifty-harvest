@@ -41,10 +41,10 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 # Session & Exact Prime Time Slots (IST)
 SESSION_MAX_RUNTIME_SEC = 20700
-INDEX_WINDOWS = (("09:15", "10:30"), ("14:00", "15:00"))
+INDEX_WINDOWS = (("09:15", "11:30"), ("14:00", "15:00"))
 INDEX_EXIT_TIME = "15:15"
 
-MCX_WINDOWS = (("17:00", "20:00"),)
+MCX_WINDOWS = (("17:00", "21:00"),)
 MCX_EXIT_TIME = "23:15"
 
 REENTRY_COOLDOWN_SEC = 300          # 5-min cooldown per symbol after closing a trade
@@ -752,9 +752,10 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 # ==============================================================================
 # 6. UNIFIED DUAL-LOGIC ENGINE (1-MIN FOR BOTH INDICES & MCX MINI):
-#    - Logic A: TREND-FOLLOWING BREAKOUT + RETEST (1 : 1.5 R:R + 1R BE Trail)
-#    - Logic B: REVERSED / CONTRARIAN (1 : 2.0 R:R + 1R BE Trail)
-#    - Tags every entry with exact Strategy Name in Dashboard, Journal & Sheets
+#    - Indices Slots: 09:15-11:30 & 14:00-15:00 IST (EOD 15:15)
+#    - MCX Mini Slot: 17:00-21:00 IST (EOD 23:15)
+#    - Logic A: TREND_BO_RETEST (1 : 1.5 R:R + 1R BE Trail)
+#    - Logic B: CONTRARIAN_REV  (1 : 2.0 R:R + 1R BE Trail)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -1245,13 +1246,13 @@ class IntradayV3Engine:
                 lines.append("<i>No closed trades yet today.</i>")
 
             if self.last_summaries:
-                lines.append(f"\n📡 <b>INDICES LIVE (1m • BO+RETEST &amp; CONTRARIAN)</b>")
+                lines.append(f"\n📡 <b>INDICES LIVE (1m • 09:15-11:30 &amp; 14:00-15:00)</b>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
                         lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Vol <b>{s['vol_ratio']:.1f}x</b> | ATR <b>{s['atr']}</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX MINI LIVE (1m • BO+RETEST &amp; CONTRARIAN)</b>")
+                lines.append("\n🛢️ <b>MCX MINI LIVE (1m • 17:00-21:00)</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
@@ -1421,7 +1422,7 @@ class IntradayV3Engine:
 
         if not self.is_within_trade_window(idx, now_ist):
             self.pending_retests[idx] = None
-            slot_txt = "17:00-20:00" if is_mcx else "09:15-10:30|14:00-15:00"
+            slot_txt = "17:00-21:00" if is_mcx else "09:15-11:30|14:00-15:00"
             return {
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
@@ -1470,7 +1471,7 @@ class IntradayV3Engine:
                     "idx": idx, "is_mcx": is_mcx,
                     "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
                     "vol_ratio": vol_ratio, "atr": round(atr14, 1),
-                    "short_status": f"ENTERED TREND_BO_RETEST",
+                    "short_status": "ENTERED TREND_BO_RETEST",
                 }
 
         # ======================================================================
@@ -1833,8 +1834,8 @@ class IntradayV3Engine:
             f"🌅 <b>V3 QUANT ENGINE • ONLINE (1-MIN DUAL LOGIC)</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
-            f"📈 <b>Indices (1m):</b> <code>TREND_BO_RETEST &amp; CONTRARIAN_REV (09:15-10:30 &amp; 14:00-15:00)</code>\n"
-            f"🛢️ <b>MCX Mini (1m):</b> <code>TREND_BO_RETEST &amp; CONTRARIAN_REV (17:00-20:00)</code>"
+            f"📈 <b>Indices (1m):</b> <code>09:15-11:30 &amp; 14:00-15:00</code>\n"
+            f"🛢️ <b>MCX Mini (1m):</b> <code>17:00-21:00</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
