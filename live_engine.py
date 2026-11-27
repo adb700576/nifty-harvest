@@ -48,16 +48,17 @@ INDEX_EXIT_TIME = "15:15"
 MCX_WINDOWS = (("21:00", "22:00"),)
 MCX_EXIT_TIME = "23:15"
 
-# Equity Cash Session Controls (IST)
+# Equity Cash Session Controls (IST) — Strict Top 5 Stocks & Max 5 Equity Trades/Day
 EQ_ENTRY_START = "09:30"
 EQ_ORB_ATR_CUTOFF = "13:30"
 EQ_GANN_CUTOFF = "15:00"
 EQ_EXIT_TIME = "15:15"
 EQ_MAX_RISK_INR = 500.0
 EQ_MIN_FUEL_SCORE = 50.0
-EQ_MOTHER_TOP_N = 5
+EQ_TOP_N_STOCKS = 5
+EQ_MAX_TRADES_PER_DAY = 5
 EQ_MIN_RR = 2.0
-EQ_SCAN_INTERVAL_SEC = 24.0
+EQ_SCAN_INTERVAL_SEC = 20.0
 
 REENTRY_COOLDOWN_SEC = 300
 STARTUP_WARMUP_SEC = 30
@@ -126,7 +127,6 @@ MCX_MINI_SYMBOLS = {
     "COPPER":     "COPPER",
 }
 
-# Liquid NIFTY 50 Cash Stocks Basket for Equity Strategies
 EQUITY_UNIVERSE = [
     "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
     "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
@@ -368,7 +368,7 @@ def restore_journal_from_google_sheet():
 
 
 # ==============================================================================
-# 2. TELEGRAM DASHBOARD & AUTO-CHARGES (F&O + MCX + EQUITY INTRADAY)
+# 2. TELEGRAM DASHBOARD (4096-CHAR SAFE) & AUTO-CHARGES
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -415,13 +415,31 @@ def save_dashboard_id(msg_id: int):
         pass
 
 
+def _safe_telegram_html(text: str, max_len: int = 3950) -> str:
+    """Prevents Telegram 4096-char MESSAGE_TOO_LONG freeze without breaking HTML tags."""
+    if len(text) <= max_len:
+        return text
+    lines = text.splitlines()
+    out = []
+    curr_len = 0
+    for ln in lines:
+        if curr_len + len(ln) + 1 > max_len - 60:
+            out.append("<i>... (trimmed for Telegram 4096-char limit) ...</i>")
+            break
+        out.append(ln)
+        curr_len += len(ln) + 1
+    return "\n".join(out)
+
+
 def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
     if is_overnight_dead_hours(datetime.now(IST)) or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return message_id
 
+    safe_text = _safe_telegram_html(text)
+
     if message_id:
         edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": safe_text, "parse_mode": "HTML"}
         try:
             resp = requests.post(edit_url, json=payload, timeout=8).json()
             desc = str(resp.get("description", "")).lower()
@@ -429,8 +447,9 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
                 return message_id
         except Exception:
             pass
+
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_notification": True}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML", "disable_notification": True}
     try:
         resp = requests.post(send_url, json=payload, timeout=8).json()
         if resp.get("ok"):
@@ -1019,7 +1038,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 #         1. 1M_BO_RETEST  (1m Breakout + Retest -> 1:1.5 R:R + 1R BE Trail)
 #         2. 5M_CONTRARIAN (5m EMA20/50 Reversed -> 1:2.0 R:R + 1R BE Trail)
 #         3. VWAP_PCR_REV  (VWAP + PCR Reversed -> Swapped 1R Tgt / 2R SL)
-#    - NSE Equity Cash Stocks (09:30-15:00, ₹500 Max Risk/Trade):
+#    - NSE Equity Cash Stocks (STRICT TOP 5 STOCKS ONLY, MAX 5 TRADES/DAY, ₹500 RISK):
 #         4. EQ_GANN_15M   (09:30 Gann Square-of-9 Levels -> T3 1:2+ R:R)
 #         5. EQ_ATR_RANGE  (Fuel >= 50 + 15m Open ± 0.5*ATR14 Breakout -> Day Low/High SL)
 #         6. EQ_MOTHER_ORB (Top 5 Mother Candle High/Low Breakout -> Mother SL)
@@ -1034,11 +1053,11 @@ class IntradayV3Engine:
         self.open_pcr = {idx: None for idx in INDICES}
         self.pcr_history = {idx: deque(maxlen=6) for idx in INDICES}
 
-        # Equity Cash State (initialized after 09:30 IST)
+        # Equity Cash State (Strict Top 5 Stocks & Max 5 Trades/Day)
         self.eq_instruments = {}
         self.eq_morning_ready = False
         self.eq_levels = {}
-        self.eq_mother_top5 = set()
+        self.eq_top5_stocks = []
         self.eq_traded_today = set()
         self.last_eq_scan_ts = 0.0
         self.eq_scan_summary = "WAITING 09:30"
@@ -1572,7 +1591,7 @@ class IntradayV3Engine:
         ]
 
     # ==========================================================================
-    # TELEGRAM DASHBOARD (F&O + MCX + EQUITY 6-STRATEGY UNIFIED VIEW)
+    # TELEGRAM DASHBOARD (COMPACT 4096-SAFE + TOP 5 EQUITY + 6 STRATEGIES)
     # ==========================================================================
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
@@ -1637,42 +1656,41 @@ class IntradayV3Engine:
                     lot_spec_txt = f"{pos['qty']} Sh" if pos["type"] == "EQUITY_CASH" else f"{num_lots} Lot = {pos['qty']} Qty"
 
                     lines.extend([
-                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)\n  Strategy: {trail_tag}",
-                        f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
-                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>  |  Live Net: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>) | {trail_tag}",
+                        f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b> | SL: <code>₹{pos['sl']:.2f}</code> ({sl_label}) | Tgt: <code>{tgt_txt}</code> | Net: {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
 
-            lines.append("\n🎯 <b>STRATEGY PERFORMANCE (F&amp;O + EQUITY)</b>")
+            lines.append("\n🎯 <b>STRATEGY PERFORMANCE (F&amp;O + TOP-5 EQUITY)</b>")
             lines.extend(self.build_strategy_performance_lines())
 
             lines.append("\n⏰ <b>HOURLY SESSION TRACKER (IST)</b>")
             lines.extend(self.build_hourly_analysis_lines())
 
-            lines.append("\n📒 <b>TODAY'S CLOSED TRADES (LATEST 8)</b>")
+            lines.append("\n📒 <b>TODAY'S CLOSED TRADES (LATEST 6)</b>")
             if self.closed_trades:
-                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"])[-8:]:
+                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"])[-6:]:
                     icon = "✅" if t["pnl"] >= 0 else "❌"
                     setup_lbl = t.get("setup", "UNKNOWN")
                     lines.append(
-                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code> {icon} <b>₹{t['pnl']:+,.2f}</b>\n"
-                        f"  Strat: <code>{setup_lbl}</code> | <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> | <i>{t['exit_reason']}</i>"
+                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code> {icon} <b>₹{t['pnl']:+,.2f}</b> | <code>{setup_lbl}</code> (<code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>) <i>{t['exit_reason']}</i>"
                     )
             elif not active_snap:
                 lines.append("<i>No closed trades yet today.</i>")
 
-            if self.last_summaries:
-                lines.append(f"\n📡 <b>INDICES (09:10-15:00) &amp; EQUITY (09:30-15:00)</b>")
-                lines.append(f"• <b>NSE CASH BASKET:</b> <code>{self.eq_scan_summary}</code>")
-                for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
-                    s = self.last_summaries.get(idx)
-                    if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
+            lines.append(f"\n📡 <b>INDICES (09:10-15:00) &amp; TOP-5 EQUITY (09:30-15:00)</b>")
+            lines.append(f"• <b>NSE TOP-5 CASH:</b> <code>{self.eq_scan_summary}</code>")
+            for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
+                s = self.last_summaries.get(idx)
+                if s:
+                    lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
+                else:
+                    lines.append(f"• <b>{idx}:</b> <code>SYNCING...</code>")
 
-                lines.append("\n🛢️ <b>MCX MINI LIVE (21:00-22:00)</b>")
-                for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
-                    s = self.last_summaries.get(idx)
-                    if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | VWAP <b>{s['vwap']}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
+            lines.append("\n🛢️ <b>MCX MINI LIVE (21:00-22:00)</b>")
+            for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
+                s = self.last_summaries.get(idx)
+                if s:
+                    lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | VWAP <b>{s['vwap']}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
 
             lines.append("\n📊 <b>OVERALL SUMMARY (NET ₹)</b>")
             lines.extend(self.get_performance_summary_lines(now_ist, live_net_mtm))
@@ -1683,7 +1701,7 @@ class IntradayV3Engine:
         def _pulse_loop():
             while not self.stop_requested:
                 time.sleep(DASHBOARD_PULSE_SEC)
-                if self.stop_requested or not self.dashboard_msg_id or not self.last_summaries:
+                if self.stop_requested or not self.dashboard_msg_id:
                     continue
                 if "CLOSED" in self.bot_status_text or "STOPPED" in self.bot_status_text:
                     break
@@ -1774,7 +1792,7 @@ class IntradayV3Engine:
         return True
 
     # ==========================================================================
-    # EQUITY CASH ENGINE (3 STRATEGIES: EQ_GANN_15M, EQ_ATR_RANGE, EQ_MOTHER_ORB)
+    # EQUITY CASH ENGINE (STRICT TOP 5 STOCKS ONLY & MAX 5 TRADES/DAY)
     # ==========================================================================
     def evaluate_equity_strategies(self, now_ist: datetime):
         if not self.session_sched.get("nse_open", True) or not self.eq_instruments:
@@ -1793,7 +1811,7 @@ class IntradayV3Engine:
             return
         self.last_eq_scan_ts = time.time()
 
-        # Step 1 (Once at 09:30): Lock 09:15-09:30 Mother Candle, Gann Levels & Fuel Scores
+        # Step 1 (Once at/after 09:30): Rank by 09:15-09:30 Mother Candle Fuel & lock Top 5 Stocks
         if not self.eq_morning_ready:
             fuel_ranking = []
             for sym, ikey in self.eq_instruments.items():
@@ -1825,29 +1843,47 @@ class IntradayV3Engine:
 
             if fuel_ranking:
                 fuel_ranking.sort(key=lambda x: x[1], reverse=True)
-                self.eq_mother_top5 = {s for s, _ in fuel_ranking[:EQ_MOTHER_TOP_N]}
+                self.eq_top5_stocks = [s for s, _ in fuel_ranking[:EQ_TOP_N_STOCKS]]
                 self.eq_morning_ready = True
-                log.info(f"[EQUITY 09:30 LOCKED] Top 5 Mother Candle Stocks: {sorted(self.eq_mother_top5)}")
+                log.info(f"[EQUITY TOP-5 LOCKED] Selected Stocks for all 3 Equity Strategies: {self.eq_top5_stocks}")
 
         if not self.eq_morning_ready:
             self.eq_scan_summary = "SYNCING 09:30 DATA"
             return
 
-        if hhmm >= EQ_GANN_CUTOFF:
-            self.eq_scan_summary = "CUTOFF EXPIRED (15:00)"
+        if len(self.eq_traded_today) >= EQ_MAX_TRADES_PER_DAY:
+            with self.pos_lock:
+                eq_open = sum(1 for p in self.active_positions.values() if p["type"] == "EQUITY_CASH")
+            self.eq_scan_summary = f"TOP-5 ({','.join(self.eq_top5_stocks)}) | {eq_open} Open / {len(self.eq_traded_today)}/{EQ_MAX_TRADES_PER_DAY} Done"
             return
 
-        all_eq_keys = [v["key"] for v in self.eq_levels.values()]
-        quotes = fetch_ltp_quote(all_eq_keys)
+        if hhmm >= EQ_GANN_CUTOFF:
+            self.eq_scan_summary = f"TOP-5 ({','.join(self.eq_top5_stocks)}) | CUTOFF 15:00"
+            return
 
-        for sym, meta in self.eq_levels.items():
+        top5_keys = [self.eq_levels[s]["key"] for s in self.eq_top5_stocks if s in self.eq_levels]
+        quotes = fetch_ltp_quote(top5_keys)
+
+        for sym in self.eq_top5_stocks:
+            if len(self.eq_traded_today) >= EQ_MAX_TRADES_PER_DAY:
+                break
+
+            meta = self.eq_levels.get(sym)
+            if not meta:
+                continue
             ikey = meta["key"]
             q = quotes.get(ikey, {})
             ltp = float(q.get("last_price", 0.0))
             if ltp <= 0:
                 continue
 
-            # --- EQUITY STRATEGY 1: EQ_GANN_15M (09:30 - 15:00) ---
+            # Allow max 1 active equity position per stock at any time
+            with self.pos_lock:
+                sym_open = any(p["type"] == "EQUITY_CASH" and p["symbol"] == sym for p in self.active_positions.values())
+            if sym_open:
+                continue
+
+            # --- EQUITY STRATEGY 1: EQ_GANN_15M (Top 5 Stocks, 09:30 - 15:00) ---
             gann_pk = f"{sym}__EQ_GANN_15M"
             if gann_pk not in self.eq_traded_today and meta["gann"]:
                 g = meta["gann"]
@@ -1856,24 +1892,28 @@ class IntradayV3Engine:
                     if chosen:
                         t_lvl, tgt_px = chosen
                         self.execute_equity_entry(sym, ikey, "BUY", ltp, g["BUY_SL"], tgt_px, now_ist, "EQ_GANN_15M", f"EQ_GANN_{t_lvl}_BUY")
+                        continue
                 elif ltp <= g["SELL"]:
                     chosen = choose_gann_target(g["SELL"], g["SELL_SL"], g["SELL_TARGETS"], "SELL")
                     if chosen:
                         t_lvl, tgt_px = chosen
                         self.execute_equity_entry(sym, ikey, "SELL", ltp, g["SELL_SL"], tgt_px, now_ist, "EQ_GANN_15M", f"EQ_GANN_{t_lvl}_SELL")
+                        continue
 
             if hhmm >= EQ_ORB_ATR_CUTOFF:
                 continue
 
             # --- EQUITY STRATEGY 2: EQ_MOTHER_ORB (Top 5 Stocks, 09:30 - 13:30) ---
             orb_pk = f"{sym}__EQ_MOTHER_ORB"
-            if sym in self.eq_mother_top5 and orb_pk not in self.eq_traded_today:
+            if orb_pk not in self.eq_traded_today:
                 if ltp > meta["mother_high"]:
                     self.execute_equity_entry(sym, ikey, "BUY", ltp, meta["mother_low"], 0.0, now_ist, "EQ_MOTHER_ORB", "EQ_MOTHER_ORB_BUY")
+                    continue
                 elif ltp < meta["mother_low"]:
                     self.execute_equity_entry(sym, ikey, "SELL", ltp, meta["mother_high"], 0.0, now_ist, "EQ_MOTHER_ORB", "EQ_MOTHER_ORB_SELL")
+                    continue
 
-            # --- EQUITY STRATEGY 3: EQ_ATR_RANGE (Fuel >= 50 + Completed 15m ATR Breakout, 09:30 - 13:30) ---
+            # --- EQUITY STRATEGY 3: EQ_ATR_RANGE (Top 5 Stocks, Fuel >= 50, 09:30 - 13:30) ---
             atr_pk = f"{sym}__EQ_ATR_RANGE"
             if meta["fuel"] >= EQ_MIN_FUEL_SCORE and atr_pk not in self.eq_traded_today:
                 df_1m_s = fetch_intraday_candles(ikey, 1)
@@ -1889,12 +1929,12 @@ class IntradayV3Engine:
 
         with self.pos_lock:
             eq_open = sum(1 for p in self.active_positions.values() if p["type"] == "EQUITY_CASH")
-        self.eq_scan_summary = f"ACTIVE ({eq_open} Open | {len(self.eq_traded_today)} Today)"
+        self.eq_scan_summary = f"TOP-5 ({','.join(self.eq_top5_stocks)}) | {eq_open} Open / {len(self.eq_traded_today)}/{EQ_MAX_TRADES_PER_DAY} Done"
 
     def execute_equity_entry(self, sym: str, ikey: str, tx_side: str, ltp: float, sl_raw: float, tgt_raw: float, now_ist: datetime, strat_key: str, setup_label: str):
         pos_key = f"{sym}__{strat_key}"
         with self.pos_lock:
-            if pos_key in self.active_positions or pos_key in self.eq_traded_today:
+            if pos_key in self.active_positions or pos_key in self.eq_traded_today or len(self.eq_traded_today) >= EQ_MAX_TRADES_PER_DAY:
                 return
 
         tick_sz = 0.05
@@ -1949,7 +1989,7 @@ class IntradayV3Engine:
         raw_df = fetch_intraday_candles(fut_key, 1) if fut_key else pd.DataFrame()
         if raw_df.empty and not is_mcx and cfg.get("spot_key"):
             raw_df = fetch_intraday_candles(cfg["spot_key"], 1)
-        if raw_df.empty or len(raw_df) < 5:
+        if raw_df.empty:
             return None
 
         df_1m = add_full_indicators(raw_df)
@@ -2516,11 +2556,11 @@ class IntradayV3Engine:
         holiday_checked_0922 = False
 
         notify(
-            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE (6 STRATEGIES)</b>\n"
+            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE (TOP-5 EQUITY + F&amp;O)</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"📈 <b>F&amp;O (09:10-15:00) &amp; MCX (21:00-22:00):</b> <code>1M_BO_RETEST + 5M_CONTRARIAN + VWAP_PCR_REV</code>\n"
-            f"🏛️ <b>NSE Equity (09:30-15:00):</b> <code>EQ_GANN_15M + EQ_ATR_RANGE + EQ_MOTHER_ORB</code>"
+            f"🏛️ <b>Top-5 Equity (09:30-15:00, Max 5T):</b> <code>EQ_GANN_15M + EQ_ATR_RANGE + EQ_MOTHER_ORB</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
@@ -2587,7 +2627,6 @@ class IntradayV3Engine:
                 if res:
                     self.last_summaries[idx] = res
 
-            # Evaluate the 3 NSE Equity Cash Strategies (09:30 - 15:15 IST)
             self.evaluate_equity_strategies(now_ist)
 
             if not self.dashboard_msg_id and self.last_summaries:
