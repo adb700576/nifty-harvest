@@ -42,10 +42,10 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
 # Session & Prime Time Slots (IST)
 SESSION_MAX_RUNTIME_SEC = 20700
-INDEX_WINDOWS = (("09:10", "15:00"),)
+INDEX_WINDOWS = (("09:15", "15:00"),)
 INDEX_EXIT_TIME = "15:15"
 
-MCX_WINDOWS = (("17:00", "22:00"),)
+MCX_WINDOWS = (("17:00", "21:00"),)
 MCX_EXIT_TIME = "23:15"
 
 # Equity Cash Session Controls (IST) — Strict Top 5 Stocks & Max 5 Equity Trades/Day
@@ -64,15 +64,15 @@ REENTRY_COOLDOWN_SEC = 300
 STARTUP_WARMUP_SEC = 30
 DASHBOARD_PULSE_SEC = 10.0
 
-# F&O Strategy 1: Trend-Following Breakout + Retest (1-Minute Candles)
-BO_VOL_RATIO_MIN = 1.20
-BO_RANGE_EXPANSION_ATR = 1.20
-BO_BODY_RATIO_MIN = 0.45
-BO_RETEST_BUFFER_ATR = 0.30
-BO_RETEST_MAX_BARS = 15
-BO_RRR_TARGET = 1.50
+# F&O Strategy 1: 5-Minute VWAP Marubozu Arm + Pullback Rejection + 1:1 / 1:2 / Infinity Runner
+MARU_BODY_MIN = 0.62
+MARU_VOL_MIN = 1.15
+MARU_SL_ATR_BUF = 0.15
+MARU_MAX_ARM_BARS = 24          # Up to 2 hours (24 x 5m bars, e.g., 10:50 AM -> 12:00 PM)
+MARU_STALL_BARS_LIMIT = 3       # Exit if 3 closed 5m bars stall with weak volume
+MARU_PCR_MELT_THRESH = 0.08     # Exit if PCR shifts against position by >= 0.08
 
-# F&O Strategy 2: Reversed / Contrarian EMA Trend (5-Minute Closed Candles)
+# F&O Strategy 2: Reversed / Contrarian EMA Trend (5-Minute Closed Candles + 1 Opposite Confirm Candle)
 REV_VOL_RATIO_MIN = 1.30
 REV_BODY_RATIO_MIN = 0.50
 REV_RRR_TARGET = 2.00
@@ -98,7 +98,7 @@ JOURNAL_FIELDNAMES = [
 ]
 
 ALL_STRATEGY_KEYS = (
-    "1M_BO_RETEST",
+    "5M_VWAP_MARU",
     "5M_CONTRARIAN",
     "VWAP_PCR_REV",
     "EQ_GANN_15M",
@@ -106,6 +106,7 @@ ALL_STRATEGY_KEYS = (
     "EQ_MOTHER_ORB",
 )
 
+# COPPER removed so only true MCX Mini contracts trade
 INDICES = {
     "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "min_sl_pts": 10.0, "default_delta": 0.52},
     "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank", "min_sl_pts": 20.0, "default_delta": 0.52},
@@ -116,7 +117,6 @@ INDICES = {
     "NATURALGAS": {"type": "MCX_FUT"},
     "GOLD":       {"type": "MCX_FUT"},
     "SILVER":     {"type": "MCX_FUT"},
-    "COPPER":     {"type": "MCX_FUT"},
 }
 
 MCX_MINI_SYMBOLS = {
@@ -124,7 +124,6 @@ MCX_MINI_SYMBOLS = {
     "NATURALGAS": "NATGASMINI",
     "GOLD":       "GOLDM",
     "SILVER":     "SILVERM",
-    "COPPER":     "COPPER",
 }
 
 EQUITY_UNIVERSE = [
@@ -151,7 +150,7 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
     hhmm = now_ist.strftime("%H:%M")
-    return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "17:05")
+    return ("14:35" <= hhmm <= "15:05") or ("16:35" <= hhmm <= "17:05")
 
 
 def is_overnight_dead_hours(now_ist: datetime) -> bool:
@@ -182,7 +181,7 @@ def map_setup_to_strategy(setup_str: str) -> str:
         return "VWAP_PCR_REV"
     if "5M_CONTRARIAN" in s or "CONTRARIAN_REV" in s:
         return "5M_CONTRARIAN"
-    return "1M_BO_RETEST"
+    return "5M_VWAP_MARU"
 
 
 def inspect_special_session_schedule(now_ist: datetime) -> dict:
@@ -802,7 +801,7 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. TECHNICAL INDICATORS & EQUITY GANN / ATR / MOTHER CANDLE HELPERS
+# 4. TECHNICAL INDICATORS & 5M VWAP MARUBOZU + REJECTION STRATEGY ENGINE
 # ==============================================================================
 def add_full_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -830,6 +829,8 @@ def add_full_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     c_range = (x["high"] - x["low"]).replace(0, 1e-6)
     x["body_ratio"] = (x["close"] - x["open"]).abs() / c_range
+    x["upper_wick_ratio"] = (x["high"] - x[["open", "close"]].max(axis=1)) / c_range
+    x["lower_wick_ratio"] = (x[["open", "close"]].min(axis=1) - x["low"]) / c_range
     return x
 
 
@@ -873,6 +874,294 @@ def build_resampled_5m_df(df_1m: pd.DataFrame) -> pd.DataFrame:
     if df_5m.empty:
         return df_5m
     return add_full_indicators(df_5m)
+
+
+class FiveMinVwapMarubozuStrategy:
+    """
+    5-Minute VWAP Marubozu Arm + Pullback Rejection Entry + 1:1 / 1:2 / Infinity Runner + PCR/Momentum Melt Exit.
+      - PE Flow: Strong Bearish Marubozu cuts VWAP -> Pullback -> Any Bearish Rejection Candle close -> PE Entry
+      - CE Flow: Strong Bullish Marubozu cuts VWAP -> Pullback -> Any Bullish Rejection Candle close -> CE Entry
+    """
+
+    def __init__(self):
+        self.armed_setup = {}       # idx -> dict with arm state
+        self.last_eval_bar_ts = {}  # idx -> last completed 5m bar timestamp
+
+    def _is_bearish_marubozu_vwap_cut(self, bar: pd.Series) -> bool:
+        o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+        vwap = float(bar["vwap"])
+        body_r = float(bar["body_ratio"])
+        vol_r = float(bar["vol_ratio"])
+        cut_vwap = (o >= vwap or h >= vwap) and (c < vwap)
+        return (c < o) and cut_vwap and (body_r >= MARU_BODY_MIN) and (vol_r >= MARU_VOL_MIN)
+
+    def _is_bullish_marubozu_vwap_cut(self, bar: pd.Series) -> bool:
+        o, h, l, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+        vwap = float(bar["vwap"])
+        body_r = float(bar["body_ratio"])
+        vol_r = float(bar["vol_ratio"])
+        cut_vwap = (o <= vwap or l <= vwap) and (c > vwap)
+        return (c > o) and cut_vwap and (body_r >= MARU_BODY_MIN) and (vol_r >= MARU_VOL_MIN)
+
+    def _is_bearish_rejection_candle(self, curr: pd.Series, prev: pd.Series) -> tuple:
+        o, h, l, c = float(curr["open"]), float(curr["high"]), float(curr["low"]), float(curr["close"])
+        vwap, ema20, atr = float(curr["vwap"]), float(curr["ema20"]), max(float(curr["atr14"]), 1e-6)
+        u_wick = float(curr["upper_wick_ratio"])
+        body_r = float(curr["body_ratio"])
+
+        if not (c < vwap and c < ema20):
+            return False, ""
+
+        near_resistance = (h >= min(vwap, ema20) - 0.60 * atr) or (float(prev["high"]) >= min(vwap, ema20) - 0.60 * atr)
+        if not near_resistance:
+            return False, ""
+
+        if u_wick >= 0.40 and c <= o:
+            return True, "WICK_REJECT"
+        if (float(prev["close"]) > float(prev["open"])) and (c < o) and (c <= float(prev["open"])):
+            return True, "BEAR_ENGULF"
+        if (c < o) and (body_r >= 0.45) and (c < float(prev["low"])):
+            return True, "EMA_VWAP_REJECT"
+        if (c < o) and (u_wick >= 0.30):
+            return True, "PULLBACK_REJECT"
+        return False, ""
+
+    def _is_bullish_rejection_candle(self, curr: pd.Series, prev: pd.Series) -> tuple:
+        o, h, l, c = float(curr["open"]), float(curr["high"]), float(curr["low"]), float(curr["close"])
+        vwap, ema20, atr = float(curr["vwap"]), float(curr["ema20"]), max(float(curr["atr14"]), 1e-6)
+        l_wick = float(curr["lower_wick_ratio"])
+        body_r = float(curr["body_ratio"])
+
+        if not (c > vwap and c > ema20):
+            return False, ""
+
+        near_support = (l <= max(vwap, ema20) + 0.60 * atr) or (float(prev["low"]) <= max(vwap, ema20) + 0.60 * atr)
+        if not near_support:
+            return False, ""
+
+        if l_wick >= 0.40 and c >= o:
+            return True, "WICK_REJECT"
+        if (float(prev["close"]) < float(prev["open"])) and (c > o) and (c >= float(prev["open"])):
+            return True, "BULL_ENGULF"
+        if (c > o) and (body_r >= 0.45) and (c > float(prev["high"])):
+            return True, "EMA_VWAP_REJECT"
+        if (c > o) and (l_wick >= 0.30):
+            return True, "PULLBACK_REJECT"
+        return False, ""
+
+    def evaluate_5m_signal(
+        self,
+        idx: str,
+        df_5m: pd.DataFrame,
+        pcr: float,
+        pcr_prev: float,
+        is_mcx: bool,
+        has_open_position: bool,
+        tick_size: float = 0.05,
+    ) -> dict:
+        if df_5m.empty or len(df_5m) < 4:
+            return {"action": "NONE", "status": "WARMUP_5M"}
+
+        closed_bar = df_5m.iloc[-2]
+        prev_bar = df_5m.iloc[-3]
+        bar_ts = str(closed_bar["timestamp"])
+        bar_hhmm = closed_bar["timestamp"].strftime("%H:%M")
+
+        if self.last_eval_bar_ts.get(idx) == bar_ts:
+            arm = self.armed_setup.get(idx)
+            st = f"ARMED {arm['side']}@{arm['arm_time']}" if arm else "SCAN 5M VWAP"
+            return {"action": "NONE", "status": st}
+
+        self.last_eval_bar_ts[idx] = bar_ts
+        close_px = float(closed_bar["close"])
+        high_px = float(closed_bar["high"])
+        low_px = float(closed_bar["low"])
+        atr = max(float(closed_bar["atr14"]), tick_size * 4)
+
+        arm = self.armed_setup.get(idx)
+
+        # Invalidate or expire existing ARM if SL breached or max bars exceeded
+        if arm is not None:
+            arm["bars_elapsed"] += 1
+            if arm["bars_elapsed"] > MARU_MAX_ARM_BARS:
+                self.armed_setup[idx] = None
+                arm = None
+            elif arm["side"] == "PE" and high_px >= arm["spot_sl"]:
+                self.armed_setup[idx] = None
+                arm = None
+            elif arm["side"] == "CE" and low_px <= arm["spot_sl"]:
+                self.armed_setup[idx] = None
+                arm = None
+
+        # ARM on strong Marubozu cutting VWAP
+        if self._is_bearish_marubozu_vwap_cut(closed_bar):
+            buf = MARU_SL_ATR_BUF * atr
+            spot_sl = round_to_tick(high_px + buf, tick_size)
+            self.armed_setup[idx] = {
+                "side": "PE",
+                "arm_time": bar_hhmm,
+                "arm_bar_ts": bar_ts,
+                "spot_sl": spot_sl,
+                "bars_elapsed": 0,
+            }
+            return {"action": "ARMED", "side": "PE", "status": f"ARMED PE@{bar_hhmm}"}
+
+        if self._is_bullish_marubozu_vwap_cut(closed_bar):
+            buf = MARU_SL_ATR_BUF * atr
+            spot_sl = round_to_tick(low_px - buf, tick_size)
+            self.armed_setup[idx] = {
+                "side": "CE",
+                "arm_time": bar_hhmm,
+                "arm_bar_ts": bar_ts,
+                "spot_sl": spot_sl,
+                "bars_elapsed": 0,
+            }
+            return {"action": "ARMED", "side": "CE", "status": f"ARMED CE@{bar_hhmm}"}
+
+        # Trigger Rejection Entry while ARMED
+        if arm is not None and not has_open_position and bar_ts != arm["arm_bar_ts"]:
+            if arm["side"] == "PE":
+                rej_ok, pat_name = self._is_bearish_rejection_candle(closed_bar, prev_bar)
+                pcr_ok = True if is_mcx else ((pcr <= 1.05) and (pcr <= pcr_prev + 0.01))
+                if rej_ok and pcr_ok:
+                    spot_risk = arm["spot_sl"] - close_px
+                    if spot_risk > 0:
+                        self.armed_setup[idx] = None
+                        return {
+                            "action": "ENTER",
+                            "side": "PE",
+                            "setup": f"5M_VWAP_{pat_name}",
+                            "arm_time": arm["arm_time"],
+                            "entry_time": bar_hhmm,
+                            "spot_entry": close_px,
+                            "spot_sl": arm["spot_sl"],
+                            "spot_risk": round(spot_risk, 2),
+                            "entry_pcr": pcr,
+                            "status": f"ENTER PE@{bar_hhmm}",
+                        }
+
+            elif arm["side"] == "CE":
+                rej_ok, pat_name = self._is_bullish_rejection_candle(closed_bar, prev_bar)
+                pcr_ok = True if is_mcx else ((pcr >= 0.95) and (pcr >= pcr_prev - 0.01))
+                if rej_ok and pcr_ok:
+                    spot_risk = close_px - arm["spot_sl"]
+                    if spot_risk > 0:
+                        self.armed_setup[idx] = None
+                        return {
+                            "action": "ENTER",
+                            "side": "CE",
+                            "setup": f"5M_VWAP_{pat_name}",
+                            "arm_time": arm["arm_time"],
+                            "entry_time": bar_hhmm,
+                            "spot_entry": close_px,
+                            "spot_sl": arm["spot_sl"],
+                            "spot_risk": round(spot_risk, 2),
+                            "entry_pcr": pcr,
+                            "status": f"ENTER CE@{bar_hhmm}",
+                        }
+
+        st = f"ARMED {arm['side']}@{arm['arm_time']}" if arm else "SCAN 5M VWAP"
+        return {"action": "NONE", "status": st}
+
+    def manage_position_trail_and_melt(
+        self,
+        pos: dict,
+        spot_ltp: float,
+        opt_ltp: float,
+        df_5m: pd.DataFrame,
+        curr_pcr: float,
+        hhmm: str,
+    ) -> dict:
+        side = pos["side"]  # "PE" or "CE"
+        is_mcx = pos.get("type") == "MCX_FUT"
+        spot_entry = float(pos.get("spot_entry", pos["entry_price"]))
+        spot_risk = max(float(pos.get("spot_risk", pos.get("r_unit", 1.0))), 1e-6)
+        opt_entry = float(pos["entry_price"])
+        opt_r = max(float(pos.get("r_unit", 1.0)), 1e-6)
+        tick_sz = float(pos.get("tick_size", 0.05))
+        entry_pcr = float(pos.get("entry_pcr", curr_pcr))
+
+        spot_move = (spot_entry - spot_ltp) if side == "PE" else (spot_ltp - spot_entry)
+        curr_r = spot_move / spot_risk
+
+        # 1:1 (1R) -> Shift SL to Cost-to-Cost
+        if curr_r >= 1.0 and pos.get("trail_stage") not in ("1R COST-TO-COST", "2R +1R LOCKED", "INFINITY 20EMA"):
+            pos["spot_sl"] = spot_entry
+            if is_mcx:
+                pos["sl"] = round_to_tick((opt_entry - 0.05 * opt_r) if side == "PE" else (opt_entry + 0.05 * opt_r), tick_sz)
+            else:
+                pos["sl"] = round_to_tick(opt_entry + (0.05 * opt_r), tick_sz)
+            pos["trail_stage"] = "1R COST-TO-COST"
+
+        # 1:2 (2R) -> Shift SL to +1R Locked Profit
+        if curr_r >= 2.0 and pos.get("trail_stage") not in ("2R +1R LOCKED", "INFINITY 20EMA"):
+            pos["spot_sl"] = (spot_entry - spot_risk) if side == "PE" else (spot_entry + spot_risk)
+            if is_mcx:
+                pos["sl"] = round_to_tick((opt_entry - opt_r) if side == "PE" else (opt_entry + opt_r), tick_sz)
+            else:
+                pos["sl"] = round_to_tick(opt_entry + opt_r, tick_sz)
+            pos["trail_stage"] = "2R +1R LOCKED"
+
+        # > 2.2R -> Infinity Runner trailing 5m 20 EMA
+        if curr_r >= 2.2 and not df_5m.empty and len(df_5m) >= 2:
+            ema20_5m = float(df_5m.iloc[-2]["ema20"])
+            if side == "PE" and ema20_5m < pos["spot_sl"]:
+                pos["spot_sl"] = round_to_tick(ema20_5m, tick_sz)
+                pos["trail_stage"] = "INFINITY 20EMA"
+            elif side == "CE" and ema20_5m > pos["spot_sl"]:
+                pos["spot_sl"] = round_to_tick(ema20_5m, tick_sz)
+                pos["trail_stage"] = "INFINITY 20EMA"
+
+        # Hard SL check (Spot or Option/Future)
+        if side == "PE":
+            opt_sl_hit = (opt_ltp >= pos["sl"]) if is_mcx else (opt_ltp <= pos["sl"])
+            if spot_ltp >= pos["spot_sl"] or opt_sl_hit:
+                reason = f"{pos['trail_stage'].replace(' ', '_')}_EXIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
+                return {"exit": True, "reason": reason}
+        else:
+            if spot_ltp <= pos["spot_sl"] or opt_ltp <= pos["sl"]:
+                reason = f"{pos['trail_stage'].replace(' ', '_')}_EXIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
+                return {"exit": True, "reason": reason}
+
+        # PCR Melt exit (Index Options only)
+        if not is_mcx and curr_pcr > 0 and entry_pcr > 0:
+            if side == "PE" and (curr_pcr - entry_pcr) >= MARU_PCR_MELT_THRESH:
+                return {"exit": True, "reason": f"PCR_MELT({entry_pcr:.2f}->{curr_pcr:.2f})"}
+            if side == "CE" and (entry_pcr - curr_pcr) >= MARU_PCR_MELT_THRESH:
+                return {"exit": True, "reason": f"PCR_MELT({entry_pcr:.2f}->{curr_pcr:.2f})"}
+
+        # No Momentum / Option Premium Melt exit
+        if not df_5m.empty and len(df_5m) >= (MARU_STALL_BARS_LIMIT + 2):
+            recent = df_5m.iloc[-(MARU_STALL_BARS_LIMIT + 1):-1]
+            last_closed = recent.iloc[-1]
+            avg_vol_r = float(recent["vol_ratio"].mean())
+            ema20_c = float(last_closed["ema20"])
+            vwap_c = float(last_closed["vwap"])
+            c_px = float(last_closed["close"])
+
+            if side == "PE" and c_px > ema20_c and c_px > vwap_c:
+                return {"exit": True, "reason": "NO_MOMENTUM_EMA_VWAP_CROSS"}
+            if side == "CE" and c_px < ema20_c and c_px < vwap_c:
+                return {"exit": True, "reason": "NO_MOMENTUM_EMA_VWAP_CROSS"}
+
+            if not is_mcx and curr_r < 0.8 and avg_vol_r < 0.70:
+                if side == "PE":
+                    no_new_low = float(recent["low"].min()) > (spot_ltp - 0.10 * spot_risk)
+                    opt_melting = (opt_ltp < opt_entry * 0.88) and (spot_move >= 0)
+                    if no_new_low and opt_melting:
+                        return {"exit": True, "reason": "MOMENTUM_AND_PREMIUM_MELT"}
+                elif side == "CE":
+                    no_new_high = float(recent["high"].max()) < (spot_ltp + 0.10 * spot_risk)
+                    opt_melting = (opt_ltp < opt_entry * 0.88) and (spot_move >= 0)
+                    if no_new_high and opt_melting:
+                        return {"exit": True, "reason": "MOMENTUM_AND_PREMIUM_MELT"}
+
+        if not is_mcx and hhmm >= INDEX_EXIT_TIME:
+            return {"exit": True, "reason": "EOD_RUNNER_EXIT_1515"}
+        if is_mcx and hhmm >= MCX_EXIT_TIME:
+            return {"exit": True, "reason": "MCX_EOD_EXIT_2315"}
+
+        return {"exit": False, "reason": None}
 
 
 def compute_gann_levels(reference_price: float) -> dict:
@@ -1038,7 +1327,7 @@ class IntradayV3Engine:
     def __init__(self):
         self.expiries = {}
         self.fut_contracts = {}
-        self.pending_retests = {idx: None for idx in INDICES}
+        self.vwap_maru_5m = FiveMinVwapMarubozuStrategy()
         self.last_rev_5m_ts = {idx: "" for idx in INDICES}
         self.last_vwap_bar_ts = {idx: "" for idx in INDICES}
         self.open_pcr = {idx: None for idx in INDICES}
@@ -1063,6 +1352,7 @@ class IntradayV3Engine:
         self.day_pnl = 0.0
         self.last_summaries = {}
         self.latest_dfs = {}
+        self.latest_5m_dfs = {}
 
         # 2 Clean Pinned Dashboards: master (Consolidated P&L + Strategies) & positions (Live Trades & Feed)
         self.dash_ids = load_saved_dashboard_ids()
@@ -1331,6 +1621,16 @@ class IntradayV3Engine:
             for pos_key, pos in self.active_positions.items():
                 if pos["instrument_key"].replace(":", "|") == norm_key:
                     pos["last_ltp"] = ltp
+                    if pos.get("strategy_key") == "5M_VWAP_MARU":
+                        # 5M_VWAP_MARU manages 1:1 / 1:2 / Infinity Runner inside manage_open_positions
+                        is_mcx = pos.get("type") == "MCX_FUT"
+                        if is_mcx and pos["tx_side"] == "SELL" and ltp >= pos["sl"]:
+                            exits_to_run.append((pos_key, "STOP_LOSS_HIT"))
+                        elif (not is_mcx or pos["tx_side"] == "BUY") and ltp <= pos["sl"]:
+                            reason = f"{pos['trail_stage'].replace(' ', '_')}_EXIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
+                            exits_to_run.append((pos_key, reason))
+                        continue
+
                     is_short = pos["tx_side"] == "SELL"
                     entry = pos["entry_price"]
                     curr_gain = (entry - ltp) if is_short else (ltp - entry)
@@ -1490,8 +1790,8 @@ class IntradayV3Engine:
             avg_loss = (abs(sum(float(t["pnl"]) for t in losses)) / len(losses)) if losses else 0.0
             if avg_loss > 0 and avg_win > 0:
                 rr_txt = f"1:{avg_win / avg_loss:.1f}"
-            elif sk == "1M_BO_RETEST":
-                rr_txt = "1:1.5"
+            elif sk == "5M_VWAP_MARU":
+                rr_txt = "1:2->INF"
             elif sk in ("5M_CONTRARIAN", "EQ_GANN_15M"):
                 rr_txt = "1:2.0+"
             elif sk == "VWAP_PCR_REV":
@@ -1682,7 +1982,7 @@ class IntradayV3Engine:
 
                     strat_lbl = pos.get("setup_name", pos.get("strategy_key", ""))
                     tgt_val = float(pos.get("target", 0.0))
-                    tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else "15:15 EOD"
+                    tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else ("INFINITY" if pos.get("strategy_key") == "5M_VWAP_MARU" else "15:15 EOD")
                     trail_tag = f"<code>{strat_lbl}</code> | 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{strat_lbl}</code>"
                     p_icon = "🟢" if pnl >= 0 else "🔴"
                     sl_lbl = f"Lock <b>₹{sl_net:+,.0f}</b>" if sl_net >= 0 else f"Risk <b>₹{abs(sl_net):,.0f}</b>"
@@ -1721,12 +2021,12 @@ class IntradayV3Engine:
                     pos_lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | <code>{s['short_status']}</code>")
 
             mcx_parts = []
-            for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
+            for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER"):
                 s = self.last_summaries.get(idx)
                 if s:
                     mcx_parts.append(f"{idx[:4]} <code>{s['spot']}</code>")
             if mcx_parts:
-                pos_lines.append(f"• <b>MCX (17:00-22:00):</b> {' | '.join(mcx_parts)}")
+                pos_lines.append(f"• <b>MCX Mini (17:00-21:00):</b> {' | '.join(mcx_parts)}")
 
             prev_ids = dict(self.dash_ids)
             self.dash_ids["master"] = upsert_telegram_dashboard("\n".join(master_lines), self.dash_ids.get("master"))
@@ -1777,8 +2077,6 @@ class IntradayV3Engine:
 
         idx = pos["symbol"]
         self.last_exit_ts[pos_key] = 0.0 if is_reversal else time.time()
-        if pos.get("strategy_key") == "1M_BO_RETEST":
-            self.pending_retests[idx] = None
 
         df_curr = self.latest_dfs.get(idx)
         if not is_reversal and df_curr is not None and not df_curr.empty:
@@ -2022,7 +2320,7 @@ class IntradayV3Engine:
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     # ==========================================================================
-    # F&O + MCX 3-STRATEGY EVALUATOR (1M_BO_RETEST, 5M_CONTRARIAN, VWAP_PCR_REV)
+    # F&O + MCX 3-STRATEGY EVALUATOR (5M_VWAP_MARU, 5M_CONTRARIAN, VWAP_PCR_REV)
     # ==========================================================================
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
@@ -2038,7 +2336,6 @@ class IntradayV3Engine:
         self.latest_dfs[idx] = df_1m
 
         curr_1m = df_1m.iloc[-1]
-        curr_1m_ts = str(curr_1m["timestamp"])
         price_now = float(curr_1m["close"])
         vwap_1m = float(curr_1m["vwap"])
         atr14_1m = max(float(curr_1m["atr14"]), cfg.get("tick_size", 0.05) * 2)
@@ -2066,6 +2363,7 @@ class IntradayV3Engine:
             strong_bear_pcr = (price_now < vwap_1m) and (vol_ratio_1m >= VWAP_MIN_VOL_RATIO)
 
         df_5m = build_resampled_5m_df(raw_df)
+        self.latest_5m_dfs[idx] = df_5m
 
         vwap_pos_key = f"{idx}__VWAP_PCR_REV"
         with self.pos_lock:
@@ -2087,10 +2385,10 @@ class IntradayV3Engine:
 
         in_window = self.is_within_trade_window(idx, now_ist)
         if not in_window:
-            self.pending_retests[idx] = None
+            self.vwap_maru_5m.armed_setup[idx] = None
             with self.pos_lock:
                 open_cnt = sum(1 for p in self.active_positions.values() if p["symbol"] == idx)
-            slot_txt = "17:00-22:00" if is_mcx else "09:10-15:00"
+            slot_txt = "17:00-21:00" if is_mcx else "09:15-15:00"
             st_lbl = f"ACTIVE({open_cnt}) | SLOT {slot_txt}" if open_cnt > 0 else f"SLOT {slot_txt}"
             return {
                 "idx": idx, "is_mcx": is_mcx,
@@ -2100,46 +2398,33 @@ class IntradayV3Engine:
                 "short_status": st_lbl,
             }
 
-        # STRATEGY 1: 1M_BO_RETEST
-        if self.can_trigger_strategy(idx, "1M_BO_RETEST", curr_1m_ts):
-            pending = self.pending_retests.get(idx)
-            if pending:
-                bars_waited = int((now_ist - pending["armed_at"]).total_seconds() // 60)
-                if bars_waited > BO_RETEST_MAX_BARS:
-                    self.pending_retests[idx] = None
-                    pending = None
+        # STRATEGY 1: 5M_VWAP_MARU (Marubozu Arm + Pullback Rejection + 1:1 / 1:2 / Infinity Runner)
+        maru_pos_key = f"{idx}__5M_VWAP_MARU"
+        with self.pos_lock:
+            has_maru_pos = maru_pos_key in self.active_positions
 
-            if pending is not None and curr_1m_ts != pending["armed_ts"]:
-                lvl = float(pending["level"])
-                buf = BO_RETEST_BUFFER_ATR * float(pending["atr"])
-                retest_ok = False
-                if pending["side"] == "CE" and (lvl - buf) <= float(curr_1m["low"]) <= (lvl + buf) and float(curr_1m["close"]) > float(curr_1m["open"]):
-                    retest_ok = True
-                elif pending["side"] == "PE" and (lvl - buf) <= float(curr_1m["high"]) <= (lvl + buf) and float(curr_1m["close"]) < float(curr_1m["open"]):
-                    retest_ok = True
+        pcr_prev = self.pcr_history[idx][-2] if (not is_mcx and len(self.pcr_history[idx]) >= 2) else pcr
+        maru_sig = self.vwap_maru_5m.evaluate_5m_signal(
+            idx=idx,
+            df_5m=df_5m,
+            pcr=pcr,
+            pcr_prev=pcr_prev,
+            is_mcx=is_mcx,
+            has_open_position=has_maru_pos,
+            tick_size=cfg.get("tick_size", 0.05),
+        )
+        if maru_sig["action"] == "ENTER":
+            bar_5m_ts = str(df_5m.iloc[-2]["timestamp"]) if len(df_5m) >= 2 else ""
+            if self.can_trigger_strategy(idx, "5M_VWAP_MARU", bar_5m_ts):
+                self.dispatch_marubozu_entry(
+                    idx=idx, cfg=cfg, sig=maru_sig, fut_price=price_now,
+                    chain=chain, is_today_exp=is_today_exp, now_ist=now_ist,
+                )
 
-                if retest_ok:
-                    self.dispatch_standard_entry(
-                        idx=idx, cfg=cfg, side=pending["side"], fut_price=price_now,
-                        atr14=float(pending["atr"]), chain=chain, is_today_exp=is_today_exp,
-                        now_ist=now_ist, strat_key="1M_BO_RETEST",
-                        setup_detail="1M_BO_RETEST", rrr_mult=BO_RRR_TARGET,
-                    )
-            elif pending is None:
-                c_range_1m = float(curr_1m["high"]) - float(curr_1m["low"])
-                c_body_1m = abs(float(curr_1m["close"]) - float(curr_1m["open"]))
-                b_ratio_1m = c_body_1m / (c_range_1m if c_range_1m > 0 else 1e-9)
-                if (vol_ratio_1m >= BO_VOL_RATIO_MIN or c_range_1m >= BO_RANGE_EXPANSION_ATR * atr14_1m) and b_ratio_1m >= BO_BODY_RATIO_MIN:
-                    if float(curr_1m["close"]) > float(curr_1m["open"]):
-                        self.pending_retests[idx] = {"side": "CE", "level": float(curr_1m["high"]), "atr": atr14_1m, "armed_at": now_ist, "armed_ts": curr_1m_ts}
-                    elif float(curr_1m["close"]) < float(curr_1m["open"]):
-                        self.pending_retests[idx] = {"side": "PE", "level": float(curr_1m["low"]), "atr": atr14_1m, "armed_at": now_ist, "armed_ts": curr_1m_ts}
-        else:
-            self.pending_retests[idx] = None
-
-        # STRATEGY 2: 5M_CONTRARIAN
-        if not df_5m.empty and len(df_5m) >= 10:
-            bar_5m = df_5m.iloc[-2]
+        # STRATEGY 2: 5M_CONTRARIAN (Requires 1 Opposite Confirmation Candle before Reversal Entry)
+        if not df_5m.empty and len(df_5m) >= 12:
+            bar_5m = df_5m.iloc[-2]       # Latest completed 5m confirmation candle
+            prev_5m = df_5m.iloc[-3]      # Prior completed 5m trend candle
             bar_5m_ts = str(bar_5m["timestamp"])
             if bar_5m_ts != self.last_rev_5m_ts.get(idx, "") and self.can_trigger_strategy(idx, "5M_CONTRARIAN", bar_5m_ts):
                 self.last_rev_5m_ts[idx] = bar_5m_ts
@@ -2149,18 +2434,27 @@ class IntradayV3Engine:
                 body_5m = abs(float(bar_5m["close"]) - float(bar_5m["open"]))
                 br_5m = body_5m / (rng_5m if rng_5m > 0 else 1e-9)
 
-                bull_5m = float(bar_5m["close"]) > float(bar_5m["ema20"]) > float(bar_5m["ema50"])
-                bear_5m = float(bar_5m["close"]) < float(bar_5m["ema20"]) < float(bar_5m["ema50"])
+                was_bull_trend = (
+                    float(prev_5m["close"]) > float(prev_5m["ema20"]) > float(prev_5m["ema50"])
+                    and float(prev_5m["close"]) > float(prev_5m["open"])
+                )
+                was_bear_trend = (
+                    float(prev_5m["close"]) < float(prev_5m["ema20"]) < float(prev_5m["ema50"])
+                    and float(prev_5m["close"]) < float(prev_5m["open"])
+                )
+
+                confirm_red_candle = float(bar_5m["close"]) < float(bar_5m["open"])
+                confirm_green_candle = float(bar_5m["close"]) > float(bar_5m["open"])
 
                 if vol_5m >= REV_VOL_RATIO_MIN and br_5m >= REV_BODY_RATIO_MIN:
-                    if bull_5m and float(bar_5m["close"]) > float(bar_5m["open"]):
+                    if was_bull_trend and confirm_red_candle:
                         self.dispatch_standard_entry(
                             idx=idx, cfg=cfg, side="PE", fut_price=price_now,
                             atr14=atr14_5m, chain=chain, is_today_exp=is_today_exp,
                             now_ist=now_ist, strat_key="5M_CONTRARIAN",
                             setup_detail="5M_CONTRARIAN_REV", rrr_mult=REV_RRR_TARGET,
                         )
-                    elif bear_5m and float(bar_5m["close"]) < float(bar_5m["open"]):
+                    elif was_bear_trend and confirm_green_candle:
                         self.dispatch_standard_entry(
                             idx=idx, cfg=cfg, side="CE", fut_price=price_now,
                             atr14=atr14_5m, chain=chain, is_today_exp=is_today_exp,
@@ -2193,10 +2487,11 @@ class IntradayV3Engine:
 
         if sym_active:
             short_status = f"ACTIVE [{','.join(s.split('_')[0] for s in sym_active)}]"
-        elif self.pending_retests.get(idx):
-            short_status = f"ARMED 1m {self.pending_retests[idx]['side']} RT"
+        elif self.vwap_maru_5m.armed_setup.get(idx):
+            arm_obj = self.vwap_maru_5m.armed_setup[idx]
+            short_status = f"ARMED {arm_obj['side']}@{arm_obj['arm_time']}"
         else:
-            short_status = "SCAN ALL 3"
+            short_status = "SCAN 5M ALL 3"
 
         return {
             "idx": idx, "is_mcx": is_mcx,
@@ -2205,6 +2500,124 @@ class IntradayV3Engine:
             "pcr": pcr, "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
             "short_status": short_status,
         }
+
+    def dispatch_marubozu_entry(self, idx, cfg, sig, fut_price, chain, is_today_exp, now_ist):
+        pos_key = f"{idx}__5M_VWAP_MARU"
+        with self.pos_lock:
+            if pos_key in self.active_positions:
+                return
+
+        side = sig["side"]
+        spot_sl = float(sig["spot_sl"])
+        spot_risk = max(float(sig["spot_risk"]), 1.0)
+        setup_lbl = f"{sig['setup']}_{side}"
+
+        if cfg["type"] == "MCX_FUT":
+            tx_side = "BUY" if side == "CE" else "SELL"
+            inst_key = cfg["spot_key"]
+            lot_size = int(cfg["lot_size"])
+            pnl_mult = int(cfg.get("pnl_multiplier", lot_size))
+            tick_sz = cfg.get("tick_size", 0.05)
+
+            ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
+            sl_points = max(round_to_tick(abs(ltp - spot_sl), tick_sz), round_to_tick(ltp * 0.0015, tick_sz), tick_sz * 4)
+            sl_price = round_to_tick((ltp - sl_points) if tx_side == "BUY" else (ltp + sl_points), tick_sz)
+
+            qty = min(lot_size, cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, "MCX_FUT").get("total", 180.0)
+
+            order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": "5M_VWAP_MARU",
+                        "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
+                        "side": side, "tx_side": tx_side, "display_side": tx_side,
+                        "lots": 1, "lot_size": lot_size, "qty": qty, "pnl_units": pnl_mult,
+                        "tick_size": tick_sz, "entry_price": fill, "r_unit": sl_points,
+                        "spot_entry": fill, "spot_sl": sl_price, "spot_risk": sl_points,
+                        "entry_pcr": 0.0, "est_charges": total_est_ch, "last_ltp": fill,
+                        "sl": sl_price, "target": 0.0, "allow_be_trail": True,
+                        "trail_stage": None, "setup_name": setup_lbl,
+                        "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"\n🎯 <b>NEW 5M VWAP MARU ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Setup:</b> <code>{setup_lbl}</code> (Arm <code>{sig['arm_time']}</code> → Entry <code>{sig['entry_time']}</code>)\n"
+                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>1:1->Cost | 1:2->+1R | INF</code>\n"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
+        else:
+            if not chain:
+                return
+            step = cfg.get("step", 50)
+            tick_sz = cfg.get("tick_size", 0.05)
+            opt_field = "call_options" if side == "CE" else "put_options"
+            target_strike = round(fut_price / step) * step
+            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
+            if not chosen:
+                valid_rows = [row for row in chain if row.get(opt_field, {}).get("instrument_key")]
+                if not valid_rows:
+                    return
+                nearest_row = min(valid_rows, key=lambda r: abs(float(r.get("strike_price", 0)) - fut_price))
+                target_strike = nearest_row.get("strike_price", target_strike)
+                chosen = nearest_row.get(opt_field, {})
+
+            inst_key = chosen.get("instrument_key")
+            if not inst_key:
+                return
+
+            mkt = chosen.get("market_data", {})
+            greeks = chosen.get("option_greeks", {})
+            ltp = float(mkt.get("ltp", 0))
+            if ltp <= 0:
+                ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", 0.0))
+            if ltp <= 0:
+                return
+
+            raw_delta = abs(float(greeks.get("delta", 0.0)))
+            delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else cfg.get("default_delta", 0.52)
+            min_sl_pts = float(cfg.get("min_sl_pts", 10.0))
+            sl_points = max(round_to_tick(max(min_sl_pts, spot_risk * delta), tick_sz), tick_sz * 4)
+            sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
+
+            qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, "INDEX_OPT").get("total", 65.0)
+
+            order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": "5M_VWAP_MARU",
+                        "type": "INDEX_OPT", "instrument_key": inst_key,
+                        "strike": target_strike, "side": side, "tx_side": "BUY",
+                        "display_side": side, "lots": 1, "lot_size": int(cfg["lot_size"]),
+                        "qty": qty, "pnl_units": qty, "tick_size": tick_sz,
+                        "entry_price": fill, "r_unit": sl_points,
+                        "spot_entry": fut_price, "spot_sl": spot_sl, "spot_risk": spot_risk,
+                        "entry_pcr": float(sig.get("entry_pcr", 1.0)),
+                        "est_charges": total_est_ch, "last_ltp": fill,
+                        "sl": sl_price, "target": 0.0, "allow_be_trail": True,
+                        "trail_stage": None, "setup_name": setup_lbl,
+                        "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"\n🎯 <b>NEW 5M VWAP MARU ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Setup:</b> <code>{setup_lbl}</code> (Arm <code>{sig['arm_time']}</code> → Entry <code>{sig['entry_time']}</code>)\n"
+                    f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | Opt SL: <code>₹{sl_price:.2f}</code> (Spot SL: <code>{spot_sl:.1f}</code>) | Tgt: <code>1:1->Cost | 1:2->+1R | INF</code>\n"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def dispatch_standard_entry(self, idx, cfg, side, fut_price, atr14, chain, is_today_exp, now_ist, strat_key, setup_detail, rrr_mult):
         pos_key = f"{idx}__{strat_key}"
@@ -2255,8 +2668,6 @@ class IntradayV3Engine:
                         "trail_stage": None, "setup_name": full_setup,
                         "entry_time": now_ist.strftime("%H:%M:%S"),
                     }
-                if strat_key == "1M_BO_RETEST":
-                    self.pending_retests[idx] = None
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
@@ -2324,8 +2735,6 @@ class IntradayV3Engine:
                         "allow_be_trail": True, "trail_stage": None,
                         "setup_name": full_setup, "entry_time": now_ist.strftime("%H:%M:%S"),
                     }
-                if strat_key == "1M_BO_RETEST":
-                    self.pending_retests[idx] = None
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
@@ -2490,6 +2899,24 @@ class IntradayV3Engine:
             else:
                 ltp = pos.get("last_ltp", pos["entry_price"])
 
+            # Special Multi-Stage Management for 5M_VWAP_MARU (1:1 Cost, 1:2 +1R, Infinity 20EMA, PCR/Momentum Melt)
+            if pos.get("strategy_key") == "5M_VWAP_MARU":
+                sym = pos["symbol"]
+                df_5m_sym = self.latest_5m_dfs.get(sym, pd.DataFrame())
+                spot_ltp = float(self.last_summaries.get(sym, {}).get("spot", ltp))
+                curr_pcr = float(self.last_summaries.get(sym, {}).get("pcr", pos.get("entry_pcr", 1.0)))
+                res = self.vwap_maru_5m.manage_position_trail_and_melt(
+                    pos=pos,
+                    spot_ltp=spot_ltp,
+                    opt_ltp=ltp,
+                    df_5m=df_5m_sym,
+                    curr_pcr=curr_pcr,
+                    hhmm=hhmm,
+                )
+                if res["exit"]:
+                    self.close_position_now(pos_key, ltp, res["reason"], now_ist)
+                continue
+
             is_short = pos["tx_side"] == "SELL"
             tgt = float(pos.get("target", 0.0))
             exit_reason = None
@@ -2598,7 +3025,7 @@ class IntradayV3Engine:
         holiday_checked_0922 = False
 
         notify(
-            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE</b>\n"
+            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE (5M VWAP MARUBOZU + CONTRARIAN CONFIRM)</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
             f"📌 <b>Pinned Boards:</b> <code>[1/2] Master P&amp;L Summary</code> + <code>[2/2] Active Trades &amp; Feed</code>"
