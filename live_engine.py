@@ -12,6 +12,7 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
+from collections import deque
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -31,7 +32,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("V3_ENGINE")
+log = logging.getLogger("V3_TRIPLE_ENGINE")
 
 UPSTOX_ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -39,31 +40,37 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 GSHEET_WEBHOOK_URL = os.getenv("GSHEET_WEBHOOK_URL", "").strip()
 PAPER_MODE = os.getenv("PAPER_MODE", "true").strip().lower() == "true"
 
-# Session & Prime Time Slots (IST)
+# Session & Exact Requested Time Slots (IST)
 SESSION_MAX_RUNTIME_SEC = 20700
-INDEX_WINDOWS = (("09:15", "11:30"), ("14:00", "15:00"))
+INDEX_WINDOWS = (("09:10", "15:00"),)
 INDEX_EXIT_TIME = "15:15"
 
-MCX_WINDOWS = (("17:00", "21:00"),)
+MCX_WINDOWS = (("21:00", "22:00"),)
 MCX_EXIT_TIME = "23:15"
 
-REENTRY_COOLDOWN_SEC = 300          # 5-min cooldown per symbol after closing a trade
-MAX_ACTIVE_TRADES_TOTAL = 5         # Max 5 concurrent symbols (1 per symbol)
-STARTUP_WARMUP_SEC = 45
+REENTRY_COOLDOWN_SEC = 300          # 5-min anti-chase cooldown per (symbol, strategy) after exit
+STARTUP_WARMUP_SEC = 30
 DASHBOARD_PULSE_SEC = 5.0
 
-# Logic 1: Trend-Following Breakout + Retest Parameters (1-Minute Candles)
+# Strategy 1: Trend-Following Breakout + Retest (1-Minute Candles -> 1:1.5 R:R)
 BO_VOL_RATIO_MIN = 1.20
 BO_RANGE_EXPANSION_ATR = 1.20
 BO_BODY_RATIO_MIN = 0.45
 BO_RETEST_BUFFER_ATR = 0.30
-BO_RETEST_MAX_BARS = 15             # 15 x 1m candles = 15 minutes max wait for retest
-BO_RRR_TARGET = 1.50                # Fixed 1 : 1.5 Risk-to-Reward
+BO_RETEST_MAX_BARS = 15
+BO_RRR_TARGET = 1.50
 
-# Logic 2: Reversed / Contrarian Parameters (5-Minute Candles)
+# Strategy 2: Reversed / Contrarian EMA Trend (5-Minute Closed Candles -> 1:2.0 R:R)
 REV_VOL_RATIO_MIN = 1.30
 REV_BODY_RATIO_MIN = 0.50
-REV_RRR_TARGET = 2.00               # Fixed 1 : 2.0 Risk-to-Reward
+REV_RRR_TARGET = 2.00
+
+# Strategy 3: Reversed VWAP + PCR + Candlestick Pattern (1m IDX / 5m MCX -> Swapped 1R Tgt / 2R SL)
+VWAP_MIN_VOL_RATIO = 1.20
+VWAP_MIN_BODY_RATIO = 0.50
+VWAP_TOUCH_BAND_ATR = 0.30
+SWING_BUFFER_ATR = 0.15
+MIN_PCR_STEP_DIFF = 0.02
 
 ATR_SL_MULT = 1.20
 
@@ -78,18 +85,19 @@ JOURNAL_FIELDNAMES = [
     "gross_pnl", "brokerage", "taxes_other", "charges", "pnl", "day_pnl", "setup",
 ]
 
-# Base fetch is 1-minute; 5-minute candles are resampled dynamically for Contrarian logic
+STRATEGY_KEYS = ("1M_BO_RETEST", "5M_CONTRARIAN", "VWAP_PCR_REV")
+
 INDICES = {
-    "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "tf_min": 1, "min_sl_pts": 10.0, "default_delta": 0.52},
-    "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank", "tf_min": 1, "min_sl_pts": 20.0, "default_delta": 0.52},
-    "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service", "tf_min": 1, "min_sl_pts": 10.0, "default_delta": 0.52},
-    "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT", "tf_min": 1, "min_sl_pts": 8.0,  "default_delta": 0.50},
-    "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX", "tf_min": 1, "min_sl_pts": 25.0, "default_delta": 0.52},
-    "CRUDEOIL":   {"type": "MCX_FUT", "tf_min": 1},
-    "NATURALGAS": {"type": "MCX_FUT", "tf_min": 1},
-    "GOLD":       {"type": "MCX_FUT", "tf_min": 1},
-    "SILVER":     {"type": "MCX_FUT", "tf_min": 1},
-    "COPPER":     {"type": "MCX_FUT", "tf_min": 1},
+    "NIFTY":      {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty 50", "min_sl_pts": 10.0, "default_delta": 0.52},
+    "BANKNIFTY":  {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Bank", "min_sl_pts": 20.0, "default_delta": 0.52},
+    "FINNIFTY":   {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|Nifty Fin Service", "min_sl_pts": 10.0, "default_delta": 0.52},
+    "MIDCPNIFTY": {"type": "INDEX_OPT", "spot_key": "NSE_INDEX|NIFTY MID SELECT", "min_sl_pts": 8.0,  "default_delta": 0.50},
+    "SENSEX":     {"type": "INDEX_OPT", "spot_key": "BSE_INDEX|SENSEX", "min_sl_pts": 25.0, "default_delta": 0.52},
+    "CRUDEOIL":   {"type": "MCX_FUT"},
+    "NATURALGAS": {"type": "MCX_FUT"},
+    "GOLD":       {"type": "MCX_FUT"},
+    "SILVER":     {"type": "MCX_FUT"},
+    "COPPER":     {"type": "MCX_FUT"},
 }
 
 MCX_MINI_SYMBOLS = {
@@ -128,6 +136,15 @@ def ms_to_ist_hhmm(epoch_ms) -> str:
         return dt.strftime("%H:%M")
     except Exception:
         return ""
+
+
+def map_setup_to_strategy(setup_str: str) -> str:
+    s = str(setup_str or "").upper()
+    if "VWAP_PCR_REV" in s or "REV_VWAP" in s:
+        return "VWAP_PCR_REV"
+    if "5M_CONTRARIAN" in s or "CONTRARIAN_REV" in s:
+        return "5M_CONTRARIAN"
+    return "1M_BO_RETEST"
 
 
 def inspect_special_session_schedule(now_ist: datetime) -> dict:
@@ -197,7 +214,7 @@ def inspect_special_session_schedule(now_ist: datetime) -> dict:
         mcx_live = check_live_exchange_status("MCX")
         if mcx_live in ("NORMAL_OPEN", "OPEN", "PRE_OPEN"):
             info["mcx_open"] = True
-            info["mcx_start"] = "17:00"
+            info["mcx_start"] = MCX_WINDOWS[0][0]
 
     return info
 
@@ -591,7 +608,7 @@ def get_active_future_contract(idx: str) -> dict:
     raw_tick = float(top.get("tick_size", 0.05) or 0.05)
     tick_size = round(raw_tick / 100.0, 4) if raw_tick >= 5.0 else raw_tick
 
-    contract_info = {
+    return {
         "instrument_key": str(top.get("instrument_key", "")),
         "lot_size": order_lot_size,
         "pnl_multiplier": pnl_per_lot_pt,
@@ -601,12 +618,6 @@ def get_active_future_contract(idx: str) -> dict:
         "trading_symbol": str(top.get("trading_symbol", target_sym)),
         "expiry": _norm_contract_expiry(top.get("expiry")),
     }
-    if is_mcx:
-        log.info(
-            f"[MCX MINI] {idx} -> {contract_info['trading_symbol']} | "
-            f"1 Lot = {contract_info['lot_size']} Qty (₹{contract_info['pnl_multiplier']}/pt) | Tick = ₹{contract_info['tick_size']}"
-        )
-    return contract_info
 
 
 def get_dynamic_option_specs(spot_key: str) -> dict:
@@ -700,9 +711,9 @@ def fetch_option_chain(spot_key: str, expiry_date: str) -> list:
 
 
 # ==============================================================================
-# 4. TECHNICAL INDICATORS (1-MIN & RESAMPLED 5-MIN FOR CONTRARIAN LOGIC)
+# 4. UNIFIED TECHNICAL INDICATORS (EMA20/50, VWAP, ATR14, VOL RATIO, SWINGS)
 # ==============================================================================
-def add_clean_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def add_full_indicators(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     x = df.copy()
@@ -718,13 +729,21 @@ def add_clean_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["tr"] = tr
     x["atr14"] = tr.rolling(14, min_periods=1).mean()
 
+    tp = (x["high"] + x["low"] + x["close"]) / 3.0
+    day_ser = x["timestamp"].dt.date
+    vol_safe = x["volume"].replace(0, 1.0)
+    x["vwap"] = (tp * vol_safe).groupby(day_ser).cumsum() / vol_safe.groupby(day_ser).cumsum()
+
+    # Uses available candles from 09:15 (min_periods=1) so 09:15-09:34 works immediately
     vol_sma20 = x["volume"].rolling(20, min_periods=1).mean().replace(0, np.nan)
     x["vol_ratio"] = (x["volume"] / vol_sma20).fillna(1.0)
+
+    c_range = (x["high"] - x["low"]).replace(0, 1e-6)
+    x["body_ratio"] = (x["close"] - x["open"]).abs() / c_range
     return x
 
 
 def build_resampled_5m_df(df_1m: pd.DataFrame) -> pd.DataFrame:
-    """Resamples 1-minute candles into 5-minute candles and computes EMA20/50, ATR14, and Vol Ratio."""
     if df_1m.empty or len(df_1m) < 5:
         return pd.DataFrame()
     tmp = df_1m.copy().set_index("timestamp")
@@ -737,7 +756,104 @@ def build_resampled_5m_df(df_1m: pd.DataFrame) -> pd.DataFrame:
     }).dropna().reset_index()
     if df_5m.empty:
         return df_5m
-    return add_clean_indicators(df_5m)
+    return add_full_indicators(df_5m)
+
+
+def find_latest_swing_levels(df: pd.DataFrame, lookback: int = 12) -> tuple:
+    sub = df.iloc[-lookback:] if len(df) >= lookback else df
+    lows = sub["low"].values
+    highs = sub["high"].values
+
+    swing_low = None
+    for i in range(len(lows) - 2, 0, -1):
+        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
+            swing_low = float(lows[i])
+            break
+    if swing_low is None:
+        swing_low = float(sub["low"].min())
+
+    swing_high = None
+    for i in range(len(highs) - 2, 0, -1):
+        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
+            swing_high = float(highs[i])
+            break
+    if swing_high is None:
+        swing_high = float(sub["high"].max())
+
+    return swing_low, swing_high
+
+
+def detect_vwap_pattern_with_momentum(df: pd.DataFrame) -> dict:
+    """
+    Detects raw Bullish ("CE") or Bearish ("PE") VWAP pattern with momentum.
+    Strategy 3 flips CE -> PE/SELL and PE -> CE/BUY (Reversed / Contrarian).
+    """
+    if len(df) < 5:
+        return {"signal": None, "pattern": None}
+
+    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+    o1, h1, l1, cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
+    o2, h2, l2, cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
+    o3, h3, l3, cl3 = float(c3["open"]), float(c3["high"]), float(c3["low"]), float(c3["close"])
+
+    vwap3 = float(c3["vwap"])
+    vwap2 = float(c2["vwap"])
+    atr = max(float(c3["atr14"]), 1e-6)
+    vol_ratio = float(c3["vol_ratio"])
+    body_ratio = float(c3["body_ratio"])
+
+    r1, b1 = max(h1 - l1, 1e-6), abs(cl1 - o1)
+    r2, b2 = max(h2 - l2, 1e-6), abs(cl2 - o2)
+    r3, b3 = max(h3 - l3, 1e-6), abs(cl3 - o3)
+
+    upper_wick3 = h3 - max(o3, cl3)
+    lower_wick3 = min(o3, cl3) - l3
+    mid1 = (o1 + cl1) / 2.0
+
+    if vol_ratio < VWAP_MIN_VOL_RATIO or body_ratio < VWAP_MIN_BODY_RATIO:
+        return {"signal": None, "pattern": None}
+
+    touch_band = VWAP_TOUCH_BAND_ATR * atr
+
+    touched_vwap_from_above = (
+        abs(l3 - vwap3) <= touch_band
+        or abs(l2 - vwap2) <= touch_band
+        or (l3 <= vwap3 and cl3 > vwap3)
+    )
+    bull_pattern = None
+    if touched_vwap_from_above and cl3 > vwap3 and cl3 > o3:
+        if (cl2 < o2) and (cl3 >= o2) and (o3 <= cl2):
+            bull_pattern = "BULL_ENGULF"
+        elif (cl1 < o1) and (b1 / r1 >= 0.45) and (b2 / r2 <= 0.40) and (cl3 > mid1):
+            bull_pattern = "MORN_STAR"
+        elif (lower_wick3 >= 1.5 * max(b3, r3 * 0.1)) and ((cl3 - l3) / r3 >= 0.60):
+            bull_pattern = "HAMMER"
+        elif (cl3 > h2) and (body_ratio >= 0.60):
+            bull_pattern = "VWAP_BOUNCE"
+
+    if bull_pattern:
+        return {"signal": "CE", "pattern": bull_pattern}
+
+    touched_vwap_from_below = (
+        abs(h3 - vwap3) <= touch_band
+        or abs(h2 - vwap2) <= touch_band
+        or (h3 >= vwap3 and cl3 < vwap3)
+    )
+    bear_pattern = None
+    if touched_vwap_from_below and cl3 < vwap3 and cl3 < o3:
+        if (cl2 > o2) and (cl3 <= o2) and (o3 >= cl2):
+            bear_pattern = "BEAR_ENGULF"
+        elif (cl1 > o1) and (b1 / r1 >= 0.45) and (b2 / r2 <= 0.40) and (cl3 < mid1):
+            bear_pattern = "EVE_STAR"
+        elif (upper_wick3 >= 1.5 * max(b3, r3 * 0.1)) and ((h3 - cl3) / r3 >= 0.60):
+            bear_pattern = "SHOOT_STAR"
+        elif (cl3 < l2) and (body_ratio >= 0.60):
+            bear_pattern = "VWAP_REJECT"
+
+    if bear_pattern:
+        return {"signal": "PE", "pattern": bear_pattern}
+
+    return {"signal": None, "pattern": None}
 
 
 # ==============================================================================
@@ -755,7 +871,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
     try:
         payload = {
             "quantity": qty, "product": "I", "validity": "DAY", "price": limit_price,
-            "tag": "V3_DUAL_ENGINE", "instrument_token": instrument_key,
+            "tag": "V3_TRIPLE_ENGINE", "instrument_token": instrument_key,
             "order_type": "LIMIT", "transaction_type": side,
             "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False,
         }
@@ -768,11 +884,11 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. UNIFIED DUAL-TIMEFRAME ENGINE (FOR BOTH INDICES & MCX MINI):
-#    - Indices Slots: 09:15-11:30 & 14:00-15:00 IST (EOD 15:15)
-#    - MCX Mini Slot: 17:00-21:00 IST (EOD 23:15)
-#    - Logic A (1-Min): TREND_BO_RETEST (1 : 1.5 R:R + 1R BE Trail)
-#    - Logic B (5-Min): CONTRARIAN_REV  (1 : 2.0 R:R + 1R BE Trail)
+# 6. UNIFIED TRIPLE-STRATEGY ENGINE (UNCAPPED CONCURRENT EXECUTION):
+#    - Strategy 1: 1M_BO_RETEST   (1m Breakout + Retest -> 1 : 1.5 R:R + 1R BE)
+#    - Strategy 2: 5M_CONTRARIAN  (5m EMA20/50 Reversed -> 1 : 2.0 R:R + 1R BE)
+#    - Strategy 3: VWAP_PCR_REV   (VWAP + PCR Reversed -> Swapped 1R Tgt / 2R SL)
+#    - Tracks Strategy-Wise Performance & Hourly Profit/Loss/Consolidation
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -780,10 +896,16 @@ class IntradayV3Engine:
         self.fut_contracts = {}
         self.pending_retests = {idx: None for idx in INDICES}
         self.last_rev_5m_ts = {idx: "" for idx in INDICES}
-        self.last_exit_ts = {idx: 0.0 for idx in INDICES}
-        self.last_exit_candle_ts = {idx: "" for idx in INDICES}
+        self.last_vwap_bar_ts = {idx: "" for idx in INDICES}
+        self.open_pcr = {idx: None for idx in INDICES}
+        self.pcr_history = {idx: deque(maxlen=6) for idx in INDICES}
+
+        # Keyed by (symbol, strategy_key) so all 3 strategies can run independently on any symbol
+        self.last_exit_ts = {}
+        self.last_exit_candle_ts = {}
         self.active_positions = {}
         self.pos_lock = threading.Lock()
+
         self.closed_trades = []
         self.trade_counter = 0
         self.day_pnl = 0.0
@@ -851,8 +973,8 @@ class IntradayV3Engine:
         os.makedirs(os.path.dirname(ACTIVE_STATE_FILE), exist_ok=True)
         serializable = {}
         with self.pos_lock:
-            for idx, pos in self.active_positions.items():
-                serializable[idx] = dict(pos)
+            for pos_key, pos in self.active_positions.items():
+                serializable[pos_key] = dict(pos)
         try:
             with open(ACTIVE_STATE_FILE, mode="w", encoding="utf-8") as f:
                 json.dump(serializable, f, indent=2)
@@ -874,39 +996,41 @@ class IntradayV3Engine:
             immediate_exits = []
 
             with self.pos_lock:
-                for idx, pos in data.items():
+                for pos_key, pos in data.items():
                     inst_key = pos["instrument_key"]
                     is_short = pos["tx_side"] == "SELL"
                     entry = float(pos["entry_price"])
                     tick_sz = float(pos.get("tick_size", 0.05))
                     r_unit = max(float(pos.get("r_unit", 1.0)), 1e-6)
+                    allow_be = bool(pos.get("allow_be_trail", True))
 
                     q_data = live_quotes.get(inst_key, {})
                     curr_ltp = float(q_data.get("last_price", pos.get("last_ltp", entry)))
                     pos["last_ltp"] = curr_ltp
 
-                    curr_gain = (entry - curr_ltp) if is_short else (curr_ltp - entry)
-                    if curr_gain >= r_unit:
-                        be_sl = round_to_tick((entry - 0.10 * r_unit) if is_short else (entry + 0.10 * r_unit), tick_sz)
-                        if (is_short and be_sl < pos["sl"]) or (not is_short and be_sl > pos["sl"]):
-                            pos["sl"] = be_sl
-                            pos["trail_stage"] = "1R BREAK-EVEN"
+                    if allow_be:
+                        curr_gain = (entry - curr_ltp) if is_short else (curr_ltp - entry)
+                        if curr_gain >= r_unit:
+                            be_sl = round_to_tick((entry - 0.10 * r_unit) if is_short else (entry + 0.10 * r_unit), tick_sz)
+                            if (is_short and be_sl < pos["sl"]) or (not is_short and be_sl > pos["sl"]):
+                                pos["sl"] = be_sl
+                                pos["trail_stage"] = "1R BREAK-EVEN"
 
-                    self.active_positions[idx] = pos
+                    self.active_positions[pos_key] = pos
                     self.trade_counter = max(self.trade_counter, int(pos.get("trade_no", 0)), len(self.closed_trades))
 
                     tgt = float(pos.get("target", 0.0))
                     if tgt > 0 and ((not is_short and curr_ltp >= tgt) or (is_short and curr_ltp <= tgt)):
-                        immediate_exits.append((idx, curr_ltp, "TARGET_HIT"))
+                        immediate_exits.append((pos_key, curr_ltp, "TARGET_HIT"))
                     elif (not is_short and curr_ltp <= pos["sl"]) or (is_short and curr_ltp >= pos["sl"]):
                         reason = "TRAIL_BE_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
-                        immediate_exits.append((idx, curr_ltp, reason))
+                        immediate_exits.append((pos_key, curr_ltp, reason))
 
-            for idx, pos in list(self.active_positions.items()):
+            for pos in list(self.active_positions.values()):
                 self.subscribe_tick_instrument(pos["instrument_key"])
 
-            for idx, exit_ltp, reason in immediate_exits:
-                self.close_position_now(idx, exit_ltp, reason, now_ist)
+            for pos_key, exit_ltp, reason in immediate_exits:
+                self.close_position_now(pos_key, exit_ltp, reason, now_ist)
 
             self.save_active_positions_state()
         except Exception as e:
@@ -949,7 +1073,9 @@ class IntradayV3Engine:
                 for t in self.closed_trades:
                     try:
                         ex_dt = datetime.strptime(f"{today_str} {t['exit_time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                        self.last_exit_ts[t["symbol"]] = max(self.last_exit_ts.get(t["symbol"], 0.0), ex_dt.timestamp())
+                        strat_k = map_setup_to_strategy(t.get("setup", ""))
+                        pk = f"{t['symbol']}__{strat_k}"
+                        self.last_exit_ts[pk] = max(self.last_exit_ts.get(pk, 0.0), ex_dt.timestamp())
                     except Exception:
                         pass
                 log.info(f"[STATE LOADED] {len(self.closed_trades)} today's trade(s) loaded | Net PnL: ₹{self.day_pnl:+.2f}")
@@ -969,7 +1095,7 @@ class IntradayV3Engine:
             def on_open(*args):
                 self.ws_connected = True
                 with self.pos_lock:
-                    active_keys = [p["instrument_key"] for p in self.active_positions.values()]
+                    active_keys = list({p["instrument_key"] for p in self.active_positions.values()})
                 if active_keys:
                     self.streamer.subscribe(active_keys, "ltpc")
                     self.subscribed_keys.update(active_keys)
@@ -1012,15 +1138,19 @@ class IntradayV3Engine:
             except Exception:
                 pass
 
-    def unsubscribe_tick_instrument(self, instrument_key: str):
-        self.subscribed_keys.discard(instrument_key)
-        if self.streamer and self.ws_connected:
-            try:
-                self.streamer.unsubscribe([instrument_key])
-            except Exception:
-                pass
+    def unsubscribe_tick_instrument_if_unused(self, instrument_key: str):
         with self.pos_lock:
+            still_used = any(p["instrument_key"] == instrument_key for p in self.active_positions.values())
             no_active = len(self.active_positions) == 0
+
+        if not still_used:
+            self.subscribed_keys.discard(instrument_key)
+            if self.streamer and self.ws_connected:
+                try:
+                    self.streamer.unsubscribe([instrument_key])
+                except Exception:
+                    pass
+
         if no_active and self.streamer:
             try:
                 self.streamer.disconnect()
@@ -1030,12 +1160,12 @@ class IntradayV3Engine:
             self.ws_connected = False
 
     def on_tick_price(self, instrument_key: str, ltp: float):
-        """Real-time tick exit engine: 1R Break-Even Trail, Fixed Target Hit, and Stop-Loss Hit."""
+        """Real-time tick exit engine across all active strategy positions."""
         norm_key = instrument_key.replace(":", "|")
-        target_idx, exit_reason = None, None
+        exits_to_run = []
 
         with self.pos_lock:
-            for idx, pos in self.active_positions.items():
+            for pos_key, pos in self.active_positions.items():
                 if pos["instrument_key"].replace(":", "|") == norm_key:
                     pos["last_ltp"] = ltp
                     is_short = pos["tx_side"] == "SELL"
@@ -1045,23 +1175,20 @@ class IntradayV3Engine:
                     tick_sz = pos.get("tick_size", 0.05)
                     tgt = float(pos.get("target", 0.0))
 
-                    # Move SL to Break-Even after 1R gain
-                    if curr_gain >= r_unit:
+                    if pos.get("allow_be_trail", True) and curr_gain >= r_unit:
                         be_sl = round_to_tick((entry - 0.10 * r_unit) if is_short else (entry + 0.10 * r_unit), tick_sz)
                         if (is_short and be_sl < pos["sl"]) or (not is_short and be_sl > pos["sl"]):
                             pos["sl"] = be_sl
                             pos["trail_stage"] = "1R BREAK-EVEN"
 
                     if tgt > 0 and ((not is_short and ltp >= tgt) or (is_short and ltp <= tgt)):
-                        exit_reason = "TARGET_HIT"
-                        target_idx = idx
+                        exits_to_run.append((pos_key, "TARGET_HIT"))
                     elif (not is_short and ltp <= pos["sl"]) or (is_short and ltp >= pos["sl"]):
-                        exit_reason = "TRAIL_BE_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
-                        target_idx = idx
-                    break
+                        reason = "TRAIL_BE_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
+                        exits_to_run.append((pos_key, reason))
 
-        if target_idx and exit_reason:
-            self.close_position_now(target_idx, ltp, exit_reason, datetime.now(IST))
+        for pos_key, reason in exits_to_run:
+            self.close_position_now(pos_key, ltp, reason, datetime.now(IST))
 
     def init_contracts(self):
         for idx, cfg in INDICES.items():
@@ -1109,6 +1236,27 @@ class IntradayV3Engine:
             return self.session_sched["nse_start"] <= hhmm <= self.session_sched["nse_end"]
         return any(st <= hhmm <= en for st, en in INDEX_WINDOWS)
 
+    def analyze_strong_pcr(self, idx: str, chain: list) -> tuple:
+        if not chain:
+            return 1.0, 0.0, False, False
+
+        total_pe_oi = sum(float(r.get("put_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
+        total_ce_oi = sum(float(r.get("call_options", {}).get("market_data", {}).get("oi", 0)) for r in chain)
+        pcr = round(total_pe_oi / total_ce_oi, 2) if total_ce_oi > 0 else 1.0
+
+        if self.open_pcr[idx] is None:
+            self.open_pcr[idx] = pcr
+        cum_diff = round(pcr - self.open_pcr[idx], 2)
+
+        hist = self.pcr_history[idx]
+        if not hist or hist[-1] != pcr:
+            hist.append(pcr)
+
+        step_diff = round(hist[-1] - hist[-2], 2) if len(hist) >= 2 else 0.0
+        strong_bull_pcr = (step_diff >= MIN_PCR_STEP_DIFF and cum_diff > 0) or (pcr >= 1.15 and step_diff >= 0)
+        strong_bear_pcr = (step_diff <= -MIN_PCR_STEP_DIFF and cum_diff < 0) or (pcr <= 0.85 and step_diff <= 0)
+        return pcr, cum_diff, strong_bull_pcr, strong_bear_pcr
+
     def compute_live_mtm(self) -> float:
         with self.pos_lock:
             if not self.active_positions:
@@ -1122,6 +1270,106 @@ class IntradayV3Engine:
             eff_units = float(pos.get("pnl_units", pos["qty"]))
             total_mtm += (pos["entry_price"] - ltp) * eff_units if is_short else (ltp - pos["entry_price"]) * eff_units
         return round(total_mtm, 2)
+
+    # ==========================================================================
+    # ANALYTICS: STRATEGY-WISE PERFORMANCE & HOURLY SESSION BREAKDOWN
+    # ==========================================================================
+    def build_strategy_performance_lines(self) -> list:
+        with self.pos_lock:
+            active_vals = list(self.active_positions.values())
+
+        lines = []
+        for sk in STRATEGY_KEYS:
+            c_list = [t for t in self.closed_trades if map_setup_to_strategy(t.get("setup", "")) == sk]
+            a_list = [p for p in active_vals if p.get("strategy_key") == sk]
+
+            tot = len(c_list)
+            wins = [t for t in c_list if float(t.get("pnl", 0.0)) > 0]
+            losses = [t for t in c_list if float(t.get("pnl", 0.0)) <= 0]
+            wr = int(round((len(wins) / tot) * 100.0)) if tot > 0 else 0
+            realized_pnl = round(sum(float(t.get("pnl", 0.0)) for t in c_list), 2)
+
+            live_mtm = 0.0
+            for p in a_list:
+                ltp = p.get("last_ltp", p["entry_price"])
+                is_short = p["tx_side"] == "SELL"
+                eff_u = float(p.get("pnl_units", p["qty"]))
+                est_c = float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0))
+                gross = (p["entry_price"] - ltp) * eff_u if is_short else (ltp - p["entry_price"]) * eff_u
+                live_mtm += (gross - est_c)
+
+            avg_win = (sum(float(t["pnl"]) for t in wins) / len(wins)) if wins else 0.0
+            avg_loss = (abs(sum(float(t["pnl"]) for t in losses)) / len(losses)) if losses else 0.0
+            if avg_loss > 0 and avg_win > 0:
+                rr_txt = f"1:{avg_win / avg_loss:.1f}"
+            elif sk == "1M_BO_RETEST":
+                rr_txt = "1:1.5"
+            elif sk == "5M_CONTRARIAN":
+                rr_txt = "1:2.0"
+            else:
+                rr_txt = "1:0.5(REV)"
+
+            tot_net = round(realized_pnl + live_mtm, 2)
+            icon = "🟢" if tot_net > 0 else ("🔴" if tot_net < 0 else "⚪")
+            open_tag = f" | Open:{len(a_list)}" if a_list else ""
+            lines.append(
+                f"• <b>{sk}:</b> {icon} <b>₹{tot_net:+,.0f}</b> | {tot}T ({len(wins)}W/{len(losses)}L) | WR <b>{wr}%</b> | R:R <b>{rr_txt}</b>{open_tag}"
+            )
+        return lines
+
+    def build_hourly_analysis_lines(self) -> list:
+        hourly = {}
+        for t in self.closed_trades:
+            et = str(t.get("entry_time", ""))
+            if len(et) >= 2 and et[:2].isdigit():
+                hr = int(et[:2])
+                rec = hourly.setdefault(hr, {"trades": 0, "wins": 0, "pnl": 0.0})
+                rec["trades"] += 1
+                pnl_v = float(t.get("pnl", 0.0))
+                if pnl_v > 0:
+                    rec["wins"] += 1
+                rec["pnl"] = round(rec["pnl"] + pnl_v, 2)
+
+        with self.pos_lock:
+            for p in self.active_positions.values():
+                et = str(p.get("entry_time", ""))
+                if len(et) >= 2 and et[:2].isdigit():
+                    hr = int(et[:2])
+                    rec = hourly.setdefault(hr, {"trades": 0, "wins": 0, "pnl": 0.0})
+                    ltp = p.get("last_ltp", p["entry_price"])
+                    is_short = p["tx_side"] == "SELL"
+                    eff_u = float(p.get("pnl_units", p["qty"]))
+                    est_c = float(p.get("est_charges", 180.0 if p["type"] == "MCX_FUT" else 65.0))
+                    gross = (p["entry_price"] - ltp) * eff_u if is_short else (ltp - p["entry_price"]) * eff_u
+                    rec["pnl"] = round(rec["pnl"] + gross - est_c, 2)
+
+        if not hourly:
+            return ["<i>No hourly trade data yet today.</i>"]
+
+        best_hr = max(hourly.items(), key=lambda kv: kv[1]["pnl"])
+        worst_hr = min(hourly.items(), key=lambda kv: kv[1]["pnl"])
+        lines = []
+
+        for hr in sorted(hourly.keys()):
+            d = hourly[hr]
+            slot_lbl = f"{hr:02d}:00-{hr + 1:02d}:00"
+            if d["pnl"] >= 200:
+                tag = "🔥 PROFIT"
+            elif d["pnl"] <= -200:
+                tag = "⚠️ LOSS"
+            else:
+                tag = "➖ CONSOL/FLAT"
+
+            badge = ""
+            if hr == best_hr[0] and best_hr[1]["pnl"] > 0:
+                badge = " [BEST HR]"
+            elif hr == worst_hr[0] and worst_hr[1]["pnl"] < 0:
+                badge = " [WORST HR]"
+
+            lines.append(
+                f"• <code>{slot_lbl}</code>: <b>₹{d['pnl']:+,.0f}</b> ({d['trades']}T, {d['wins']}W) | <code>{tag}{badge}</code>"
+            )
+        return lines
 
     def get_performance_summary_lines(self, now_ist: datetime, live_mtm: float) -> list:
         today_str = now_ist.strftime("%Y-%m-%d")
@@ -1175,7 +1423,7 @@ class IntradayV3Engine:
         ]
 
     # ==========================================================================
-    # TELEGRAM DASHBOARD (SHOWS EXACT ENTRY LOGIC NAME & TIMEFRAME)
+    # TELEGRAM DASHBOARD (SHOWS STRATEGY ON POSITIONS, STRATEGY STATS & HOURLY)
     # ==========================================================================
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
@@ -1205,7 +1453,7 @@ class IntradayV3Engine:
             day_wr = int(round((total_wins / tot_closed) * 100.0)) if tot_closed > 0 else 0
 
             lines = [
-                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} <code>1m BO+RT &amp; 5m REV</code>",
+                f"{status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge} <code>3-STRAT UNCAPPED</code>",
                 f"────────────────────────────",
                 f"💼 <b>Day Net P&amp;L:</b> {net_icon} <b>₹{net_pnl:+,.2f}</b>",
                 f"• Realized: <b>₹{self.day_pnl:+,.2f}</b>  |  Live MTM: <b>₹{live_net_mtm:+,.2f}</b>",
@@ -1214,7 +1462,8 @@ class IntradayV3Engine:
 
             if active_snap:
                 lines.append(f"\n🔥 <b>ACTIVE POSITIONS ({len(active_snap)})</b>")
-                for p_idx, pos in active_snap:
+                for _, pos in active_snap:
+                    p_idx = pos["symbol"]
                     ltp = pos.get("last_ltp", pos["entry_price"])
                     is_short = pos["tx_side"] == "SELL"
                     est_charges = float(pos.get("est_charges", 180.0 if pos["type"] == "MCX_FUT" else 65.0))
@@ -1224,59 +1473,57 @@ class IntradayV3Engine:
                     pnl = round(gross_val - est_charges, 2)
                     sl_gross = (pos["entry_price"] - pos["sl"]) * eff_units if is_short else (pos["sl"] - pos["entry_price"]) * eff_units
                     sl_net_pnl = round(sl_gross - est_charges, 0)
-                    logic_name = pos.get("trade_mode", "1M_TREND_BO_RETEST")
+                    strat_lbl = pos.get("setup_name", pos.get("strategy_key", "1M_BO_RETEST"))
                     tgt_val = float(pos.get("target", 0.0))
-                    tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else "FIXED RRR"
-                    trail_tag = f"<code>{logic_name}</code> | 🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{logic_name}</code>"
+                    trail_tag = f"<code>{strat_lbl}</code> | 🛡️ <code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{strat_lbl}</code>"
                     p_icon = "🟢" if pnl >= 0 else "🔴"
                     sl_label = f"Locked <b>₹{sl_net_pnl:+,.0f}</b>" if sl_net_pnl >= 0 else f"Max Risk <b>₹{abs(sl_net_pnl):,.0f}</b>"
 
                     lot_sz = int(pos.get("lot_size", pos["qty"]))
                     num_lots = int(pos.get("lots", max(1, pos["qty"] // max(lot_sz, 1))))
-                    lot_spec_txt = (
-                        f"{num_lots} Lot = {pos['qty']} Qty"
-                        if num_lots == 1
-                        else f"{num_lots} Lots × {lot_sz} = {pos['qty']} Qty"
-                    )
+                    lot_spec_txt = f"{num_lots} Lot = {pos['qty']} Qty"
 
                     lines.extend([
-                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)\n  Logic: {trail_tag}",
+                        f"• <b>#{pos['trade_no']} {p_idx}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{lot_spec_txt}</code>)\n  Strategy: {trail_tag}",
                         f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>",
-                        f"  PnL: <code>{pts_diff:.2f} pt × {eff_units} = ₹{gross_val:,.0f}</code>",
-                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>{tgt_txt}</code>",
-                        f"  Live Net P&amp;L: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_label})  |  Target: <code>₹{tgt_val:.2f}</code>  |  Live Net: {p_icon} <b>₹{pnl:+,.2f}</b>",
                     ])
+
+            lines.append("\n🎯 <b>STRATEGY PERFORMANCE (TODAY)</b>")
+            lines.extend(self.build_strategy_performance_lines())
+
+            lines.append("\n⏰ <b>HOURLY SESSION TRACKER (IST)</b>")
+            lines.extend(self.build_hourly_analysis_lines())
 
             lines.append("\n📒 <b>TODAY'S CLOSED TRADES</b>")
             if self.closed_trades:
-                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"]):
+                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"])[-8:]:
                     icon = "✅" if t["pnl"] >= 0 else "❌"
                     pts_t = float(t.get("points", 0.0))
                     units_t = int(float(t.get("pnl_units") or t.get("qty", 1)))
                     gross_t = float(t.get("gross_pnl", round(pts_t * units_t, 2)))
                     setup_lbl = t.get("setup", "UNKNOWN")
                     lines.append(
-                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} Net <b>₹{t['pnl']:+,.2f}</b>\n"
-                        f"  Logic: <code>{setup_lbl}</code> | <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>\n"
-                        f"  In: ₹{t['entry_price']:.2f} → Exit: ₹{t['exit_price']:.2f} (<code>{pts_t:.2f} pt × {units_t} = ₹{gross_t:,.0f}</code>) | <i>{t['exit_reason']}</i>"
+                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code> {icon} <b>₹{t['pnl']:+,.2f}</b>\n"
+                        f"  Strat: <code>{setup_lbl}</code> | <code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code> | <i>{t['exit_reason']}</i>"
                     )
             elif not active_snap:
                 lines.append("<i>No closed trades yet today.</i>")
 
             if self.last_summaries:
-                lines.append(f"\n📡 <b>INDICES LIVE (09:15-11:30 &amp; 14:00-15:00)</b>")
+                lines.append(f"\n📡 <b>INDICES LIVE (09:10-15:00 • 3-STRAT)</b>")
                 for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                     s = self.last_summaries.get(idx)
                     if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Vol <b>{s['vol_ratio']:.1f}x</b> | ATR <b>{s['atr']}</b> | <code>{s['short_status']}</code>")
+                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
 
-                lines.append("\n🛢️ <b>MCX MINI LIVE (17:00-21:00)</b>")
+                lines.append("\n🛢️ <b>MCX MINI LIVE (21:00-22:00 • 3-STRAT)</b>")
                 for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                     s = self.last_summaries.get(idx)
                     if s:
-                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | Vol <b>{s['vol_ratio']:.1f}x</b> | ATR <b>{s['atr']}</b> | <code>{s['short_status']}</code>")
+                        lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | VWAP <b>{s['vwap']}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
 
-            lines.append("\n📊 <b>PERFORMANCE SUMMARY (NET ₹)</b>")
+            lines.append("\n📊 <b>OVERALL SUMMARY (NET ₹)</b>")
             lines.extend(self.get_performance_summary_lines(now_ist, live_net_mtm))
 
             self.dashboard_msg_id = upsert_telegram_dashboard("\n".join(lines), self.dashboard_msg_id)
@@ -1291,7 +1538,7 @@ class IntradayV3Engine:
                     break
                 try:
                     with self.pos_lock:
-                        active_keys = [p["instrument_key"] for p in self.active_positions.values()]
+                        active_keys = list({p["instrument_key"] for p in self.active_positions.values()})
                     spot_keys = [cfg["spot_key"] for cfg in INDICES.values() if cfg.get("spot_key")]
                     all_live_keys = list(dict.fromkeys(active_keys + spot_keys))
 
@@ -1314,19 +1561,22 @@ class IntradayV3Engine:
 
         threading.Thread(target=_pulse_loop, daemon=True).start()
 
-    def close_position_now(self, idx: str, ltp: float, exit_reason: str, now_ist: datetime):
+    def close_position_now(self, pos_key: str, ltp: float, exit_reason: str, now_ist: datetime, is_reversal: bool = False):
         with self.pos_lock:
-            pos = self.active_positions.pop(idx, None)
+            pos = self.active_positions.pop(pos_key, None)
         if not pos:
             return
 
-        self.last_exit_ts[idx] = time.time()
-        self.pending_retests[idx] = None
-        df_curr = self.latest_dfs.get(idx)
-        if df_curr is not None and not df_curr.empty:
-            self.last_exit_candle_ts[idx] = str(df_curr["timestamp"].iloc[-1])
+        idx = pos["symbol"]
+        self.last_exit_ts[pos_key] = 0.0 if is_reversal else time.time()
+        if pos.get("strategy_key") == "1M_BO_RETEST":
+            self.pending_retests[idx] = None
 
-        self.unsubscribe_tick_instrument(pos["instrument_key"])
+        df_curr = self.latest_dfs.get(idx)
+        if not is_reversal and df_curr is not None and not df_curr.empty:
+            self.last_exit_candle_ts[pos_key] = str(df_curr["timestamp"].iloc[-1])
+
+        self.unsubscribe_tick_instrument_if_unused(pos["instrument_key"])
         self.save_active_positions_state()
 
         is_short = pos["tx_side"] == "SELL"
@@ -1361,10 +1611,23 @@ class IntradayV3Engine:
         record_trade_journal(journal_entry)
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
+    def can_trigger_strategy(self, idx: str, strat_key: str, curr_candle_ts: str) -> bool:
+        pos_key = f"{idx}__{strat_key}"
+        with self.pos_lock:
+            if pos_key in self.active_positions:
+                return False
+        sec_since = time.time() - self.last_exit_ts.get(pos_key, 0.0)
+        if sec_since < REENTRY_COOLDOWN_SEC:
+            return False
+        if curr_candle_ts and curr_candle_ts == self.last_exit_candle_ts.get(pos_key, ""):
+            return False
+        return True
+
     # ==========================================================================
-    # UNIFIED DUAL-TIMEFRAME EVALUATOR (FOR BOTH INDICES & MCX MINI)
-    #   1. LOGIC A (1-Minute Candles): TREND_BO_RETEST -> 1 : 1.5 R:R
-    #   2. LOGIC B (5-Minute Candles): CONTRARIAN_REV  -> 1 : 2.0 R:R
+    # UNIFIED 3-STRATEGY EVALUATOR (ALL 3 STRATEGIES RUN INDEPENDENTLY — NO CAP)
+    #   1. 1M_BO_RETEST  : 1m Breakout + 15-bar Retest -> 1:1.5 R:R + 1R BE Trail
+    #   2. 5M_CONTRARIAN : 5m EMA20/50 + Vol >= 1.3x Reversed -> 1:2.0 R:R + 1R BE Trail
+    #   3. VWAP_PCR_REV  : VWAP + PCR Pattern Reversed -> Swapped 1R Tgt & 2R SL
     # ==========================================================================
     def evaluate_instrument(self, idx: str, cfg: dict, now_ist: datetime):
         is_mcx = cfg["type"] == "MCX_FUT"
@@ -1373,37 +1636,18 @@ class IntradayV3Engine:
         raw_df = fetch_intraday_candles(fut_key, 1) if fut_key else pd.DataFrame()
         if raw_df.empty and not is_mcx and cfg.get("spot_key"):
             raw_df = fetch_intraday_candles(cfg["spot_key"], 1)
-        if raw_df.empty or len(raw_df) < 20:
+        if raw_df.empty or len(raw_df) < 5:
             return None
 
-        df_1m = add_clean_indicators(raw_df)
+        df_1m = add_full_indicators(raw_df)
         self.latest_dfs[idx] = df_1m
 
         curr_1m = df_1m.iloc[-1]
         curr_1m_ts = str(curr_1m["timestamp"])
         price_now = float(curr_1m["close"])
+        vwap_1m = float(curr_1m["vwap"])
         atr14_1m = max(float(curr_1m["atr14"]), cfg.get("tick_size", 0.05) * 2)
         vol_ratio_1m = float(curr_1m["vol_ratio"])
-
-        with self.pos_lock:
-            in_trade = idx in self.active_positions
-
-        if in_trade:
-            self.pending_retests[idx] = None
-            with self.pos_lock:
-                pos = self.active_positions.get(idx)
-            if pos:
-                ltp_now = pos.get("last_ltp", price_now if is_mcx else pos["entry_price"])
-                is_short = pos["tx_side"] == "SELL"
-                est_ch = float(pos.get("est_charges", 180.0 if is_mcx else 65.0))
-                eff_u = float(pos.get("pnl_units", pos["qty"]))
-                pos_mtm = ((pos["entry_price"] - ltp_now) * eff_u if is_short else (ltp_now - pos["entry_price"]) * eff_u) - est_ch
-                return {
-                    "idx": idx, "is_mcx": is_mcx,
-                    "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                    "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
-                    "short_status": f"ACTIVE #{pos['trade_no']} [{pos.get('trade_mode','')}] (₹{pos_mtm:+.0f})",
-                }
 
         uptime_sec = time.time() - self.engine_boot_ts
         if uptime_sec < STARTUP_WARMUP_SEC:
@@ -1411,329 +1655,443 @@ class IntradayV3Engine:
             return {
                 "idx": idx, "is_mcx": is_mcx,
                 "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
+                "vwap": round(vwap_1m, 2) if vwap_1m < 1000 else int(round(vwap_1m)),
+                "pcr": 0.0, "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
                 "short_status": f"WARMUP ({rem_w}s)",
             }
 
-        sec_since_exit = time.time() - self.last_exit_ts.get(idx, 0.0)
-        if sec_since_exit < REENTRY_COOLDOWN_SEC or curr_1m_ts == self.last_exit_candle_ts.get(idx, ""):
-            rem_min = max(1, int(math.ceil((REENTRY_COOLDOWN_SEC - sec_since_exit) / 60.0)))
-            self.pending_retests[idx] = None
-            return {
-                "idx": idx, "is_mcx": is_mcx,
-                "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
-                "short_status": f"COOLDOWN ({rem_min}m)",
-            }
+        # Fetch Option Chain once per cycle for Indices (shared across all 3 strategies)
+        chain, active_expiry, is_today_exp = [], "", False
+        pcr = 0.0
+        if not is_mcx:
+            active_expiry, is_today_exp = self.get_smart_expiry(idx, now_ist)
+            chain = fetch_option_chain(cfg["spot_key"], active_expiry)
+            pcr, _, strong_bull_pcr, strong_bear_pcr = self.analyze_strong_pcr(idx, chain)
+        else:
+            strong_bull_pcr = (price_now > vwap_1m) and (vol_ratio_1m >= VWAP_MIN_VOL_RATIO)
+            strong_bear_pcr = (price_now < vwap_1m) and (vol_ratio_1m >= VWAP_MIN_VOL_RATIO)
 
-        with self.pos_lock:
-            total_open = len(self.active_positions)
-        if total_open >= MAX_ACTIVE_TRADES_TOTAL:
-            return {
-                "idx": idx, "is_mcx": is_mcx,
-                "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
-                "short_status": "MAX 5 ACTIVE",
-            }
-
-        if not self.is_within_trade_window(idx, now_ist):
-            self.pending_retests[idx] = None
-            slot_txt = "17:00-21:00" if is_mcx else "09:15-11:30|14:00-15:00"
-            return {
-                "idx": idx, "is_mcx": is_mcx,
-                "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
-                "short_status": f"SLOT {slot_txt}",
-            }
-
-        # ======================================================================
-        # LOGIC A (1-MINUTE CANDLES): TREND-FOLLOWING BREAKOUT + RETEST (1:1.5)
-        # ======================================================================
-        pending = self.pending_retests.get(idx)
-        if pending:
-            bars_waited = int((now_ist - pending["armed_at"]).total_seconds() // 60)
-            if bars_waited > BO_RETEST_MAX_BARS:
-                self.pending_retests[idx] = None
-                pending = None
-
-        if pending is not None and curr_1m_ts != pending["armed_ts"]:
-            lvl = float(pending["level"])
-            buf = BO_RETEST_BUFFER_ATR * float(pending["atr"])
-            retest_confirmed = False
-
-            if pending["side"] == "CE":
-                if (lvl - buf) <= float(curr_1m["low"]) <= (lvl + buf) and float(curr_1m["close"]) > float(curr_1m["open"]):
-                    retest_confirmed = True
-            else:
-                if (lvl - buf) <= float(curr_1m["high"]) <= (lvl + buf) and float(curr_1m["close"]) < float(curr_1m["open"]):
-                    retest_confirmed = True
-
-            if retest_confirmed:
-                self.dispatch_entry(
-                    idx=idx,
-                    cfg=cfg,
-                    side=pending["side"],
-                    fut_price=price_now,
-                    atr14=float(pending["atr"]),
-                    now_ist=now_ist,
-                    logic_code="1M_TREND_BO_RETEST",
-                    rrr_mult=BO_RRR_TARGET,
-                )
-                return {
-                    "idx": idx, "is_mcx": is_mcx,
-                    "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                    "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
-                    "short_status": "ENTERED 1M_TREND_BO_RETEST",
-                }
-
-        # ======================================================================
-        # LOGIC B (5-MINUTE CANDLES): REVERSED / CONTRARIAN (1:2.0 R:R)
-        # Evaluates the latest CLOSED 5-minute candle (df_5m.iloc[-2])
-        # ======================================================================
         df_5m = build_resampled_5m_df(raw_df)
-        if not df_5m.empty and len(df_5m) >= 22:
+
+        # Check Opposite Reversal for active Strategy 3 (VWAP_PCR_REV) position
+        vwap_pos_key = f"{idx}__VWAP_PCR_REV"
+        with self.pos_lock:
+            active_vwap_pos = self.active_positions.get(vwap_pos_key)
+
+        df_vwap_src = df_5m if (is_mcx and not df_5m.empty and len(df_5m) >= 5) else df_1m
+        pat_res = detect_vwap_pattern_with_momentum(df_vwap_src)
+        raw_pat_sig = pat_res["signal"]
+        pat_name = pat_res["pattern"]
+
+        if active_vwap_pos is not None:
+            ltp_v = active_vwap_pos.get("last_ltp", price_now if is_mcx else active_vwap_pos["entry_price"])
+            vwap_ref = float(df_vwap_src.iloc[-1]["vwap"])
+            price_ref = float(df_vwap_src.iloc[-1]["close"])
+            if active_vwap_pos["side"] == "PE" and raw_pat_sig == "PE" and strong_bear_pcr and price_ref < vwap_ref:
+                self.close_position_now(vwap_pos_key, ltp_v, "REVERSAL_TO_CE", now_ist, is_reversal=True)
+            elif active_vwap_pos["side"] == "CE" and raw_pat_sig == "CE" and strong_bull_pcr and price_ref > vwap_ref:
+                self.close_position_now(vwap_pos_key, ltp_v, "REVERSAL_TO_PE", now_ist, is_reversal=True)
+
+        in_window = self.is_within_trade_window(idx, now_ist)
+        if not in_window:
+            self.pending_retests[idx] = None
+            with self.pos_lock:
+                open_cnt = sum(1 for p in self.active_positions.values() if p["symbol"] == idx)
+            slot_txt = "21:00-22:00" if is_mcx else "09:10-15:00"
+            st_lbl = f"ACTIVE({open_cnt}) | SLOT {slot_txt}" if open_cnt > 0 else f"SLOT {slot_txt}"
+            return {
+                "idx": idx, "is_mcx": is_mcx,
+                "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
+                "vwap": round(vwap_1m, 2) if vwap_1m < 1000 else int(round(vwap_1m)),
+                "pcr": pcr, "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
+                "short_status": st_lbl,
+            }
+
+        # ======================================================================
+        # STRATEGY 1: 1M_BO_RETEST (1-Min Breakout + Retest -> 1:1.5 R:R + 1R BE)
+        # ======================================================================
+        if self.can_trigger_strategy(idx, "1M_BO_RETEST", curr_1m_ts):
+            pending = self.pending_retests.get(idx)
+            if pending:
+                bars_waited = int((now_ist - pending["armed_at"]).total_seconds() // 60)
+                if bars_waited > BO_RETEST_MAX_BARS:
+                    self.pending_retests[idx] = None
+                    pending = None
+
+            if pending is not None and curr_1m_ts != pending["armed_ts"]:
+                lvl = float(pending["level"])
+                buf = BO_RETEST_BUFFER_ATR * float(pending["atr"])
+                retest_ok = False
+                if pending["side"] == "CE" and (lvl - buf) <= float(curr_1m["low"]) <= (lvl + buf) and float(curr_1m["close"]) > float(curr_1m["open"]):
+                    retest_ok = True
+                elif pending["side"] == "PE" and (lvl - buf) <= float(curr_1m["high"]) <= (lvl + buf) and float(curr_1m["close"]) < float(curr_1m["open"]):
+                    retest_ok = True
+
+                if retest_ok:
+                    self.dispatch_standard_entry(
+                        idx=idx, cfg=cfg, side=pending["side"], fut_price=price_now,
+                        atr14=float(pending["atr"]), chain=chain, is_today_exp=is_today_exp,
+                        now_ist=now_ist, strat_key="1M_BO_RETEST",
+                        setup_detail="1M_BO_RETEST", rrr_mult=BO_RRR_TARGET,
+                    )
+            elif pending is None:
+                c_range_1m = float(curr_1m["high"]) - float(curr_1m["low"])
+                c_body_1m = abs(float(curr_1m["close"]) - float(curr_1m["open"]))
+                b_ratio_1m = c_body_1m / (c_range_1m if c_range_1m > 0 else 1e-9)
+                if (vol_ratio_1m >= BO_VOL_RATIO_MIN or c_range_1m >= BO_RANGE_EXPANSION_ATR * atr14_1m) and b_ratio_1m >= BO_BODY_RATIO_MIN:
+                    if float(curr_1m["close"]) > float(curr_1m["open"]):
+                        self.pending_retests[idx] = {"side": "CE", "level": float(curr_1m["high"]), "atr": atr14_1m, "armed_at": now_ist, "armed_ts": curr_1m_ts}
+                    elif float(curr_1m["close"]) < float(curr_1m["open"]):
+                        self.pending_retests[idx] = {"side": "PE", "level": float(curr_1m["low"]), "atr": atr14_1m, "armed_at": now_ist, "armed_ts": curr_1m_ts}
+        else:
+            self.pending_retests[idx] = None
+
+        # ======================================================================
+        # STRATEGY 2: 5M_CONTRARIAN (5-Min Closed Candle EMA20/50 Reversed -> 1:2.0 R:R)
+        # ======================================================================
+        if not df_5m.empty and len(df_5m) >= 10:
             bar_5m = df_5m.iloc[-2]
             bar_5m_ts = str(bar_5m["timestamp"])
-
-            if bar_5m_ts != self.last_rev_5m_ts.get(idx, ""):
+            if bar_5m_ts != self.last_rev_5m_ts.get(idx, "") and self.can_trigger_strategy(idx, "5M_CONTRARIAN", bar_5m_ts):
                 self.last_rev_5m_ts[idx] = bar_5m_ts
                 atr14_5m = max(float(bar_5m["atr14"]), cfg.get("tick_size", 0.05) * 2)
-                vol_ratio_5m = float(bar_5m["vol_ratio"])
-                range_5m = float(bar_5m["high"]) - float(bar_5m["low"])
+                vol_5m = float(bar_5m["vol_ratio"])
+                rng_5m = float(bar_5m["high"]) - float(bar_5m["low"])
                 body_5m = abs(float(bar_5m["close"]) - float(bar_5m["open"]))
-                body_ratio_5m = body_5m / (range_5m if range_5m > 0 else 1e-9)
+                br_5m = body_5m / (rng_5m if rng_5m > 0 else 1e-9)
 
-                is_bull_5m = float(bar_5m["close"]) > float(bar_5m["ema20"]) > float(bar_5m["ema50"])
-                is_bear_5m = float(bar_5m["close"]) < float(bar_5m["ema20"]) < float(bar_5m["ema50"])
-                is_rev_vol = vol_ratio_5m >= REV_VOL_RATIO_MIN
-                is_rev_body = body_ratio_5m >= REV_BODY_RATIO_MIN
+                bull_5m = float(bar_5m["close"]) > float(bar_5m["ema20"]) > float(bar_5m["ema50"])
+                bear_5m = float(bar_5m["close"]) < float(bar_5m["ema20"]) < float(bar_5m["ema50"])
 
-                if is_rev_vol and is_rev_body:
-                    if is_bull_5m and float(bar_5m["close"]) > float(bar_5m["open"]):
-                        # Raw 5m Bullish Breakout -> Flip to PE / SELL (Contrarian)
-                        self.pending_retests[idx] = None
-                        self.dispatch_entry(
-                            idx=idx,
-                            cfg=cfg,
-                            side="PE",
-                            fut_price=price_now,
-                            atr14=atr14_5m,
-                            now_ist=now_ist,
-                            logic_code="5M_CONTRARIAN_REV",
-                            rrr_mult=REV_RRR_TARGET,
+                if vol_5m >= REV_VOL_RATIO_MIN and br_5m >= REV_BODY_RATIO_MIN:
+                    if bull_5m and float(bar_5m["close"]) > float(bar_5m["open"]):
+                        # Raw Bullish -> Reversed to PE / SELL
+                        self.dispatch_standard_entry(
+                            idx=idx, cfg=cfg, side="PE", fut_price=price_now,
+                            atr14=atr14_5m, chain=chain, is_today_exp=is_today_exp,
+                            now_ist=now_ist, strat_key="5M_CONTRARIAN",
+                            setup_detail="5M_CONTRARIAN_REV", rrr_mult=REV_RRR_TARGET,
                         )
-                        return {
-                            "idx": idx, "is_mcx": is_mcx,
-                            "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                            "vol_ratio": vol_ratio_5m, "atr": round(atr14_5m, 1),
-                            "short_status": "ENTERED 5M_CONTRARIAN_REV",
-                        }
-                    elif is_bear_5m and float(bar_5m["close"]) < float(bar_5m["open"]):
-                        # Raw 5m Bearish Breakdown -> Flip to CE / BUY (Contrarian)
-                        self.pending_retests[idx] = None
-                        self.dispatch_entry(
-                            idx=idx,
-                            cfg=cfg,
-                            side="CE",
-                            fut_price=price_now,
-                            atr14=atr14_5m,
-                            now_ist=now_ist,
-                            logic_code="5M_CONTRARIAN_REV",
-                            rrr_mult=REV_RRR_TARGET,
+                    elif bear_5m and float(bar_5m["close"]) < float(bar_5m["open"]):
+                        # Raw Bearish -> Reversed to CE / BUY
+                        self.dispatch_standard_entry(
+                            idx=idx, cfg=cfg, side="CE", fut_price=price_now,
+                            atr14=atr14_5m, chain=chain, is_today_exp=is_today_exp,
+                            now_ist=now_ist, strat_key="5M_CONTRARIAN",
+                            setup_detail="5M_CONTRARIAN_REV", rrr_mult=REV_RRR_TARGET,
                         )
-                        return {
-                            "idx": idx, "is_mcx": is_mcx,
-                            "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-                            "vol_ratio": vol_ratio_5m, "atr": round(atr14_5m, 1),
-                            "short_status": "ENTERED 5M_CONTRARIAN_REV",
-                        }
 
         # ======================================================================
-        # ARM NEW 1-MINUTE BREAKOUT FOR LOGIC A
+        # STRATEGY 3: VWAP_PCR_REV (Reversed VWAP + PCR Pattern -> Swapped 1R Tgt / 2R SL)
         # ======================================================================
-        if pending is None:
-            c_range_1m = float(curr_1m["high"]) - float(curr_1m["low"])
-            c_body_1m = abs(float(curr_1m["close"]) - float(curr_1m["open"]))
-            body_ratio_1m = c_body_1m / (c_range_1m if c_range_1m > 0 else 1e-9)
+        vwap_bar_ts = str(df_vwap_src.iloc[-1]["timestamp"])
+        if raw_pat_sig in ("CE", "PE") and vwap_bar_ts != self.last_vwap_bar_ts.get(idx, ""):
+            if self.can_trigger_strategy(idx, "VWAP_PCR_REV", vwap_bar_ts):
+                atr_vwap = max(float(df_vwap_src.iloc[-1]["atr14"]), cfg.get("tick_size", 0.05) * 2)
+                if raw_pat_sig == "CE" and strong_bull_pcr:
+                    # Raw Bullish -> Flip to PE / SELL with Swapped Target (1R) & SL (2R)
+                    self.last_vwap_bar_ts[idx] = vwap_bar_ts
+                    self.dispatch_vwap_reversed_entry(
+                        idx=idx, cfg=cfg, flipped_side="PE", pattern_name=pat_name,
+                        df_src=df_vwap_src, fut_price=price_now, atr14=atr_vwap,
+                        chain=chain, is_today_exp=is_today_exp, now_ist=now_ist,
+                    )
+                elif raw_pat_sig == "PE" and strong_bear_pcr:
+                    # Raw Bearish -> Flip to CE / BUY with Swapped Target (1R) & SL (2R)
+                    self.last_vwap_bar_ts[idx] = vwap_bar_ts
+                    self.dispatch_vwap_reversed_entry(
+                        idx=idx, cfg=cfg, flipped_side="CE", pattern_name=pat_name,
+                        df_src=df_vwap_src, fut_price=price_now, atr14=atr_vwap,
+                        chain=chain, is_today_exp=is_today_exp, now_ist=now_ist,
+                    )
 
-            has_volume = vol_ratio_1m >= BO_VOL_RATIO_MIN
-            is_range_exp = c_range_1m >= (BO_RANGE_EXPANSION_ATR * atr14_1m)
-            is_solid = body_ratio_1m >= BO_BODY_RATIO_MIN
+        with self.pos_lock:
+            sym_active = [p["strategy_key"] for p in self.active_positions.values() if p["symbol"] == idx]
 
-            if (has_volume or is_range_exp) and is_solid:
-                if float(curr_1m["close"]) > float(curr_1m["open"]):
-                    pending = {
-                        "side": "CE",
-                        "level": float(curr_1m["high"]),
-                        "atr": atr14_1m,
-                        "armed_at": now_ist,
-                        "armed_ts": curr_1m_ts,
-                    }
-                    self.pending_retests[idx] = pending
-                elif float(curr_1m["close"]) < float(curr_1m["open"]):
-                    pending = {
-                        "side": "PE",
-                        "level": float(curr_1m["low"]),
-                        "atr": atr14_1m,
-                        "armed_at": now_ist,
-                        "armed_ts": curr_1m_ts,
-                    }
-                    self.pending_retests[idx] = pending
+        if sym_active:
+            short_status = f"ACTIVE [{','.join(s.split('_')[0] for s in sym_active)}]"
+        elif self.pending_retests.get(idx):
+            short_status = f"ARMED 1m {self.pending_retests[idx]['side']} RT"
+        else:
+            short_status = "SCAN ALL 3"
 
-        short_status = f"ARMED 1m {pending['side']} RT" if pending else "SCAN 1mBO+5mREV"
         return {
             "idx": idx, "is_mcx": is_mcx,
             "spot": round(price_now, 2) if price_now < 1000 else int(round(price_now)),
-            "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
+            "vwap": round(vwap_1m, 2) if vwap_1m < 1000 else int(round(vwap_1m)),
+            "pcr": pcr, "vol_ratio": vol_ratio_1m, "atr": round(atr14_1m, 1),
             "short_status": short_status,
         }
 
     # ==========================================================================
-    # UNIFIED ENTRY ROUTER (TAGS EXACT LOGIC NAME & TIMEFRAME ON EVERY POSITION)
+    # ENTRY EXECUTORS FOR STRATEGY 1, 2 & 3
     # ==========================================================================
-    def dispatch_entry(self, idx: str, cfg: dict, side: str, fut_price: float, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
+    def dispatch_standard_entry(self, idx, cfg, side, fut_price, atr14, chain, is_today_exp, now_ist, strat_key, setup_detail, rrr_mult):
+        pos_key = f"{idx}__{strat_key}"
+        with self.pos_lock:
+            if pos_key in self.active_positions:
+                return
+
         if cfg["type"] == "MCX_FUT":
             tx_side = "BUY" if side == "CE" else "SELL"
-            self.execute_mcx_fut_entry(idx, cfg, tx_side, fut_price, atr14, now_ist, logic_code, rrr_mult)
-        else:
-            active_expiry, _ = self.get_smart_expiry(idx, now_ist)
-            chain = fetch_option_chain(cfg["spot_key"], active_expiry)
-            self.execute_index_opt_entry(idx, cfg, side, fut_price, chain, atr14, now_ist, logic_code, rrr_mult)
+            inst_key = cfg["spot_key"]
+            lot_size = int(cfg["lot_size"])
+            pnl_mult = int(cfg.get("pnl_multiplier", lot_size))
+            tick_sz = cfg.get("tick_size", 0.05)
 
-    def execute_mcx_fut_entry(self, idx: str, cfg: dict, tx_side: str, fut_price: float, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
-        with self.pos_lock:
-            if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+            ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
+            min_sl = round_to_tick(ltp * 0.0015, tick_sz)
+            sl_points = max(round_to_tick(atr14 * ATR_SL_MULT, tick_sz), min_sl, tick_sz * 4)
+            target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
+
+            if tx_side == "BUY":
+                sl_price = round_to_tick(ltp - sl_points, tick_sz)
+                target_price = round_to_tick(ltp + target_points, tick_sz)
+                opt_side = "CE"
+            else:
+                sl_price = round_to_tick(ltp + sl_points, tick_sz)
+                target_price = round_to_tick(ltp - target_points, tick_sz)
+                opt_side = "PE"
+
+            qty = min(lot_size, cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
+            full_setup = f"{setup_detail}_{tx_side}"
+
+            order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": strat_key,
+                        "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
+                        "side": opt_side, "tx_side": tx_side, "display_side": tx_side,
+                        "lots": 1, "lot_size": lot_size, "qty": qty, "pnl_units": pnl_mult,
+                        "tick_size": tick_sz, "entry_price": fill, "r_unit": sl_points,
+                        "est_charges": total_est_ch, "last_ltp": fill,
+                        "sl": sl_price, "target": target_price, "allow_be_trail": True,
+                        "trail_stage": None, "setup_name": full_setup,
+                        "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                if strat_key == "1M_BO_RETEST":
+                    self.pending_retests[idx] = None
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"🚀 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
+                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
+        else:
+            if not chain:
+                return
+            step = cfg.get("step", 50)
+            tick_sz = cfg.get("tick_size", 0.05)
+            opt_field = "call_options" if side == "CE" else "put_options"
+            target_strike = round(fut_price / step) * step
+            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
+            if not chosen:
+                valid_rows = [row for row in chain if row.get(opt_field, {}).get("instrument_key")]
+                if not valid_rows:
+                    return
+                nearest_row = min(valid_rows, key=lambda r: abs(float(r.get("strike_price", 0)) - fut_price))
+                target_strike = nearest_row.get("strike_price", target_strike)
+                chosen = nearest_row.get(opt_field, {})
+
+            inst_key = chosen.get("instrument_key")
+            if not inst_key:
                 return
 
-        inst_key = cfg["spot_key"]
-        lot_size = int(cfg["lot_size"])
-        pnl_mult = int(cfg.get("pnl_multiplier", lot_size))
-        tick_sz = cfg.get("tick_size", 0.05)
+            mkt = chosen.get("market_data", {})
+            greeks = chosen.get("option_greeks", {})
+            ltp = float(mkt.get("ltp", 0))
+            if ltp <= 0:
+                ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", 0.0))
+            if ltp <= 0:
+                return
 
-        ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
-        min_sl = round_to_tick(ltp * 0.0015, tick_sz)
-        sl_points = max(round_to_tick(atr14 * ATR_SL_MULT, tick_sz), min_sl, tick_sz * 4)
-        target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
+            raw_delta = abs(float(greeks.get("delta", 0.0)))
+            delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else cfg.get("default_delta", 0.52)
+            calc_sl_pts = atr14 * ATR_SL_MULT * delta
+            min_sl_pts = float(cfg.get("min_sl_pts", 10.0))
+            sl_points = max(round_to_tick(max(min_sl_pts, calc_sl_pts), tick_sz), tick_sz * 4)
+            target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
 
-        if tx_side == "BUY":
-            sl_price = round_to_tick(ltp - sl_points, tick_sz)
+            sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
             target_price = round_to_tick(ltp + target_points, tick_sz)
-            opt_side = "CE"
-        else:
-            sl_price = round_to_tick(ltp + sl_points, tick_sz)
-            target_price = round_to_tick(ltp - target_points, tick_sz)
-            opt_side = "PE"
 
-        qty = min(lot_size, cfg["freeze_qty"])
-        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
-        full_setup_name = f"MCX_{logic_code}_{tx_side}"
+            qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
+            full_setup = f"{setup_detail}_{side}"
 
-        order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp, tick_sz)
-        if order_res.get("status") == "success":
-            fill = order_res["fill_price"]
-            sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
-            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
-            t_no = self.trade_counter
-            entry_time_str = now_ist.strftime("%H:%M:%S")
-            with self.pos_lock:
-                self.active_positions[idx] = {
-                    "trade_no": t_no, "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
-                    "side": opt_side, "tx_side": tx_side, "display_side": tx_side,
-                    "lots": 1, "lot_size": lot_size, "qty": qty, "pnl_units": pnl_mult,
-                    "tick_size": tick_sz, "entry_price": fill, "r_unit": sl_points,
-                    "est_charges": total_est_ch, "last_ltp": fill, "sl": sl_price, "target": target_price,
-                    "trail_stage": None, "trade_mode": logic_code,
-                    "setup_name": full_setup_name, "entry_time": entry_time_str,
-                }
-            self.pending_retests[idx] = None
-            self.subscribe_tick_instrument(inst_key)
-            self.save_active_positions_state()
-            notify(
-                f"🚀 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
-                f"📌 <b>Logic:</b> <code>{logic_code}</code> (<code>{full_setup_name}</code>)\n"
-                f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
-            )
-            self.render_live_dashboard(now_ist.strftime("%H:%M"))
+            order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": strat_key,
+                        "type": "INDEX_OPT", "instrument_key": inst_key,
+                        "strike": target_strike, "side": side, "tx_side": "BUY",
+                        "display_side": side, "lots": 1, "lot_size": int(cfg["lot_size"]),
+                        "qty": qty, "pnl_units": qty, "tick_size": tick_sz,
+                        "entry_price": fill, "r_unit": sl_points, "est_charges": total_est_ch,
+                        "last_ltp": fill, "sl": sl_price, "target": target_price,
+                        "allow_be_trail": True, "trail_stage": None,
+                        "setup_name": full_setup, "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                if strat_key == "1M_BO_RETEST":
+                    self.pending_retests[idx] = None
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"🚀 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
+                    f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
-    def execute_index_opt_entry(self, idx: str, cfg: dict, side: str, fut_price: float, chain: list, atr14: float, now_ist: datetime, logic_code: str, rrr_mult: float):
+    def dispatch_vwap_reversed_entry(self, idx, cfg, flipped_side, pattern_name, df_src, fut_price, atr14, chain, is_today_exp, now_ist):
+        """Strategy 3: Reversed VWAP + PCR Pattern with Swapped Target (1R) & SL (2R)."""
+        pos_key = f"{idx}__VWAP_PCR_REV"
         with self.pos_lock:
-            if idx in self.active_positions or len(self.active_positions) >= MAX_ACTIVE_TRADES_TOTAL:
+            if pos_key in self.active_positions:
                 return
 
-        if not chain:
-            self.pending_retests[idx] = None
-            return
+        swing_low, swing_high = find_latest_swing_levels(df_src, lookback=10)
+        buf = SWING_BUFFER_ATR * atr14
 
-        step = cfg.get("step", 50)
-        tick_sz = cfg.get("tick_size", 0.05)
-        opt_field = "call_options" if side == "CE" else "put_options"
+        if cfg["type"] == "MCX_FUT":
+            inst_key = cfg["spot_key"]
+            lot_size = int(cfg["lot_size"])
+            pnl_mult = int(cfg.get("pnl_multiplier", lot_size))
+            tick_sz = cfg.get("tick_size", 0.05)
+            tx_side = "BUY" if flipped_side == "CE" else "SELL"
 
-        target_strike = round(fut_price / step) * step
-        chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
-        if not chosen:
-            valid_rows = [row for row in chain if row.get(opt_field, {}).get("instrument_key")]
-            if not valid_rows:
-                self.pending_retests[idx] = None
+            ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", fut_price))
+            min_dist = max(round_to_tick(ltp * 0.0012, tick_sz), tick_sz * 4)
+
+            if tx_side == "BUY":
+                raw_swing_dist = max(round_to_tick((swing_high + buf) - ltp, tick_sz), min_dist)
+                target_points = raw_swing_dist
+                sl_points = round_to_tick(raw_swing_dist * 2.0, tick_sz)
+                sl_price = round_to_tick(ltp - sl_points, tick_sz)
+                target_price = round_to_tick(ltp + target_points, tick_sz)
+            else:
+                raw_swing_dist = max(round_to_tick(ltp - (swing_low - buf), tick_sz), min_dist)
+                target_points = raw_swing_dist
+                sl_points = round_to_tick(raw_swing_dist * 2.0, tick_sz)
+                sl_price = round_to_tick(ltp + sl_points, tick_sz)
+                target_price = round_to_tick(ltp - target_points, tick_sz)
+
+            qty = min(lot_size, cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, pnl_mult, True).get("total", 180.0)
+            full_setup = f"VWAP_PCR_REV_{pattern_name}_{tx_side}"
+
+            order_res = place_marketable_limit_order(inst_key, qty, tx_side, ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                sym = self.fut_contracts.get(idx, {}).get("trading_symbol", f"{idx} FUT")
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": "VWAP_PCR_REV",
+                        "type": "MCX_FUT", "instrument_key": inst_key, "strike": sym,
+                        "side": flipped_side, "tx_side": tx_side, "display_side": tx_side,
+                        "lots": 1, "lot_size": lot_size, "qty": qty, "pnl_units": pnl_mult,
+                        "tick_size": tick_sz, "entry_price": fill, "r_unit": target_points,
+                        "est_charges": total_est_ch, "last_ltp": fill,
+                        "sl": sl_price, "target": target_price, "allow_be_trail": False,
+                        "trail_stage": None, "setup_name": full_setup,
+                        "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"🔄 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
+                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
+        else:
+            if not chain:
                 return
-            nearest_row = min(valid_rows, key=lambda r: abs(float(r.get("strike_price", 0)) - fut_price))
-            target_strike = nearest_row.get("strike_price", target_strike)
-            chosen = nearest_row.get(opt_field, {})
+            step = cfg.get("step", 50)
+            tick_sz = cfg.get("tick_size", 0.05)
+            opt_field = "call_options" if flipped_side == "CE" else "put_options"
+            target_strike = round(fut_price / step) * step
+            chosen = next((row.get(opt_field, {}) for row in chain if row.get("strike_price") == target_strike), None)
+            if not chosen:
+                valid_rows = [row for row in chain if row.get(opt_field, {}).get("instrument_key")]
+                if not valid_rows:
+                    return
+                nearest_row = min(valid_rows, key=lambda r: abs(float(r.get("strike_price", 0)) - fut_price))
+                target_strike = nearest_row.get("strike_price", target_strike)
+                chosen = nearest_row.get(opt_field, {})
 
-        inst_key = chosen.get("instrument_key")
-        if not inst_key:
-            self.pending_retests[idx] = None
-            return
+            inst_key = chosen.get("instrument_key")
+            if not inst_key:
+                return
 
-        mkt = chosen.get("market_data", {})
-        greeks = chosen.get("option_greeks", {})
-        ltp = float(mkt.get("ltp", 0))
-        if ltp <= 0:
-            ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", 0.0))
-        if ltp <= 0:
-            self.pending_retests[idx] = None
-            return
+            mkt = chosen.get("market_data", {})
+            greeks = chosen.get("option_greeks", {})
+            ltp = float(mkt.get("ltp", 0))
+            if ltp <= 0:
+                ltp = float(fetch_ltp_quote([inst_key]).get(inst_key, {}).get("last_price", 0.0))
+            if ltp <= 0:
+                return
 
-        raw_delta = abs(float(greeks.get("delta", 0.0)))
-        delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else cfg.get("default_delta", 0.52)
+            if flipped_side == "PE":
+                fut_old_sl = round(swing_low - buf, 2)
+                fut_risk = max(fut_price - fut_old_sl, 0.5 * atr14)
+            else:
+                fut_old_sl = round(swing_high + buf, 2)
+                fut_risk = max(fut_old_sl - fut_price, 0.5 * atr14)
 
-        calc_sl_pts = atr14 * ATR_SL_MULT * delta
-        min_sl_pts = float(cfg.get("min_sl_pts", 10.0))
-        sl_points = max(round_to_tick(max(min_sl_pts, calc_sl_pts), tick_sz), tick_sz * 4)
-        target_points = round_to_tick(sl_points * rrr_mult, tick_sz)
+            raw_delta = abs(float(greeks.get("delta", 0.0)))
+            live_delta = min(0.75, max(0.35, raw_delta)) if raw_delta > 0 else cfg.get("default_delta", 0.52)
 
-        sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
-        target_price = round_to_tick(ltp + target_points, tick_sz)
+            base_opt_pts = min(max(fut_risk * live_delta, ltp * 0.10), ltp * 0.30)
+            target_points = max(round_to_tick(base_opt_pts, tick_sz), tick_sz * 4)
+            sl_points = round_to_tick(target_points * 2.0, tick_sz)
 
-        qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
-        total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
-        full_setup_name = f"IDX_{logic_code}_{side}"
+            sl_price = round_to_tick(max(tick_sz, ltp - sl_points), tick_sz)
+            target_price = round_to_tick(ltp + target_points, tick_sz)
 
-        order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
-        if order_res.get("status") == "success":
-            fill = order_res["fill_price"]
-            self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
-            t_no = self.trade_counter
-            entry_time_str = now_ist.strftime("%H:%M:%S")
-            with self.pos_lock:
-                self.active_positions[idx] = {
-                    "trade_no": t_no, "type": "INDEX_OPT", "instrument_key": inst_key,
-                    "strike": target_strike, "side": side, "tx_side": "BUY",
-                    "display_side": side, "lots": 1, "lot_size": int(cfg["lot_size"]),
-                    "qty": qty, "pnl_units": qty, "tick_size": tick_sz,
-                    "entry_price": fill, "r_unit": sl_points, "est_charges": total_est_ch,
-                    "last_ltp": fill, "sl": sl_price, "target": target_price,
-                    "trail_stage": None, "trade_mode": logic_code,
-                    "setup_name": full_setup_name, "entry_time": entry_time_str,
-                }
-            self.pending_retests[idx] = None
-            self.subscribe_tick_instrument(inst_key)
-            self.save_active_positions_state()
-            notify(
-                f"🚀 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
-                f"📌 <b>Logic:</b> <code>{logic_code}</code> (<code>{full_setup_name}</code>)\n"
-                f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
-            )
-            self.render_live_dashboard(now_ist.strftime("%H:%M"))
+            qty = min(int(cfg["lot_size"]), cfg["freeze_qty"])
+            total_est_ch = fetch_exact_trade_charges(inst_key, ltp, ltp, qty, False).get("total", 65.0)
+            full_setup = f"VWAP_PCR_REV_{pattern_name}_{flipped_side}"
+
+            order_res = place_marketable_limit_order(inst_key, qty, "BUY", ltp, tick_sz)
+            if order_res.get("status") == "success":
+                fill = order_res["fill_price"]
+                self.trade_counter = max(self.trade_counter, len(self.closed_trades)) + 1
+                t_no = self.trade_counter
+                with self.pos_lock:
+                    self.active_positions[pos_key] = {
+                        "trade_no": t_no, "symbol": idx, "strategy_key": "VWAP_PCR_REV",
+                        "type": "INDEX_OPT", "instrument_key": inst_key,
+                        "strike": target_strike, "side": flipped_side, "tx_side": "BUY",
+                        "display_side": flipped_side, "lots": 1, "lot_size": int(cfg["lot_size"]),
+                        "qty": qty, "pnl_units": qty, "tick_size": tick_sz,
+                        "entry_price": fill, "r_unit": target_points, "est_charges": total_est_ch,
+                        "last_ltp": fill, "sl": sl_price, "target": target_price,
+                        "allow_be_trail": False, "trail_stage": None,
+                        "setup_name": full_setup, "entry_time": now_ist.strftime("%H:%M:%S"),
+                    }
+                self.subscribe_tick_instrument(inst_key)
+                self.save_active_positions_state()
+                notify(
+                    f"🔄 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
+                    f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
+                    f"📊 <b>Option:</b> <code>{target_strike} {flipped_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>"
+                )
+                self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def manage_open_positions(self, now_ist: datetime):
         with self.pos_lock:
@@ -1744,9 +2102,9 @@ class IntradayV3Engine:
         hhmm = now_ist.strftime("%H:%M")
         nse_exit_t = self.session_sched.get("nse_exit", INDEX_EXIT_TIME)
         mcx_exit_t = self.session_sched.get("mcx_exit", MCX_EXIT_TIME)
-        quotes = fetch_ltp_quote([p["instrument_key"] for _, p in pos_items]) if not self.ws_connected else {}
+        quotes = fetch_ltp_quote(list({p["instrument_key"] for _, p in pos_items})) if not self.ws_connected else {}
 
-        for idx, pos in pos_items:
+        for pos_key, pos in pos_items:
             if not self.ws_connected:
                 ltp = float(quotes.get(pos["instrument_key"], {}).get("last_price", pos.get("last_ltp", pos["entry_price"])))
                 pos["last_ltp"] = ltp
@@ -1769,17 +2127,17 @@ class IntradayV3Engine:
                 exit_reason = "TRAIL_BE_SL_HIT" if pos.get("trail_stage") else "STOP_LOSS_HIT"
 
             if exit_reason:
-                self.close_position_now(idx, ltp, exit_reason, now_ist)
+                self.close_position_now(pos_key, ltp, exit_reason, now_ist)
 
     def shutdown_cleanly(self, now_ist: datetime, reason_label: str):
         if reason_label == "MANUAL STOP":
             with self.pos_lock:
                 open_items = list(self.active_positions.items())
             if open_items:
-                quotes = fetch_ltp_quote([p["instrument_key"] for _, p in open_items])
-                for idx, pos in open_items:
+                quotes = fetch_ltp_quote(list({p["instrument_key"] for _, p in open_items}))
+                for pos_key, pos in open_items:
                     exit_ltp = float(quotes.get(pos["instrument_key"], {}).get("last_price", pos.get("last_ltp", pos["entry_price"])))
-                    self.close_position_now(idx, exit_ltp, "MANUAL_STOP_EXIT", now_ist)
+                    self.close_position_now(pos_key, exit_ltp, "MANUAL_STOP_EXIT", now_ist)
 
         self.save_active_positions_state()
         self.bot_status_text = "MARKET CLOSED"
@@ -1861,11 +2219,11 @@ class IntradayV3Engine:
         holiday_checked_0922 = False
 
         notify(
-            f"🌅 <b>V3 QUANT ENGINE • ONLINE (1m BO+RT &amp; 5m CONTRARIAN)</b>\n"
+            f"🌅 <b>V3 TRIPLE-STRATEGY ENGINE • ONLINE (UNCAPPED)</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
-            f"📈 <b>Indices:</b> <code>09:15-11:30 &amp; 14:00-15:00</code> (1m BO+RT + 5m REV)\n"
-            f"🛢️ <b>MCX Mini:</b> <code>17:00-21:00</code> (1m BO+RT + 5m REV)"
+            f"📈 <b>Indices (09:10-15:00):</b> <code>1M_BO_RETEST + 5M_CONTRARIAN + VWAP_PCR_REV</code>\n"
+            f"🛢️ <b>MCX Mini (21:00-22:00):</b> <code>1M_BO_RETEST + 5M_CONTRARIAN + VWAP_PCR_REV</code>"
         )
         self.dashboard_msg_id = None
         self.start_heartbeat_thread()
@@ -1893,11 +2251,11 @@ class IntradayV3Engine:
                     self.session_sched["is_holiday"] = True
                     self.session_sched["nse_open"] = False
                     self.session_sched["mcx_open"] = True
-                    self.session_sched["mcx_start"] = "17:00"
+                    self.session_sched["mcx_start"] = MCX_WINDOWS[0][0]
                     notify(
                         f"🟡 <b>NSE/BSE HOLIDAY ({today_s}) • MCX EVENING ARMED</b>\n"
                         f"────────────────────────────\n"
-                        f"🛢️ <i>Index trading disabled; MCX commodity trading will auto-start at 17:00 IST.</i>"
+                        f"🛢️ <i>Index trading disabled; MCX commodity trading will auto-start at 21:00 IST.</i>"
                     )
 
             self.manage_open_positions(now_ist)
@@ -1906,9 +2264,9 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
-            if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
-                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
-            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
+            if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "21:00"):
+                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '21:00')})"
+            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "21:00"):
                 self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
             else:
                 self.bot_status_text = "BOT LIVE"
@@ -1921,9 +2279,10 @@ class IntradayV3Engine:
                         if idx not in self.last_summaries:
                             spot_df = fetch_intraday_candles(cfg["spot_key"], 5)
                             if not spot_df.empty:
+                                close_v = int(round(float(spot_df["close"].iloc[-1])))
                                 self.last_summaries[idx] = {
-                                    "idx": idx, "is_mcx": False, "spot": int(round(float(spot_df["close"].iloc[-1]))),
-                                    "vol_ratio": 0.0, "atr": 0.0,
+                                    "idx": idx, "is_mcx": False, "spot": close_v, "vwap": close_v,
+                                    "pcr": 0.0, "vol_ratio": 0.0, "atr": 0.0,
                                     "short_status": "HOLIDAY" if not self.session_sched["nse_open"] else "CLOSED",
                                 }
                         continue
