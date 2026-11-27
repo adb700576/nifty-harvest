@@ -45,7 +45,7 @@ SESSION_MAX_RUNTIME_SEC = 20700
 INDEX_WINDOWS = (("09:10", "15:00"),)
 INDEX_EXIT_TIME = "15:15"
 
-MCX_WINDOWS = (("21:00", "22:00"),)
+MCX_WINDOWS = (("17:00", "22:00"),)
 MCX_EXIT_TIME = "23:15"
 
 # Equity Cash Session Controls (IST) — Strict Top 5 Stocks & Max 5 Equity Trades/Day
@@ -151,7 +151,7 @@ def round_to_tick(price: float, tick_size: float) -> float:
 
 def is_scheduled_handover_window(now_ist: datetime) -> bool:
     hhmm = now_ist.strftime("%H:%M")
-    return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "21:05")
+    return ("14:35" <= hhmm <= "15:05") or ("20:30" <= hhmm <= "17:05")
 
 
 def is_overnight_dead_hours(now_ist: datetime) -> bool:
@@ -1726,7 +1726,7 @@ class IntradayV3Engine:
                 if s:
                     mcx_parts.append(f"{idx[:4]} <code>{s['spot']}</code>")
             if mcx_parts:
-                pos_lines.append(f"• <b>MCX (21:00-22:00):</b> {' | '.join(mcx_parts)}")
+                pos_lines.append(f"• <b>MCX (17:00-22:00):</b> {' | '.join(mcx_parts)}")
 
             prev_ids = dict(self.dash_ids)
             self.dash_ids["master"] = upsert_telegram_dashboard("\n".join(master_lines), self.dash_ids.get("master"))
@@ -2090,7 +2090,7 @@ class IntradayV3Engine:
             self.pending_retests[idx] = None
             with self.pos_lock:
                 open_cnt = sum(1 for p in self.active_positions.values() if p["symbol"] == idx)
-            slot_txt = "21:00-22:00" if is_mcx else "09:10-15:00"
+            slot_txt = "17:00-22:00" if is_mcx else "09:10-15:00"
             st_lbl = f"ACTIVE({open_cnt}) | SLOT {slot_txt}" if open_cnt > 0 else f"SLOT {slot_txt}"
             return {
                 "idx": idx, "is_mcx": is_mcx,
@@ -2633,7 +2633,7 @@ class IntradayV3Engine:
                     notify(
                         f"🟡 <b>NSE/BSE HOLIDAY ({today_s}) • MCX EVENING ARMED</b>\n"
                         f"────────────────────────────\n"
-                        f"🛢️ <i>Index &amp; Equity disabled; MCX commodity trading will auto-start at 21:00 IST.</i>"
+                        f"🛢️ <i>Index &amp; Equity disabled; MCX commodity trading will auto-start at 17:00 IST.</i>"
                     )
 
             self.manage_open_positions(now_ist)
@@ -2642,9 +2642,9 @@ class IntradayV3Engine:
                 self.shutdown_cleanly(now_ist, "EOD CLOSED")
                 break
 
-            if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "21:00"):
-                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '21:00')})"
-            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "21:00"):
+            if not self.session_sched["nse_open"] and hhmm < self.session_sched.get("mcx_start", "17:00"):
+                self.bot_status_text = f"STANDBY (MCX OPENS {self.session_sched.get('mcx_start', '17:00')})"
+            elif self.session_sched["is_muhurat"] and hhmm < self.session_sched.get("nse_start", "18:00") and hhmm < self.session_sched.get("mcx_start", "17:00"):
                 self.bot_status_text = f"STANDBY (MUHURAT {self.session_sched.get('nse_start', '18:00')})"
             else:
                 self.bot_status_text = "BOT LIVE"
