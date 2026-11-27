@@ -62,7 +62,7 @@ EQ_SCAN_INTERVAL_SEC = 20.0
 
 REENTRY_COOLDOWN_SEC = 300
 STARTUP_WARMUP_SEC = 30
-DASHBOARD_PULSE_SEC = 6.0
+DASHBOARD_PULSE_SEC = 10.0
 
 # F&O Strategy 1: Trend-Following Breakout + Retest (1-Minute Candles)
 BO_VOL_RATIO_MIN = 1.20
@@ -88,7 +88,7 @@ ATR_SL_MULT = 1.20
 
 JOURNAL_FILE = "live_journal/trade_journal.csv"
 ACTIVE_STATE_FILE = "live_journal/active_positions.json"
-DASHBOARD_STATE_FILE = "live_journal/dashboard_state_v4.json"
+DASHBOARD_STATE_FILE = "live_journal/dashboard_state_clean.json"
 LOCK_FILE = "live_journal/engine.lock"
 
 JOURNAL_FIELDNAMES = [
@@ -368,7 +368,7 @@ def restore_journal_from_google_sheet():
 
 
 # ==============================================================================
-# 2. 4-PINNED TELEGRAM DASHBOARDS (MASTER + INDEX + MCX + EQUITY) & CHARGES
+# 2. CLEAN 2-PINNED TELEGRAM DASHBOARDS (WITH CLEAR SPACING BETWEEN TRADES)
 # ==============================================================================
 def notify(msg: str, silent: bool = False):
     clean_lines = [line.strip() for line in msg.splitlines() if line.strip()]
@@ -381,18 +381,18 @@ def notify(msg: str, silent: bool = False):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_notification": silent}
     for attempt in range(2):
         try:
-            requests.post(url, json=payload, timeout=8)
+            requests.post(url, json=payload, timeout=10)
             return
         except Exception as e:
             if attempt == 0:
-                time.sleep(0.5)
+                time.sleep(0.8)
             else:
                 log.warning(f"Telegram send error after retry: {e}")
 
 
 def load_saved_dashboard_ids() -> dict:
     today_str = datetime.now(IST).strftime("%Y-%m-%d")
-    default_ids = {"master": None, "index": None, "mcx": None, "equity": None}
+    default_ids = {"master": None, "positions": None}
     if os.path.isfile(DASHBOARD_STATE_FILE):
         try:
             with open(DASHBOARD_STATE_FILE, "r", encoding="utf-8") as f:
@@ -424,7 +424,7 @@ def _safe_telegram_html(text: str, max_len: int = 3950) -> str:
     curr_len = 0
     for ln in lines:
         if curr_len + len(ln) + 1 > max_len - 50:
-            out.append("<i>... (more items in journal) ...</i>")
+            out.append("\n<i>... (see full list in CSV / Google Sheet) ...</i>")
             break
         out.append(ln)
         curr_len += len(ln) + 1
@@ -441,23 +441,23 @@ def upsert_telegram_dashboard(text: str, message_id: int = None) -> int:
         edit_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id, "text": safe_text, "parse_mode": "HTML"}
         try:
-            resp = requests.post(edit_url, json=payload, timeout=8).json()
+            resp = requests.post(edit_url, json=payload, timeout=10).json()
             desc = str(resp.get("description", "")).lower()
             if resp.get("ok") or "message is not modified" in desc:
                 return message_id
         except Exception:
-            pass
+            return message_id
 
     send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML", "disable_notification": True}
     try:
-        resp = requests.post(send_url, json=payload, timeout=8).json()
+        resp = requests.post(send_url, json=payload, timeout=10).json()
         if resp.get("ok"):
             new_id = resp["result"]["message_id"]
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/pinChatMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID, "message_id": new_id, "disable_notification": True},
-                timeout=5,
+                timeout=6,
             )
             return new_id
     except Exception as e:
@@ -1032,7 +1032,7 @@ def place_marketable_limit_order(instrument_key: str, qty: int, side: str, ltp: 
 
 
 # ==============================================================================
-# 6. UNIFIED MULTI-ASSET ENGINE WITH 4 PINNED TELEGRAM DASHBOARDS
+# 6. UNIFIED MULTI-ASSET ENGINE WITH 2 CLEAN PINNED DASHBOARDS (WITH GAP)
 # ==============================================================================
 class IntradayV3Engine:
     def __init__(self):
@@ -1064,7 +1064,7 @@ class IntradayV3Engine:
         self.last_summaries = {}
         self.latest_dfs = {}
 
-        # 4 Separate Pinned Dashboards: master (consolidated), index, mcx, equity
+        # 2 Clean Pinned Dashboards: master (Consolidated P&L + Strategies) & positions (Live Trades & Feed)
         self.dash_ids = load_saved_dashboard_ids()
         self.dashboard_pulse = False
         self.dashboard_lock = threading.Lock()
@@ -1495,15 +1495,15 @@ class IntradayV3Engine:
             elif sk in ("5M_CONTRARIAN", "EQ_GANN_15M"):
                 rr_txt = "1:2.0+"
             elif sk == "VWAP_PCR_REV":
-                rr_txt = "1:0.5(REV)"
+                rr_txt = "1:0.5"
             else:
-                rr_txt = "EOD_15:15"
+                rr_txt = "15:15"
 
             tot_net = round(realized_pnl + live_mtm, 2)
             icon = "🟢" if tot_net > 0 else ("🔴" if tot_net < 0 else "⚪")
-            open_tag = f" | Open:{len(a_list)}" if a_list else ""
+            open_tag = f" | Open: <b>{len(a_list)}</b>" if a_list else ""
             lines.append(
-                f"• <b>{sk}:</b> {icon} <b>₹{tot_net:+,.0f}</b> | {tot}T ({len(wins)}W/{len(losses)}L) | WR <b>{wr}%</b> | R:R <b>{rr_txt}</b>{open_tag}"
+                f"• <b>{sk}</b>: {icon} <b>₹{tot_net:+,.0f}</b>  ({tot}T: {len(wins)}W/{len(losses)}L, WR {wr}%, R:R {rr_txt}){open_tag}"
             )
         return lines
 
@@ -1544,20 +1544,20 @@ class IntradayV3Engine:
             d = hourly[hr]
             slot_lbl = f"{hr:02d}:00-{hr + 1:02d}:00"
             if d["pnl"] >= 200:
-                tag = "🔥 PROFIT"
+                tag = "PROFIT"
             elif d["pnl"] <= -200:
-                tag = "⚠️ LOSS"
+                tag = "LOSS"
             else:
-                tag = "➖ CONSOL/FLAT"
+                tag = "CONSOL"
 
             badge = ""
             if hr == best_hr[0] and best_hr[1]["pnl"] > 0:
-                badge = " [BEST HR]"
+                badge = " ★BEST"
             elif hr == worst_hr[0] and worst_hr[1]["pnl"] < 0:
-                badge = " [WORST HR]"
+                badge = " ▼WORST"
 
             lines.append(
-                f"• <code>{slot_lbl}</code>: <b>₹{d['pnl']:+,.0f}</b> ({d['trades']}T, {d['wins']}W) | <code>{tag}{badge}</code>"
+                f"• <code>{slot_lbl}</code>: <b>₹{d['pnl']:+,.0f}</b>  ({d['trades']}T, {d['wins']}W)  <code>[{tag}{badge}]</code>"
             )
         return lines
 
@@ -1607,59 +1607,8 @@ class IntradayV3Engine:
             f"• <b>Yearly:</b> <b>₹{y_live:+,.2f}</b> ({y_tot}T | {y_wr}% Win)",
         ]
 
-    def _format_segment_positions(self, seg_type: str) -> list:
-        with self.pos_lock:
-            seg_active = sorted(
-                [p for p in self.active_positions.values() if p.get("type") == seg_type],
-                key=lambda x: x["trade_no"],
-            )
-
-        out = []
-        if seg_active:
-            out.append(f"\n🔥 <b>ACTIVE ({len(seg_active)})</b>")
-            for pos in seg_active:
-                ltp = pos.get("last_ltp", pos["entry_price"])
-                is_short = pos["tx_side"] == "SELL"
-                est_c = float(pos.get("est_charges", 45.0 if seg_type == "EQUITY_CASH" else (180.0 if seg_type == "MCX_FUT" else 65.0)))
-                eff_u = int(pos.get("pnl_units", pos["qty"]))
-                pts_diff = round((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"]), 2)
-                gross_val = round(pts_diff * eff_u, 2)
-                pnl = round(gross_val - est_c, 2)
-                sl_gross = (pos["entry_price"] - pos["sl"]) * eff_u if is_short else (pos["sl"] - pos["entry_price"]) * eff_u
-                sl_net = round(sl_gross - est_c, 0)
-                strat_lbl = pos.get("setup_name", pos.get("strategy_key", ""))
-                tgt_val = float(pos.get("target", 0.0))
-                tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else "15:15 EOD"
-                trail_tag = f"<code>{strat_lbl}</code> | 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{strat_lbl}</code>"
-                p_icon = "🟢" if pnl >= 0 else "🔴"
-                sl_lbl = f"Lock <b>₹{sl_net:+,.0f}</b>" if sl_net >= 0 else f"Risk <b>₹{abs(sl_net):,.0f}</b>"
-                qty_txt = f"{pos['qty']} Sh" if seg_type == "EQUITY_CASH" else f"{pos['qty']} Qty"
-
-                out.extend([
-                    f"• <b>#{pos['trade_no']} {pos['symbol']}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{qty_txt}</code>) | {trail_tag}",
-                    f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b> | SL: <code>₹{pos['sl']:.2f}</code> ({sl_lbl}) | Tgt: <code>{tgt_txt}</code> | Net: {p_icon} <b>₹{pnl:+,.2f}</b>",
-                ])
-
-        seg_closed = [
-            t for t in self.closed_trades
-            if (seg_type == "EQUITY_CASH" and map_setup_to_strategy(t.get("setup", "")).startswith("EQ_"))
-            or (seg_type == "MCX_FUT" and t.get("symbol") in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"))
-            or (seg_type == "INDEX_OPT" and t.get("symbol") in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"))
-        ]
-        out.append("\n📒 <b>CLOSED TRADES (LATEST 6)</b>")
-        if seg_closed:
-            for t in sorted(seg_closed, key=lambda x: x["trade_no"])[-6:]:
-                icon = "✅" if t["pnl"] >= 0 else "❌"
-                out.append(
-                    f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code> {icon} <b>₹{t['pnl']:+,.2f}</b> | <code>{t.get('setup','')}</code> (<code>{t['entry_time'][:5]}→{t['exit_time'][:5]}</code>) <i>{t['exit_reason']}</i>"
-                )
-        elif not seg_active:
-            out.append("<i>No trades yet today.</i>")
-
-        return out
-
     # ==========================================================================
-    # RENDER & PIN ALL 4 LIVE DASHBOARDS (CONSOLIDATED + INDEX + MCX + EQUITY)
+    # RENDER 2 CLEAN, SPACED & PINNED TELEGRAM BOARDS (NO OVERLAP / NO CRAMPING)
     # ==========================================================================
     def render_live_dashboard(self, hhmm: str):
         with self.dashboard_lock:
@@ -1679,87 +1628,110 @@ class IntradayV3Engine:
             mcx_st = self._calc_segment_stats("MCX_FUT")
             eq_st = self._calc_segment_stats("EQUITY_CASH")
 
-            # ------------------------------------------------------------------
-            # PINNED CARD 1: CONSOLIDATED MASTER (INDEX + MCX + EQUITY + 6 STRAT)
-            # ------------------------------------------------------------------
             tot_icon = "🟢" if tot_st["net_pnl"] >= 0 else "🔴"
             idx_icon = "🟢" if idx_st["net_pnl"] >= 0 else "🔴"
             mcx_icon = "🟢" if mcx_st["net_pnl"] >= 0 else "🔴"
             eq_icon = "🟢" if eq_st["net_pnl"] >= 0 else "🔴"
 
+            # ------------------------------------------------------------------
+            # BOARD 1 (PINNED): CONSOLIDATED P&L + ASSET SPLIT + 6 STRATEGIES
+            # ------------------------------------------------------------------
             master_lines = [
-                f"📌 <b>[1/4] CONSOLIDATED MASTER P&amp;L</b>  |  {status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge}",
-                f"────────────────────────────",
-                f"💼 <b>TOTAL DAY NET P&amp;L:</b> {tot_icon} <b>₹{tot_st['net_pnl']:+,.2f}</b>",
-                f"• Realized: <b>₹{tot_st['realized']:+,.2f}</b>  |  Live MTM: <b>₹{tot_st['live_mtm']:+,.2f}</b>",
-                f"• Closed: <b>{tot_st['closed']}T</b> ({tot_st['wins']}W/{tot_st['losses']}L, <b>{tot_st['wr']}%</b>)  |  Open: <b>{tot_st['open_count']}</b>",
-                f"\n📦 <b>ASSET-WISE BREAKDOWN (NET ₹)</b>",
-                f"• 📡 <b>Index Options:</b> {idx_icon} <b>₹{idx_st['net_pnl']:+,.2f}</b> ({idx_st['closed']}T, {idx_st['wr']}% WR | Open: {idx_st['open_count']})",
-                f"• 🛢️ <b>MCX Mini Fut:</b> {mcx_icon} <b>₹{mcx_st['net_pnl']:+,.2f}</b> ({mcx_st['closed']}T, {mcx_st['wr']}% WR | Open: {mcx_st['open_count']})",
-                f"• 🏛️ <b>NSE Top-5 Eq:</b> {eq_icon} <b>₹{eq_st['net_pnl']:+,.2f}</b> ({eq_st['closed']}T, {eq_st['wr']}% WR | Open: {eq_st['open_count']})",
-                f"\n🎯 <b>ALL 6 STRATEGIES PERFORMANCE</b>",
+                f"📌 <b>[1/2] MASTER P&amp;L SUMMARY</b>  |  {status_header}  |  <code>{hhmm} IST</code>  |  {mode_badge}",
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f"💼 <b>CONSOLIDATED NET P&amp;L:</b>  {tot_icon} <b>₹{tot_st['net_pnl']:+,.2f}</b>",
+                f"• Realized: <b>₹{tot_st['realized']:+,.2f}</b>   |   Live MTM: <b>₹{tot_st['live_mtm']:+,.2f}</b>",
+                f"• Closed: <b>{tot_st['closed']}T</b> ({tot_st['wins']}W / {tot_st['losses']}L, <b>{tot_st['wr']}% WR</b>)   |   Open: <b>{tot_st['open_count']}</b>",
+                "",
+                f"📦 <b>SEGMENT-WISE P&amp;L (INDEX + MCX + EQUITY)</b>",
+                f"• 📡 <b>Index Options:</b>  {idx_icon} <b>₹{idx_st['net_pnl']:+,.2f}</b>  ({idx_st['closed']}T, {idx_st['wr']}% WR | Open: {idx_st['open_count']})",
+                f"• 🛢️ <b>MCX Mini Fut:</b>   {mcx_icon} <b>₹{mcx_st['net_pnl']:+,.2f}</b>  ({mcx_st['closed']}T, {mcx_st['wr']}% WR | Open: {mcx_st['open_count']})",
+                f"• 🏛️ <b>Top-5 Equity:</b>   {eq_icon} <b>₹{eq_st['net_pnl']:+,.2f}</b>  ({eq_st['closed']}T, {eq_st['wr']}% WR | Open: {eq_st['open_count']})",
+                "",
+                f"🎯 <b>STRATEGY-WISE PERFORMANCE</b>",
             ]
             master_lines.extend(self.build_strategy_performance_lines())
-            master_lines.append("\n⏰ <b>HOURLY SESSION TRACKER (IST)</b>")
+            master_lines.extend(["", "⏰ <b>HOURLY SESSION TRACKER (IST)</b>"])
             master_lines.extend(self.build_hourly_analysis_lines())
-            master_lines.append("\n📊 <b>CUMULATIVE SUMMARY (NET ₹)</b>")
+            master_lines.extend(["", "📊 <b>OVERALL ACCOUNT SUMMARY (NET ₹)</b>"])
             master_lines.extend(self.get_performance_summary_lines(now_ist, tot_st["live_mtm"]))
 
             # ------------------------------------------------------------------
-            # PINNED CARD 2: INDEX OPTIONS DASHBOARD
+            # BOARD 2 (PINNED): ACTIVE TRADES (WITH BLANK LINE GAP) & LIVE FEED
             # ------------------------------------------------------------------
-            idx_lines = [
-                f"📌 <b>[2/4] INDEX OPTIONS BOARD</b>  |  <code>{hhmm} IST</code>  |  {mode_badge}",
-                f"────────────────────────────",
-                f"📡 <b>Index Net P&amp;L:</b> {idx_icon} <b>₹{idx_st['net_pnl']:+,.2f}</b> (Real: ₹{idx_st['realized']:+,.2f} | MTM: ₹{idx_st['live_mtm']:+,.2f})",
-                f"• Trades: <b>{idx_st['closed']}</b> ({idx_st['wins']}W/{idx_st['losses']}L | WR: <b>{idx_st['wr']}%</b>)  |  Slot: <code>09:10-15:00</code>",
-                f"\n📈 <b>LIVE INDICES FEED</b>",
+            with self.pos_lock:
+                active_snap = sorted(self.active_positions.values(), key=lambda x: x["trade_no"])
+
+            pos_lines = [
+                f"📌 <b>[2/2] ACTIVE TRADES &amp; LIVE FEED</b>  |  <code>{hhmm} IST</code>  |  {mode_badge}",
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f"🔥 <b>OPEN POSITIONS ({len(active_snap)})</b>",
             ]
+
+            if active_snap:
+                for pos in active_snap:
+                    ltp = pos.get("last_ltp", pos["entry_price"])
+                    is_short = pos["tx_side"] == "SELL"
+                    seg = pos.get("type", "INDEX_OPT")
+                    est_c = float(pos.get("est_charges", 45.0 if seg == "EQUITY_CASH" else (180.0 if seg == "MCX_FUT" else 65.0)))
+                    eff_u = int(pos.get("pnl_units", pos["qty"]))
+                    pts_diff = round((pos["entry_price"] - ltp) if is_short else (ltp - pos["entry_price"]), 2)
+                    pnl = round((pts_diff * eff_u) - est_c, 2)
+                    sl_gross = (pos["entry_price"] - pos["sl"]) * eff_u if is_short else (pos["sl"] - pos["entry_price"]) * eff_u
+                    sl_net = round(sl_gross - est_c, 0)
+
+                    strat_lbl = pos.get("setup_name", pos.get("strategy_key", ""))
+                    tgt_val = float(pos.get("target", 0.0))
+                    tgt_txt = f"₹{tgt_val:.2f}" if tgt_val > 0 else "15:15 EOD"
+                    trail_tag = f"<code>{strat_lbl}</code> | 🛡️<code>{pos['trail_stage']}</code>" if pos.get("trail_stage") else f"<code>{strat_lbl}</code>"
+                    p_icon = "🟢" if pnl >= 0 else "🔴"
+                    sl_lbl = f"Lock <b>₹{sl_net:+,.0f}</b>" if sl_net >= 0 else f"Risk <b>₹{abs(sl_net):,.0f}</b>"
+                    qty_txt = f"{pos['qty']} Sh" if seg == "EQUITY_CASH" else f"{pos['qty']} Qty"
+
+                    pos_lines.extend([
+                        "",
+                        f"• <b>#{pos['trade_no']} {pos['symbol']}</b> <code>{pos['strike']} {pos['display_side']}</code> (<code>{qty_txt}</code>)  |  {trail_tag}",
+                        f"  In: <b>₹{pos['entry_price']:.2f}</b> (<code>{pos['entry_time'][:5]}</code>) → LTP: <b>₹{ltp:.2f}</b>  |  Net: {p_icon} <b>₹{pnl:+,.2f}</b>",
+                        f"  SL: <code>₹{pos['sl']:.2f}</code> ({sl_lbl})  |  Target: <code>{tgt_txt}</code>",
+                    ])
+            else:
+                pos_lines.append("<i>No open positions right now.</i>")
+
+            pos_lines.extend(["", "📒 <b>RECENT CLOSED TRADES (LATEST 5)</b>"])
+            if self.closed_trades:
+                for t in sorted(self.closed_trades, key=lambda x: x["trade_no"])[-5:]:
+                    icon = "✅" if t["pnl"] >= 0 else "❌"
+                    pos_lines.extend([
+                        "",
+                        f"• <b>#{t['trade_no']} {t['symbol']}</b> <code>{t['contract']} {t['side']}</code>  {icon} <b>₹{t['pnl']:+,.2f}</b>",
+                        f"  <code>{t.get('setup','')}</code>  |  <code>{t['entry_time'][:5]} → {t['exit_time'][:5]}</code>  |  <i>{t['exit_reason']}</i>",
+                    ])
+            else:
+                pos_lines.append("<i>No closed trades yet today.</i>")
+
+            top5_disp = ", ".join(self.eq_top5_stocks) if self.eq_top5_stocks else "WAITING 09:30"
+            pos_lines.extend([
+                "",
+                "📡 <b>LIVE MARKET SCANNER</b>",
+                f"• <b>Top-5 Equity:</b> <code>{top5_disp}</code> (<code>{len(self.eq_traded_today)}/{EQ_MAX_TRADES_PER_DAY}T</code>)",
+            ])
             for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"):
                 s = self.last_summaries.get(idx)
                 if s:
-                    idx_lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
-                else:
-                    idx_lines.append(f"• <b>{idx}:</b> <code>SYNCING...</code>")
-            idx_lines.extend(self._format_segment_positions("INDEX_OPT"))
+                    pos_lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | PCR <b>{s['pcr']:.2f}</b> | <code>{s['short_status']}</code>")
 
-            # ------------------------------------------------------------------
-            # PINNED CARD 3: MCX MINI FUTURES DASHBOARD
-            # ------------------------------------------------------------------
-            mcx_lines = [
-                f"📌 <b>[3/4] MCX MINI FUTURES BOARD</b>  |  <code>{hhmm} IST</code>  |  {mode_badge}",
-                f"────────────────────────────",
-                f"🛢️ <b>MCX Net P&amp;L:</b> {mcx_icon} <b>₹{mcx_st['net_pnl']:+,.2f}</b> (Real: ₹{mcx_st['realized']:+,.2f} | MTM: ₹{mcx_st['live_mtm']:+,.2f})",
-                f"• Trades: <b>{mcx_st['closed']}</b> ({mcx_st['wins']}W/{mcx_st['losses']}L | WR: <b>{mcx_st['wr']}%</b>)  |  Slot: <code>21:00-22:00</code>",
-                f"\n⚡ <b>LIVE MCX MINI FEED</b>",
-            ]
+            mcx_parts = []
             for idx in ("CRUDEOIL", "NATURALGAS", "GOLD", "SILVER", "COPPER"):
                 s = self.last_summaries.get(idx)
                 if s:
-                    mcx_lines.append(f"• <b>{s['idx']}:</b> <code>{s['spot']}</code> | VWAP <b>{s['vwap']}</b> | Vol <b>{s['vol_ratio']:.1f}x</b> | <code>{s['short_status']}</code>")
-                else:
-                    mcx_lines.append(f"• <b>{idx}:</b> <code>SYNCING...</code>")
-            mcx_lines.extend(self._format_segment_positions("MCX_FUT"))
+                    mcx_parts.append(f"{idx[:4]} <code>{s['spot']}</code>")
+            if mcx_parts:
+                pos_lines.append(f"• <b>MCX (21:00-22:00):</b> {' | '.join(mcx_parts)}")
 
-            # ------------------------------------------------------------------
-            # PINNED CARD 4: NSE TOP-5 EQUITY CASH DASHBOARD
-            # ------------------------------------------------------------------
-            top5_disp = ", ".join(self.eq_top5_stocks) if self.eq_top5_stocks else "WAITING 09:30"
-            eq_lines = [
-                f"📌 <b>[4/4] NSE TOP-5 EQUITY BOARD</b>  |  <code>{hhmm} IST</code>  |  {mode_badge}",
-                f"────────────────────────────",
-                f"🏛️ <b>Equity Net P&amp;L:</b> {eq_icon} <b>₹{eq_st['net_pnl']:+,.2f}</b> (Real: ₹{eq_st['realized']:+,.2f} | MTM: ₹{eq_st['live_mtm']:+,.2f})",
-                f"• Trades: <b>{eq_st['closed']}</b> ({eq_st['wins']}W/{eq_st['losses']}L | WR: <b>{eq_st['wr']}%</b>)  |  Cap: <code>{len(self.eq_traded_today)}/{EQ_MAX_TRADES_PER_DAY}T</code>",
-                f"• <b>Top-5 Basket:</b> <code>{top5_disp}</code>",
-            ]
-            eq_lines.extend(self._format_segment_positions("EQUITY_CASH"))
-
-            # Update & Pin all 4 dashboards
             prev_ids = dict(self.dash_ids)
             self.dash_ids["master"] = upsert_telegram_dashboard("\n".join(master_lines), self.dash_ids.get("master"))
-            self.dash_ids["index"] = upsert_telegram_dashboard("\n".join(idx_lines), self.dash_ids.get("index"))
-            self.dash_ids["mcx"] = upsert_telegram_dashboard("\n".join(mcx_lines), self.dash_ids.get("mcx"))
-            self.dash_ids["equity"] = upsert_telegram_dashboard("\n".join(eq_lines), self.dash_ids.get("equity"))
+            time.sleep(0.4)
+            self.dash_ids["positions"] = upsert_telegram_dashboard("\n".join(pos_lines), self.dash_ids.get("positions"))
 
             if self.dash_ids != prev_ids:
                 save_dashboard_ids(self.dash_ids)
@@ -1844,6 +1816,11 @@ class IntradayV3Engine:
         }
         self.closed_trades.append(journal_entry)
         record_trade_journal(journal_entry)
+        icon = "✅" if net_pnl >= 0 else "❌"
+        notify(
+            f"\n{icon} <b>EXIT #{pos['trade_no']} • {idx}</b> ({pos['setup_name']})\n"
+            f"📊 <b>Exit:</b> ₹{ltp:.2f} | <b>Net P&amp;L:</b> <b>₹{net_pnl:+,.2f}</b> | <i>{exit_reason}</i>\n"
+        )
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
     def can_trigger_strategy(self, idx: str, strat_key: str, curr_candle_ts: str) -> bool:
@@ -1948,7 +1925,7 @@ class IntradayV3Engine:
             if sym_open:
                 continue
 
-            # --- EQUITY STRATEGY 1: EQ_GANN_15M (Top 5 Stocks, 09:30 - 15:00) ---
+            # --- EQUITY STRATEGY 1: EQ_GANN_15M ---
             gann_pk = f"{sym}__EQ_GANN_15M"
             if gann_pk not in self.eq_traded_today and meta["gann"]:
                 g = meta["gann"]
@@ -1968,7 +1945,7 @@ class IntradayV3Engine:
             if hhmm >= EQ_ORB_ATR_CUTOFF:
                 continue
 
-            # --- EQUITY STRATEGY 2: EQ_MOTHER_ORB (Top 5 Stocks, 09:30 - 13:30) ---
+            # --- EQUITY STRATEGY 2: EQ_MOTHER_ORB ---
             orb_pk = f"{sym}__EQ_MOTHER_ORB"
             if orb_pk not in self.eq_traded_today:
                 if ltp > meta["mother_high"]:
@@ -1978,7 +1955,7 @@ class IntradayV3Engine:
                     self.execute_equity_entry(sym, ikey, "SELL", ltp, meta["mother_high"], 0.0, now_ist, "EQ_MOTHER_ORB", "EQ_MOTHER_ORB_SELL")
                     continue
 
-            # --- EQUITY STRATEGY 3: EQ_ATR_RANGE (Top 5 Stocks, Fuel >= 50, 09:30 - 13:30) ---
+            # --- EQUITY STRATEGY 3: EQ_ATR_RANGE ---
             atr_pk = f"{sym}__EQ_ATR_RANGE"
             if meta["fuel"] >= EQ_MIN_FUEL_SCORE and atr_pk not in self.eq_traded_today:
                 df_1m_s = fetch_intraday_candles(ikey, 1)
@@ -2038,9 +2015,9 @@ class IntradayV3Engine:
             self.save_active_positions_state()
             tgt_disp = f"₹{target_price:.2f}" if target_price > 0 else "15:15 EOD"
             notify(
-                f"📈 <b>NEW EQUITY ENTRY #{t_no} • {sym}</b>\n"
+                f"\n📈 <b>NEW EQUITY ENTRY #{t_no} • {sym}</b>\n"
                 f"📌 <b>Strategy:</b> <code>{setup_label}</code>\n"
-                f"📊 <b>Order:</b> <code>{tx_side} {qty} Sh</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>{tgt_disp}</code>"
+                f"📊 <b>Order:</b> <code>{tx_side} {qty} Sh</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>{tgt_disp}</code>\n"
             )
             self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
@@ -2283,9 +2260,9 @@ class IntradayV3Engine:
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
-                    f"🚀 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
+                    f"\n🚀 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
                     f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
-                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>\n"
                 )
                 self.render_live_dashboard(now_ist.strftime("%H:%M"))
         else:
@@ -2352,9 +2329,9 @@ class IntradayV3Engine:
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
-                    f"🚀 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
+                    f"\n🚀 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
                     f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
-                    f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>"
+                    f"📊 <b>Option:</b> <code>{target_strike} {side}</code> @ <b>₹{fill:.2f}</b> | SL: <code>₹{sl_price:.2f}</code> | Tgt: <code>₹{target_price:.2f}</code>\n"
                 )
                 self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
@@ -2415,9 +2392,9 @@ class IntradayV3Engine:
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
-                    f"🔄 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
+                    f"\n🔄 <b>NEW MCX ENTRY #{t_no} • {idx}</b>\n"
                     f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
-                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>"
+                    f"📊 <b>Contract:</b> <code>{sym} {tx_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>\n"
                 )
                 self.render_live_dashboard(now_ist.strftime("%H:%M"))
         else:
@@ -2489,9 +2466,9 @@ class IntradayV3Engine:
                 self.subscribe_tick_instrument(inst_key)
                 self.save_active_positions_state()
                 notify(
-                    f"🔄 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
+                    f"\n🔄 <b>NEW INDEX ENTRY #{t_no} • {idx}</b>\n"
                     f"📌 <b>Strategy:</b> <code>{full_setup}</code>\n"
-                    f"📊 <b>Option:</b> <code>{target_strike} {flipped_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>"
+                    f"📊 <b>Option:</b> <code>{target_strike} {flipped_side}</code> @ <b>₹{fill:.2f}</b> | SL (2R): <code>₹{sl_price:.2f}</code> | Tgt (1R): <code>₹{target_price:.2f}</code>\n"
                 )
                 self.render_live_dashboard(now_ist.strftime("%H:%M"))
 
@@ -2554,9 +2531,9 @@ class IntradayV3Engine:
         self.render_live_dashboard(now_ist.strftime("%H:%M"))
         if reason_label != "SESSION HANDOVER":
             notify(
-                f"🔴 <b>SESSION CLOSED ({reason_label})</b>  |  <code>{now_ist.strftime('%H:%M')} IST</code>\n"
+                f"\n🔴 <b>SESSION CLOSED ({reason_label})</b>  |  <code>{now_ist.strftime('%H:%M')} IST</code>\n"
                 f"────────────────────────────\n"
-                f"💼 <b>Day Net P&amp;L:</b> <b>₹{self.day_pnl:+,.2f}</b>  |  <b>Trades:</b> {len(self.closed_trades)}"
+                f"💼 <b>Day Net P&amp;L:</b> <b>₹{self.day_pnl:+,.2f}</b>  |  <b>Trades:</b> {len(self.closed_trades)}\n"
             )
         self.release_single_instance_lock()
 
@@ -2621,12 +2598,12 @@ class IntradayV3Engine:
         holiday_checked_0922 = False
 
         notify(
-            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE (4 PINNED BOARDS)</b>\n"
+            f"🌅 <b>V3 MULTI-ASSET ENGINE • ONLINE</b>\n"
             f"────────────────────────────\n"
             f"🔑 <b>Token:</b> Active  |  ⚡ <b>Mode:</b> <code>{'PAPER' if PAPER_MODE else 'LIVE'}</code>\n"
-            f"📌 <b>Boards:</b> <code>[1/4] Consolidated Master</code> + <code>[2/4] Index</code> + <code>[3/4] MCX</code> + <code>[4/4] Top-5 Equity</code>"
+            f"📌 <b>Pinned Boards:</b> <code>[1/2] Master P&amp;L Summary</code> + <code>[2/2] Active Trades &amp; Feed</code>"
         )
-        self.dash_ids = {"master": None, "index": None, "mcx": None, "equity": None}
+        self.dash_ids = {"master": None, "positions": None}
         self.start_heartbeat_thread()
 
         while True:
